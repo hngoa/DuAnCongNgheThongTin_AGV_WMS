@@ -1,0 +1,1697 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ESPmDNS.h>
+#include <math.h>
+#include <esp_arduino_version.h>
+#include "soc/usb_serial_jtag_reg.h"
+#include "driver/gpio.h"
+
+/*
+ * ===================================================================================
+ * AGV_Ver2 - TEST 09: ĐIỀU HƯỚNG ĐỒ THỊ 2 CHIỀU & ĐIỂM - ĐIỂM LINH HOẠT (BIDIRECTIONAL)
+ * -----------------------------------------------------------------------------------
+ * ĐẶC TẢ KỸ THUẬT NÂNG CẤP TOÀN DIỆN CHO TEST 08:
+ *   1. MÔ HÌNH ĐỒ THỊ 8 CHẶNG 2 CHIỀU HOÀN CHỈNH:
+ *      - Xuôi chiều: AB (1.51m, +90°), BC (1.54m, 0°), CD (1.51m, -90°), DA (1.54m, 180°)
+ *      - Ngược chiều: CB (1.54m, 180°), BA (1.51m, -90°), AD (1.54m, 0°), DC (1.51m, +90°)
+ *      - Xe có thể đứng tại C quay đầu 180° về B, hoặc từ bất kỳ trạm nào đi tới bất kỳ trạm nào!
+ *
+ *   2. THUẬT TOÁN KHÓA VẠCH THÍCH ỨNG CHỐNG BẮT NHẦM NHÁNH KHI QUAY ĐẦU 180°:
+ *      - Khi quay đầu 180° tại trạm C (về B), xe phải quay qua góc -90° (nhánh sang D).
+ *      - Điều kiện khóa vạch mới kiểm tra độ tiệm cận góc đích (|err| <= 35°),
+ *        đảm bảo xe KHÔNG bị bắt nhầm nhánh vuông, chỉ khóa đúng vạch khi đã hoàn thành quay đầu!
+ *
+ *   3. BỘ ĐỊNH TUYẾN ĐIỂM - ĐIỂM TỰ ĐỘNG (POINT-TO-POINT PATHFINDING):
+ *      - Nhận lệnh: GO_TO:A, GO_TO:B, GO_TO:C, GO_TO:D từ Web hoặc Serial.
+ *      - Tự động lập lộ trình ngắn nhất (Queue) và chuyển chặng liên hoàn mượt mà.
+ *
+ *   4. KẾ THỪA TOÀN BỘ SỨC MẠNH CỦA TEST 08:
+ *      - Cầu nối quán tính vượt đứt đoạn (Dead-Reckoning Virtual Line Bridge).
+ *      - Bộ lọc độ tin cậy kháng vạch mờ (Debounce 30ms) & Lọc không gian lóa sáng.
+ *      - Odometry vi sai tâm 2 bánh xe, bù trôi Gyro bằng Line, tiếp cận trạm 23cm.
+ *      - Giao tiếp Web Telemetry HTTP + UDP Discovery tự động dò tìm IP Server.
+ * ===================================================================================
+ */
+
+// --- 1. CẤU HÌNH KẾT NỐI WI-FI, TÊN MIỀN mDNS & BẢO MẬT TOKEN ---
+const char* wifi_ssid        = "LAU 3";
+const char* wifi_pass        = "777777777";
+const char* mdns_hostname    = "agv-wms";                         // Tên miền mDNS duy nhất: agv-wms.local
+const char* agv_device_token = "agv_sec_robot_v2_7f8a9b";         // Mã khóa bảo mật RBAC của Robot AGV
+String      serverUrl        = "http://192.168.1.8:5000/api/telemetry"; // IP LAN hiện tại + tự động cập nhật động qua mDNS
+String      lastKnownServerUrl = "http://192.168.1.8:5000/api/telemetry";
+
+// --- 2. SƠ ĐỒ CHÂN PHẦN CỨNG ---
+#define I2C_SDA_PIN          4
+#define I2C_SCL_PIN          5
+#define MPU6050_ADDR         0x68
+
+// --- 2.1. CẢM BIẾN DÒNG/ÁP & QUẢN LÝ NĂNG LƯỢNG INA226 (I2C1 - GPIO 8 & 9) ---
+#define INA_SDA_PIN          8
+#define INA_SCL_PIN          9
+#define INA226_ADDR          0x40
+TwoWire I2C_INA = TwoWire(1);
+
+#define INA226_REG_CONFIG       0x00
+#define INA226_REG_SHUNTVOLTAGE 0x01
+#define INA226_REG_BUSVOLTAGE   0x02
+#define INA226_REG_POWER        0x03
+#define INA226_REG_CURRENT      0x04
+#define INA226_REG_CALIBRATION  0x05
+
+bool  inaDetected            = false;
+float rShunt                 = 0.100f; // 0.1 Ohm (Module R100)
+volatile float liveBusV      = 0.0f;
+volatile float liveCurrentA  = 0.0f;
+volatile float livePowerW    = 0.0f;
+volatile float liveEnergyMah = 0.0f;
+volatile float liveEnergyWh  = 0.0f;
+unsigned long  lastPowerCalcUs = 0;
+
+#define L298N_ENA_PIN        6
+#define L298N_IN1_PIN        7
+#define L298N_IN2_PIN        15
+#define L298N_IN3_PIN        16
+#define L298N_IN4_PIN        17
+#define L298N_ENB_PIN        18
+#define BUTTON_BOOT_PIN      0
+
+#define PWM_FREQ_HZ          20000
+#define PWM_RES_BITS         8
+#define PWM_CH_LEFT          0
+#define PWM_CH_RIGHT         1
+
+#define ENC_L_A_PIN          10
+#define ENC_L_B_PIN          11
+#define ENC_R_A_PIN          12
+#define ENC_R_B_PIN          13
+
+#define LINE_L2_PIN          48
+#define LINE_L1_PIN          47
+#define LINE_C_PIN           21
+#define LINE_R1_PIN          20
+#define LINE_R2_PIN          19
+
+// --- 3. THÔNG SỐ VẬT LÝ & HIỆU CHUẨN THỰC ĐO ---
+bool invertLeftMotor         = true;
+bool invertRightMotor        = true;
+bool swapMotors              = true;
+
+bool invertEncLeft           = false;
+bool invertEncRight          = false;
+bool swapEncoders            = true;
+
+const float TICKS_PER_METER          = 6970.0f;
+const float DIST_AXLE_TO_SENSOR_M    = 0.23f; // L = 23cm từ tâm trục bánh đến hàng mắt
+const float WHEEL_BASE_W_M           = 0.29f; // W = 29cm khoảng cách 2 bánh
+const float WHEEL_DIAM_M             = 0.065f;// d = 6.5cm
+
+// Tốc độ điều khiển thích ứng (Đã nâng công suất chịu tải cho nguồn 2S qua L298N)
+int   straightPwm            = 240; // Tốc độ chạy thẳng cao (trước: 215)
+int   curvePwm               = 205; // Tốc độ ôm chỉnh lệch line (trước: 178)
+int   brakePwm               = 212; // Tốc độ tiếp cận trạm có tải, chống ì chết máy (trước: 182)
+int   turnPwm                = 200; // Tốc độ xoay tại chỗ khỏe khi mang tải (trước: 175)
+int   bridgePwm              = 222; // Tốc độ vượt vạch đứt theo Map (trước: 192)
+int   minMovePwm             = 190; // Ngưỡng PWM tối thiểu giữ mô-men thắng ma sát tải
+int   maxPwm                 = 255; // Công suất tối đa 100% duty cycle (trước: 240)
+
+// Hệ số PD bám line
+float Kp_line                = 36.0f;
+float Kd_line                = 15.0f;
+
+// --- 4. THAM SỐ VƯỢT ĐỨT ĐOẠN / VẠCH MỜ ---
+const float MAX_BRIDGE_DISTANCE_M    = 0.90f; // Nâng lên 0.90m để vượt trọn vẹn khoảng đứt vạch thực tế
+const unsigned long MAX_BRIDGE_TIME_MS = 5000; // Nâng lên 5000ms (5 giây) để không bị ngắt phanh sớm khi mang tải
+float gapStartDistM                  = 0.0f;
+float gapHeadingHoldDeg              = 0.0f;
+bool  inGapBridgeMode                = false;
+unsigned long gapStartTimeMs         = 0;
+int   consecutiveZeroLineFrames      = 0;
+
+bool  simulateGapActive              = false;
+float simGapStartLegDistM            = 0.0f;
+const float SIM_GAP_LENGTH_M         = 0.25f;
+
+// --- 5. MÔ HÌNH ĐỒ THỊ 8 CHẶNG 2 CHIỀU LINH HOẠT ---
+enum StationId {
+  STATION_A = 0,
+  STATION_B = 1,
+  STATION_C = 2,
+  STATION_D = 3,
+  STATION_UNKNOWN = 4
+};
+
+enum LegId {
+  LEG_AB = 0, // Xuôi A -> B (1.51m, +90°)
+  LEG_BC = 1, // Xuôi B -> C (1.54m, 0°)
+  LEG_CD = 2, // Xuôi C -> D (1.51m, -90°)
+  LEG_DA = 3, // Xuôi D -> A (1.54m, 180°)
+  LEG_BA = 4, // Ngược B -> A (1.51m, -90°)
+  LEG_CB = 5, // Ngược C -> B (1.54m, 180°)
+  LEG_DC = 6, // Ngược D -> C (1.51m, +90°)
+  LEG_AD = 7, // Ngược A -> D (1.54m, 0°)
+  LEG_NONE = 8
+};
+
+struct LegDef {
+  StationId fromStation;
+  StationId toStation;
+  float targetDistM;
+  float targetHeadingDeg;
+  const char* name;
+};
+
+struct StationCoord {
+  float x;
+  float y;
+};
+
+// Tọa độ chuẩn của 4 trạm trên hệ trục Đề-các Sa bàn V2.1 (Gốc A dưới-trái, +X sang phải, +Y hướng lên)
+// Được tự động đồng bộ thời gian thực với cấu hình Map đang kích hoạt trên Server (map_w, map_h)
+StationCoord STATION_COORDS[4] = {
+  { 0.00f, 0.00f }, // STATION_A (0.00m, 0.00m) - Điểm giữa 2 bánh xe tại vạch Trạm A
+  { 0.00f, 1.51f }, // STATION_B (0.00m, 1.51m) - Điểm giữa 2 bánh xe tại vạch Trạm B
+  { 1.54f, 1.51f }, // STATION_C (1.54m, 1.51m) - Điểm giữa 2 bánh xe tại vạch Trạm C
+  { 1.54f, 0.00f }  // STATION_D (1.54m, 0.00m) - Điểm giữa 2 bánh xe tại vạch Trạm D
+};
+
+LegDef LEG_TABLE[8] = {
+  { STATION_A, STATION_B, 1.51f,  90.0f, "A ➔ B" },
+  { STATION_B, STATION_C, 1.54f,   0.0f, "B ➔ C" },
+  { STATION_C, STATION_D, 1.51f, -90.0f, "C ➔ D" },
+  { STATION_D, STATION_A, 1.54f, 180.0f, "D ➔ A" },
+  { STATION_B, STATION_A, 1.51f, -90.0f, "B ➔ A" },
+  { STATION_C, STATION_B, 1.54f, 180.0f, "C ➔ B" },
+  { STATION_D, STATION_C, 1.51f,  90.0f, "D ➔ C" },
+  { STATION_A, STATION_D, 1.54f,   0.0f, "A ➔ D" }
+};
+
+// Biến chia sẻ đa nhân (Core 0 <-> Core 1)
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+
+float activeMapWidthM  = 1.54f;
+float activeMapLengthM = 1.51f;
+
+void syncMapDimensionsFromServer(float w, float h) {
+  if (w < 0.30f || h < 0.30f || w > 20.0f || h > 20.0f) return;
+  if (fabsf(w - activeMapWidthM) < 0.005f && fabsf(h - activeMapLengthM) < 0.005f) return;
+
+  portENTER_CRITICAL(&stateMux);
+  activeMapWidthM  = w;
+  activeMapLengthM = h;
+
+  STATION_COORDS[STATION_A] = { 0.00f, 0.00f };
+  STATION_COORDS[STATION_B] = { 0.00f, h     };
+  STATION_COORDS[STATION_C] = { w,     h     };
+  STATION_COORDS[STATION_D] = { w,     0.00f };
+
+  LEG_TABLE[LEG_AB].targetDistM = h;
+  LEG_TABLE[LEG_BC].targetDistM = w;
+  LEG_TABLE[LEG_CD].targetDistM = h;
+  LEG_TABLE[LEG_DA].targetDistM = w;
+  LEG_TABLE[LEG_BA].targetDistM = h;
+  LEG_TABLE[LEG_CB].targetDistM = w;
+  LEG_TABLE[LEG_DC].targetDistM = h;
+  LEG_TABLE[LEG_AD].targetDistM = w;
+  portEXIT_CRITICAL(&stateMux);
+
+  Serial.printf("\n🗺️ [ĐỒNG BỘ MAP SERVER]: Đã cập nhật bản đồ dẫn đường %.2fm x %.2fm!\n", w, h);
+}
+
+// Hàng đợi lộ trình đa chặng (Multi-leg Queue)
+LegId legQueue[4];
+int   queueLength = 0;
+int   queueIndex  = 0;
+
+volatile StationId     currentStation      = STATION_A;
+volatile LegId         currentLeg          = LEG_AB;
+volatile float         legTargetDistM      = 1.51f;
+volatile float         legTargetHeadingDeg = 90.0f;
+volatile float         startTurnYaw        = 0.0f;
+volatile int           turnDirectionSign   = 1; // +1: Quay Trái (CCW, tăng Yaw), -1: Quay Phải (CW, giảm Yaw)
+volatile unsigned long turnSearchStartMs   = 0;
+
+// Trạng thái FSM
+enum RobotSubState {
+  SUB_STOPPED,
+  SUB_TURNING_FOR_MISSION,
+  SUB_TURNING_REVERSE_SEARCH,
+  SUB_TURNING_MANUAL,
+  SUB_LINE_FOLLOWING,
+  SUB_DEAD_RECKONING_BRIDGE,
+  SUB_MOTOR_TEST,
+  SUB_PAUSE_AT_STATION
+};
+
+volatile RobotSubState robotSubState       = SUB_STOPPED;
+volatile bool          autoLoopEnabled     = false;
+volatile bool          autoLoopReverse     = false; // true: chạy ngược chiều A-D-C-B-A
+volatile unsigned long stationPauseUntilMs = 0;
+
+volatile bool isRunning                  = false;
+volatile float odomX                     = 0.0f;
+volatile float odomY                     = 0.0f;
+volatile float yawDeg                    = 90.0f;
+volatile float totalDistM                = 0.0f;
+volatile float legProgressM              = 0.0f;
+volatile float currentSpeed              = 0.0f;
+volatile int   lineMask                  = 0;
+volatile float currentLineErr            = 0.0f;
+volatile int   cmdPwmL                   = 0;
+volatile int   cmdPwmR                   = 0;
+volatile long  globalTicksL              = 0;
+volatile long  globalTicksR              = 0;
+const char* volatile robotStateStr       = "STOPPED";
+
+volatile long rawTicksL      = 0;
+volatile long rawTicksR      = 0;
+long prevTicksL              = 0;
+long prevTicksR              = 0;
+
+bool  mpuConnected           = false;
+float gyroZOffset            = -1.31f;
+float liveGzDps              = 0.0f;
+
+float lastValidError         = 0.0f;
+float lastLineError          = 0.0f;
+float lastHeadingErr         = 0.0f;
+unsigned long lineLostTimeMs = 0;
+
+// Biến theo dõi mốc mắt cảm biến chạm vạch trạm để đẩy tiếp 2 bánh xe (L = 23cm) đè đúng lên vạch
+bool  cornerSensorTriggered  = false;
+float cornerStartWheelDistM  = 0.0f;
+
+float smoothedBaseSpeed      = 0.0f;
+const float MAX_RAMP_STEP    = 8.0f; // Tăng tốc & chuyển tốc nhanh gấp đôi (800 PWM/s ở 100Hz)
+float loadBoostPwm           = 0.0f; // Bù mô-men tự động vòng kín theo tải (Encoder Speed Feedback)
+float turnBoostPwm           = 0.0f; // Bù mô-men xoay tại chỗ khi mang tải nặng (Gyro Feedback)
+
+volatile int lastAckId                  = 0;
+volatile unsigned long testMotorUntilMs = 0;
+
+inline float normalizeAngleDeg(float a) {
+  while (a >  180.0f) a -= 360.0f;
+  while (a < -180.0f) a += 360.0f;
+  return a;
+}
+
+// ===================================================================================
+// TRÌNH PHỤC VỤ NGẮT ENCODER
+// ===================================================================================
+void IRAM_ATTR isrEncLeftA() {
+  int a = gpio_get_level((gpio_num_t)ENC_L_A_PIN);
+  int b = gpio_get_level((gpio_num_t)ENC_L_B_PIN);
+  if (a == b) rawTicksL++; else rawTicksL--;
+}
+
+void IRAM_ATTR isrEncLeftB() {
+  int a = gpio_get_level((gpio_num_t)ENC_L_A_PIN);
+  int b = gpio_get_level((gpio_num_t)ENC_L_B_PIN);
+  if (a != b) rawTicksL++; else rawTicksL--;
+}
+
+void IRAM_ATTR isrEncRightA() {
+  int a = gpio_get_level((gpio_num_t)ENC_R_A_PIN);
+  int b = gpio_get_level((gpio_num_t)ENC_R_B_PIN);
+  if (a != b) rawTicksR++; else rawTicksR--;
+}
+
+void IRAM_ATTR isrEncRightB() {
+  int a = gpio_get_level((gpio_num_t)ENC_R_A_PIN);
+  int b = gpio_get_level((gpio_num_t)ENC_R_B_PIN);
+  if (a == b) rawTicksR++; else rawTicksR--;
+}
+
+void getCalibratedTicks(long &outL, long &outR) {
+  noInterrupts();
+  long rL = rawTicksL;
+  long rR = rawTicksR;
+  interrupts();
+
+  long tL = swapEncoders ? rR : rL;
+  long tR = swapEncoders ? rL : rR;
+
+  outL = invertEncLeft  ? -tL : tL;
+  outR = invertEncRight ? -tR : tR;
+}
+
+// ===================================================================================
+// ĐIỀU KHIỂN ĐỘNG CƠ L298N
+// ===================================================================================
+void writeLeftPwm(int val) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  ledcWrite(L298N_ENA_PIN, val);
+#else
+  ledcWrite(PWM_CH_LEFT, val);
+#endif
+}
+
+void writeRightPwm(int val) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  ledcWrite(L298N_ENB_PIN, val);
+#else
+  ledcWrite(PWM_CH_RIGHT, val);
+#endif
+}
+
+void initMotors() {
+  pinMode(L298N_IN1_PIN, OUTPUT);
+  pinMode(L298N_IN2_PIN, OUTPUT);
+  pinMode(L298N_IN3_PIN, OUTPUT);
+  pinMode(L298N_IN4_PIN, OUTPUT);
+  pinMode(BUTTON_BOOT_PIN, INPUT_PULLUP);
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  ledcAttach(L298N_ENA_PIN, PWM_FREQ_HZ, PWM_RES_BITS);
+  ledcAttach(L298N_ENB_PIN, PWM_FREQ_HZ, PWM_RES_BITS);
+#else
+  ledcSetup(PWM_CH_LEFT, PWM_FREQ_HZ, PWM_RES_BITS);
+  ledcSetup(PWM_CH_RIGHT, PWM_FREQ_HZ, PWM_RES_BITS);
+  ledcAttachPin(L298N_ENA_PIN, PWM_CH_LEFT);
+  ledcAttachPin(L298N_ENB_PIN, PWM_CH_RIGHT);
+#endif
+
+  writeLeftPwm(0);
+  writeRightPwm(0);
+  digitalWrite(L298N_IN1_PIN, LOW);
+  digitalWrite(L298N_IN2_PIN, LOW);
+  digitalWrite(L298N_IN3_PIN, LOW);
+  digitalWrite(L298N_IN4_PIN, LOW);
+}
+
+void setMotors(int leftVal, int rightVal) {
+  cmdPwmL = leftVal;
+  cmdPwmR = rightVal;
+
+  int cmdL = swapMotors ? rightVal : leftVal;
+  int cmdR = swapMotors ? leftVal  : rightVal;
+
+  int l = invertLeftMotor  ? -cmdL : cmdL;
+  int r = invertRightMotor ? -cmdR : cmdR;
+
+  // Bánh Trái
+  if (l > 0) {
+    digitalWrite(L298N_IN1_PIN, HIGH);
+    digitalWrite(L298N_IN2_PIN, LOW);
+    writeLeftPwm(constrain(l, 0, 255));
+  } else if (l < 0) {
+    digitalWrite(L298N_IN1_PIN, LOW);
+    digitalWrite(L298N_IN2_PIN, HIGH);
+    writeLeftPwm(constrain(-l, 0, 255));
+  } else {
+    digitalWrite(L298N_IN1_PIN, LOW);
+    digitalWrite(L298N_IN2_PIN, LOW);
+    writeLeftPwm(0);
+  }
+
+  // Bánh Phải
+  if (r > 0) {
+    digitalWrite(L298N_IN3_PIN, HIGH);
+    digitalWrite(L298N_IN4_PIN, LOW);
+    writeRightPwm(constrain(r, 0, 255));
+  } else if (r < 0) {
+    digitalWrite(L298N_IN3_PIN, LOW);
+    digitalWrite(L298N_IN4_PIN, HIGH);
+    writeRightPwm(constrain(-r, 0, 255));
+  } else {
+    digitalWrite(L298N_IN3_PIN, LOW);
+    digitalWrite(L298N_IN4_PIN, LOW);
+    writeRightPwm(0);
+  }
+}
+
+void stopMotors() {
+  setMotors(0, 0);
+  smoothedBaseSpeed = 0.0f;
+  loadBoostPwm = 0.0f;
+  turnBoostPwm = 0.0f;
+}
+
+// ===================================================================================
+// HÀM KHỞI CHẠY CHẶNG BẤT KỲ TRONG 8 CHẶNG
+// ===================================================================================
+void startMission(LegId leg) {
+  portENTER_CRITICAL(&stateMux);
+  currentLeg = leg;
+  currentStation = LEG_TABLE[leg].fromStation;
+  odomX = STATION_COORDS[currentStation].x;
+  odomY = STATION_COORDS[currentStation].y;
+  legTargetDistM = LEG_TABLE[leg].targetDistM;
+  legTargetHeadingDeg = LEG_TABLE[leg].targetHeadingDeg;
+
+  prevTicksL = globalTicksL;
+  prevTicksR = globalTicksR;
+  legProgressM = 0.0f;
+
+  float headingErr = normalizeAngleDeg(legTargetHeadingDeg - yawDeg);
+  smoothedBaseSpeed = (float)minMovePwm; // Khởi phát ngay từ ngưỡng thắng ma sát tĩnh khi mang tải
+  loadBoostPwm      = 0.0f;
+  turnBoostPwm      = 0.0f;
+  lastLineError     = 0.0f;
+  lastValidError    = 0.0f;
+  lastHeadingErr    = 0.0f;
+  lineLostTimeMs    = 0;
+  inGapBridgeMode   = false;
+  consecutiveZeroLineFrames = 0;
+  cornerSensorTriggered = false;
+  cornerStartWheelDistM = 0.0f;
+
+  bool needTurn = (fabsf(headingErr) > 6.0f);
+  if (needTurn) {
+    startTurnYaw = yawDeg;
+    turnDirectionSign = (headingErr < 0.0f) ? -1 : 1;
+    robotSubState = SUB_TURNING_FOR_MISSION;
+    robotStateStr = "TURNING_TARGET";
+    isRunning = true;
+  } else {
+    robotSubState = SUB_LINE_FOLLOWING;
+    robotStateStr = "RUNNING_FAST";
+    isRunning = true;
+  }
+  portEXIT_CRITICAL(&stateMux);
+
+  if (needTurn) {
+    Serial.printf("\n>> [BẮT ĐẦU CHẶNG: %s] Yaw hiện tại = %.1f° | Cần xoay %+.1f° tới %.1f°...\n",
+                  LEG_TABLE[leg].name, yawDeg, headingErr, legTargetHeadingDeg);
+  } else {
+    Serial.printf("\n>> [BẮT ĐẦU CHẶNG: %s] Đúng hướng %.1f° -> Khởi hành bám line!\n",
+                  LEG_TABLE[leg].name, legTargetHeadingDeg);
+  }
+}
+
+// Lập kế hoạch lộ trình Điểm - Điểm tự động (Tối ưu chiều xoay tại trạm xuất phát)
+void planAndExecuteRoute(StationId fromSt, StationId toSt) {
+  if (fromSt == toSt) {
+    if (toSt != STATION_A) {
+      // Nếu người dùng nhấc xe đặt lại về Trạm gốc A rồi bấm lại trạm đích cũ (B/C/D):
+      // Tự động đặt lại điểm xuất phát về Trạm A (0,0, 90°) để xe thực thi lộ trình từ A -> toSt
+      portENTER_CRITICAL(&stateMux);
+      currentStation = STATION_A;
+      odomX = STATION_COORDS[STATION_A].x;
+      odomY = STATION_COORDS[STATION_A].y;
+      yawDeg = 90.0f;
+      portEXIT_CRITICAL(&stateMux);
+      fromSt = STATION_A;
+      Serial.printf("\n>> [ĐỒNG BỘ TRẠM GỐC A] Tự động xuất phát từ Trạm A ➔ Trạm %c!\n", "ABCD"[toSt]);
+    } else {
+      portENTER_CRITICAL(&stateMux);
+      robotStateStr = "AT_STATION";
+      portEXIT_CRITICAL(&stateMux);
+      Serial.printf("\n>> [THÔNG BÁO] Xe đang ở sẵn trạm đích: %c!\n", "ABCD"[toSt]);
+      return;
+    }
+  }
+
+  queueLength = 0;
+  queueIndex = 0;
+
+  // 1. Kiểm tra chặng trực tiếp kề bên
+  for (int i = 0; i < 8; i++) {
+    if (LEG_TABLE[i].fromStation == fromSt && LEG_TABLE[i].toStation == toSt) {
+      legQueue[0] = (LegId)i;
+      queueLength = 1;
+      break;
+    }
+  }
+
+  // 2. Nếu là trạm đối diện (cách 2 chặng): Chọn nhánh 2 chặng có góc xoay xuất phát nhỏ nhất
+  if (queueLength == 0) {
+    LegId cw0 = LEG_NONE, cw1 = LEG_NONE;
+    LegId ccw0 = LEG_NONE, ccw1 = LEG_NONE;
+
+    if (fromSt == STATION_A && toSt == STATION_C) {
+      cw0 = LEG_AB; cw1 = LEG_BC;
+      ccw0 = LEG_AD; ccw1 = LEG_DC;
+    } else if (fromSt == STATION_C && toSt == STATION_A) {
+      cw0 = LEG_CD; cw1 = LEG_DA;
+      ccw0 = LEG_CB; ccw1 = LEG_BA;
+    } else if (fromSt == STATION_B && toSt == STATION_D) {
+      cw0 = LEG_BC; cw1 = LEG_CD;
+      ccw0 = LEG_BA; ccw1 = LEG_AD;
+    } else if (fromSt == STATION_D && toSt == STATION_B) {
+      cw0 = LEG_DA; cw1 = LEG_AB;
+      ccw0 = LEG_DC; ccw1 = LEG_CB;
+    }
+
+    if (cw0 != LEG_NONE && ccw0 != LEG_NONE) {
+      float errCw  = fabsf(normalizeAngleDeg(LEG_TABLE[cw0].targetHeadingDeg - yawDeg));
+      float errCcw = fabsf(normalizeAngleDeg(LEG_TABLE[ccw0].targetHeadingDeg - yawDeg));
+      if (errCcw + 5.0f < errCw) {
+        legQueue[0] = ccw0;
+        legQueue[1] = ccw1;
+      } else {
+        legQueue[0] = cw0;
+        legQueue[1] = cw1;
+      }
+      queueLength = 2;
+    }
+  }
+
+  if (queueLength > 0) {
+    autoLoopEnabled = false;
+    Serial.printf("\n🚀 [LỘ TRÌNH ĐIỂM - ĐIỂM] Từ Trạm %c ➔ Trạm %c (%d chặng): Chặng 1 = %s\n",
+                  "ABCD"[fromSt], "ABCD"[toSt], queueLength, LEG_TABLE[legQueue[0]].name);
+    startMission(legQueue[0]);
+  }
+}
+
+void advanceToNextLeg() {
+  // Nếu đang có hàng đợi lộ trình Point-to-Point
+  if (queueLength > 0 && (queueIndex + 1) < queueLength) {
+    queueIndex++;
+    Serial.printf("\n>> [TIẾP TỤC LỘ TRÌNH] Chặng %d/%d: %s\n", queueIndex + 1, queueLength, LEG_TABLE[legQueue[queueIndex]].name);
+    startMission(legQueue[queueIndex]);
+    return;
+  }
+  queueLength = 0; // Đã xong lộ trình
+
+  // Nếu trong chế độ tự động tuần hoàn
+  if (autoLoopReverse) {
+    // Vòng ngược: A -> D -> C -> B -> A
+    if (currentLeg == LEG_AD) startMission(LEG_DC);
+    else if (currentLeg == LEG_DC) startMission(LEG_CB);
+    else if (currentLeg == LEG_CB) startMission(LEG_BA);
+    else startMission(LEG_AD);
+  } else {
+    // Vòng xuôi: A -> B -> C -> D -> A
+    if (currentLeg == LEG_AB) startMission(LEG_BC);
+    else if (currentLeg == LEG_BC) startMission(LEG_CD);
+    else if (currentLeg == LEG_CD) startMission(LEG_DA);
+    else startMission(LEG_AB);
+  }
+}
+
+void advanceToPrevLeg() {
+  // Lệnh lùi 1 trạm theo hướng ngược lại
+  if (currentStation == STATION_A) startMission(LEG_AD);
+  else if (currentStation == STATION_D) startMission(LEG_DC);
+  else if (currentStation == STATION_C) startMission(LEG_CB);
+  else if (currentStation == STATION_B) startMission(LEG_BA);
+}
+
+void startManualTurn(float deltaAngleDeg) {
+  portENTER_CRITICAL(&stateMux);
+  legTargetHeadingDeg = normalizeAngleDeg(yawDeg + deltaAngleDeg);
+  turnDirectionSign = (deltaAngleDeg < 0.0f) ? -1 : 1;
+  robotSubState = SUB_TURNING_MANUAL;
+  robotStateStr = "TURNING_MANUAL";
+  isRunning = true;
+  smoothedBaseSpeed = 0.0f;
+  portEXIT_CRITICAL(&stateMux);
+  Serial.printf("\n>> [LỆNH XOAY THỦ CÔNG] Xoay %+.1f° tới hướng đích %.1f°...\n", deltaAngleDeg, legTargetHeadingDeg);
+}
+
+// ===================================================================================
+// CẢM BIẾN DÒ LINE & MPU-6050
+// ===================================================================================
+void initLineSensors() {
+  CLEAR_PERI_REG_MASK(USB_SERIAL_JTAG_CONF0_REG,
+                      USB_SERIAL_JTAG_USB_PAD_ENABLE |
+                      USB_SERIAL_JTAG_DP_PULLUP |
+                      USB_SERIAL_JTAG_DM_PULLUP |
+                      USB_SERIAL_JTAG_DP_PULLDOWN |
+                      USB_SERIAL_JTAG_DM_PULLDOWN);
+  SET_PERI_REG_MASK(USB_SERIAL_JTAG_CONF0_REG, USB_SERIAL_JTAG_PAD_PULL_OVERRIDE);
+
+  gpio_reset_pin((gpio_num_t)LINE_L2_PIN);
+  gpio_reset_pin((gpio_num_t)LINE_L1_PIN);
+  gpio_reset_pin((gpio_num_t)LINE_C_PIN);
+  gpio_reset_pin((gpio_num_t)LINE_R1_PIN);
+  gpio_reset_pin((gpio_num_t)LINE_R2_PIN);
+
+  pinMode(LINE_L2_PIN, INPUT_PULLUP);
+  pinMode(LINE_L1_PIN, INPUT_PULLUP);
+  pinMode(LINE_C_PIN,  INPUT_PULLUP);
+  pinMode(LINE_R1_PIN, INPUT_PULLUP);
+  pinMode(LINE_R2_PIN, INPUT_PULLUP);
+}
+
+int readLineSensors(int &sL2, int &sL1, int &sC, int &sR1, int &sR2) {
+  sL2 = digitalRead(LINE_L2_PIN);
+  sL1 = digitalRead(LINE_L1_PIN);
+  sC  = digitalRead(LINE_C_PIN);
+  sR1 = digitalRead(LINE_R1_PIN);
+  sR2 = digitalRead(LINE_R2_PIN);
+
+  int mask = (sL2 << 4) | (sL1 << 3) | (sC << 2) | (sR1 << 1) | sR2;
+
+  // Lọc mẫu nhiễu lóa sáng quang học (10001)
+  if (mask == 0b10001) {
+    sL2 = 0; sL1 = 0; sC = 0; sR1 = 0; sR2 = 0;
+    return 0;
+  }
+
+  // Chế độ mô phỏng đứt vạch nhân tạo
+  if (simulateGapActive) {
+    float simTraveled = legProgressM - simGapStartLegDistM;
+    if (simTraveled >= 0.0f && simTraveled < SIM_GAP_LENGTH_M) {
+      sL2 = 0; sL1 = 0; sC = 0; sR1 = 0; sR2 = 0;
+      return 0;
+    } else if (simTraveled >= SIM_GAP_LENGTH_M) {
+      simulateGapActive = false;
+      Serial.println("\n>> [GIẢ LẬP ĐỨT VẠCH XONG] Trở lại vạch thật!");
+    }
+  }
+
+  return mask;
+}
+
+bool writeReg8(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  return (Wire.endTransmission() == 0);
+}
+
+int16_t readReg16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((int)addr, 2);
+  if (Wire.available() == 2) {
+    return (int16_t)((Wire.read() << 8) | Wire.read());
+  }
+  return 0;
+}
+
+void calibrateGyroZ(int samples = 500) {
+  double sum = 0;
+  for (int i = 0; i < samples; i++) {
+    int16_t r = readReg16(MPU6050_ADDR, 0x47);
+    sum += (r / 32.8f);
+    delay(2);
+  }
+  gyroZOffset = (float)(sum / samples);
+}
+
+void initMPU() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 100000);
+  delay(50);
+  Wire.beginTransmission(MPU6050_ADDR);
+  if (Wire.endTransmission() == 0) {
+    writeReg8(MPU6050_ADDR, 0x6B, 0x00);
+    delay(10);
+    writeReg8(MPU6050_ADDR, 0x1A, 0x03);
+    writeReg8(MPU6050_ADDR, 0x1B, 0x10);
+    mpuConnected = true;
+    calibrateGyroZ(400);
+  }
+}
+
+// ===================================================================================
+// KHỞI TẠO & ĐỌC CẢM BIẾN DÒNG/ÁP INA226 (I2C1 - GPIO 8 & 9)
+// ===================================================================================
+bool writeInaReg16(uint8_t reg, uint16_t value) {
+  I2C_INA.beginTransmission(INA226_ADDR);
+  I2C_INA.write(reg);
+  I2C_INA.write((uint8_t)(value >> 8));
+  I2C_INA.write((uint8_t)(value & 0xFF));
+  return (I2C_INA.endTransmission() == 0);
+}
+
+bool readInaReg16(uint8_t reg, uint16_t &value) {
+  I2C_INA.beginTransmission(INA226_ADDR);
+  I2C_INA.write(reg);
+  uint8_t err = I2C_INA.endTransmission(false);
+  if (err != 0) {
+    I2C_INA.beginTransmission(INA226_ADDR);
+    I2C_INA.write(reg);
+    err = I2C_INA.endTransmission(true);
+    if (err != 0) return false;
+  }
+  uint8_t count = I2C_INA.requestFrom((uint8_t)INA226_ADDR, (uint8_t)2);
+  if (count < 2) return false;
+  uint8_t msb = I2C_INA.read();
+  uint8_t lsb = I2C_INA.read();
+  value = ((uint16_t)msb << 8) | (uint16_t)lsb;
+  return true;
+}
+
+void initINA226() {
+  pinMode(INA_SDA_PIN, INPUT_PULLUP);
+  pinMode(INA_SCL_PIN, OUTPUT);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(INA_SCL_PIN, HIGH); delayMicroseconds(5);
+    digitalWrite(INA_SCL_PIN, LOW);  delayMicroseconds(5);
+  }
+  digitalWrite(INA_SCL_PIN, HIGH);
+  pinMode(INA_SCL_PIN, INPUT_PULLUP);
+  delayMicroseconds(20);
+
+  I2C_INA.begin(INA_SDA_PIN, INA_SCL_PIN, 100000);
+  I2C_INA.setTimeOut(25);
+
+  I2C_INA.beginTransmission(INA226_ADDR);
+  if (I2C_INA.endTransmission() == 0) {
+    inaDetected = true;
+    writeInaReg16(INA226_REG_CONFIG, 0x4127);
+    uint16_t calVal = (uint16_t)(0.00512f / (0.0001f * rShunt));
+    writeInaReg16(INA226_REG_CALIBRATION, calVal);
+    Serial.println("✅ [INA226]: Khởi tạo cảm biến năng lượng trên GPIO 8, 9 THÀNH CÔNG!");
+  } else {
+    inaDetected = false;
+    Serial.println("⚠️ [INA226]: Không thấy cảm biến INA226 trên GPIO 8, 9 (Chạy chế độ điều hướng thuần túy).");
+  }
+}
+
+void updatePowerSensors() {
+  if (!inaDetected) return;
+  uint16_t rawBus = 0;
+  uint16_t rawShunt = 0;
+  if (!readInaReg16(INA226_REG_BUSVOLTAGE, rawBus) || !readInaReg16(INA226_REG_SHUNTVOLTAGE, rawShunt)) return;
+
+  unsigned long nowUs = micros();
+  float dtSec = (float)(nowUs - lastPowerCalcUs) / 1000000.0f;
+  if (dtSec < 0.0f || dtSec > 1.0f) dtSec = 0.05f;
+  lastPowerCalcUs = nowUs;
+
+  liveBusV = (float)rawBus * 0.00125f;
+  int16_t signedShunt = (int16_t)rawShunt;
+  float shunt_mV = (float)signedShunt * 0.0025f;
+  liveCurrentA = (shunt_mV / 1000.0f) / rShunt;
+  livePowerW = liveBusV * liveCurrentA;
+  if (livePowerW < 0) livePowerW = -livePowerW;
+
+  if (liveCurrentA > 0.005f) {
+    liveEnergyMah += (liveCurrentA * 1000.0f) * (dtSec / 3600.0f);
+    liveEnergyWh  += livePowerW * (dtSec / 3600.0f);
+  }
+}
+
+// ===================================================================================
+// CORE 1: ĐIỀU KHIỂN THỜI GIAN THỰC 100Hz (BỔ TRỢ XOAY 180° & CẦU NỐI QUÁN TÍNH)
+// ===================================================================================
+void updateControlAndOdometry(float dt = 0.010f) {
+  // 1. Cập nhật góc Yaw từ MPU-6050
+  if (mpuConnected) {
+    int16_t rGz = readReg16(MPU6050_ADDR, 0x47);
+    float gzRaw = (rGz / 32.8f);
+
+    if (!isRunning && (testMotorUntilMs < millis()) && (robotSubState == SUB_STOPPED || robotSubState == SUB_PAUSE_AT_STATION)) {
+      gyroZOffset = 0.995f * gyroZOffset + 0.005f * gzRaw;
+      liveGzDps = 0.0f;
+    } else {
+      // Quy ước Đề-các chuẩn (Gốc dưới-trái, +X sang phải 0°, +Y hướng lên +90°):
+      // Xoay Trái (CCW) -> gz > 0 (tăng yawDeg); Xoay Phải (CW) -> gz < 0 (giảm yawDeg)
+      float gz = (gzRaw - gyroZOffset);
+      if (fabsf(gz) < 0.25f) gz = 0.0f;
+      liveGzDps = gz;
+      yawDeg = normalizeAngleDeg(yawDeg + gz * dt);
+    }
+  }
+
+  // 2. Cập nhật Odometry
+  long curL, curR;
+  getCalibratedTicks(curL, curR);
+  globalTicksL = curL;
+  globalTicksR = curR;
+
+  long dL = curL - prevTicksL;
+  long dR = curR - prevTicksR;
+  prevTicksL = curL;
+  prevTicksR = curR;
+
+  float deltaSL = (float)dL / TICKS_PER_METER;
+  float deltaSR = (float)dR / TICKS_PER_METER;
+  float deltaS  = (deltaSL + deltaSR) / 2.0f;
+
+  // Khóa dịch chuyển tịnh tiến khi xe đang xoay tại chỗ để triệt tiêu sai số trượt bánh làm lệch quỹ đạo
+  bool isTurningInPlace = (robotSubState == SUB_TURNING_FOR_MISSION ||
+                           robotSubState == SUB_TURNING_REVERSE_SEARCH ||
+                           robotSubState == SUB_TURNING_MANUAL);
+  if (isTurningInPlace) {
+    deltaS = 0.0f;
+  }
+
+  currentSpeed = (deltaS / dt) * 100.0f;
+  totalDistM += fabsf(deltaS);
+
+  float rad = (yawDeg * PI) / 180.0f;
+  odomX += deltaS * cosf(rad);
+  odomY += deltaS * sinf(rad);
+
+  // Cập nhật cảm biến năng lượng INA226 định kỳ (20Hz = mỗi 5 chu kỳ 100Hz)
+  static int powerDiv = 0;
+  if (++powerDiv >= 5) {
+    powerDiv = 0;
+    updatePowerSensors();
+  }
+
+  // 3. Đọc mắt cảm biến
+  int sL2, sL1, sC, sR1, sR2;
+  lineMask = readLineSensors(sL2, sL1, sC, sR1, sR2);
+  int activeCount = sL2 + sL1 + sC + sR1 + sR2;
+
+  // ---------------------------------------------------------------------------------
+  // TRẠNG THÁI 0: NGHỈ TẠI TRẠM (2 GIÂY TRONG CHẾ ĐỘ AUTO LOOP)
+  // ---------------------------------------------------------------------------------
+  if (robotSubState == SUB_PAUSE_AT_STATION) {
+    setMotors(0, 0);
+    if (millis() >= stationPauseUntilMs) {
+      advanceToNextLeg();
+    }
+    return;
+  }
+
+  // ---------------------------------------------------------------------------------
+  // TRẠNG THÁI 1A: XOAY TẠI TRẠM DỰA TRÊN GÓC HƯỚNG BẢN ĐỒ & KHÓA VẠCH ĐÍCH
+  // ---------------------------------------------------------------------------------
+  if (robotSubState == SUB_TURNING_FOR_MISSION) {
+    float err = normalizeAngleDeg(legTargetHeadingDeg - yawDeg);
+    float absErr = fabsf(err);
+    float rotatedSoFar = fabsf(normalizeAngleDeg(yawDeg - startTurnYaw));
+
+    // ĐIỀU KIỆN KHÓA VẠCH AN TOÀN:
+    // 1. Đã xoay thoát khỏi vạch ban đầu (rotatedSoFar >= 20°)
+    // 2. Góc hướng đã tiệm cận góc đích (|err| <= 18°) -> Tránh bắt nhầm nhánh vuông khi quay đầu 180°
+    // 3. Mắt giữa sC hoặc sL1/sR1 chạm vạch mới
+    bool centerOnLine = (sC == 1) || ((sL1 + sR1) >= 1 && absErr <= 8.0f);
+    bool lineCaught = (absErr <= 18.0f) && (rotatedSoFar >= 20.0f) && centerOnLine;
+
+    if (lineCaught) {
+      setMotors(0, 0);
+      smoothedBaseSpeed = 0.0f;
+      loadBoostPwm = 0.0f;
+      turnBoostPwm = 0.0f;
+      yawDeg = legTargetHeadingDeg;
+      prevTicksL = globalTicksL;
+      prevTicksR = globalTicksR;
+      legProgressM = 0.0f;
+      lastLineError = 0.0f;
+      lastValidError = 0.0f;
+      lastHeadingErr = 0.0f;
+      inGapBridgeMode = false;
+      consecutiveZeroLineFrames = 0;
+      cornerSensorTriggered = false;
+      cornerStartWheelDistM = 0.0f;
+      robotSubState = SUB_LINE_FOLLOWING;
+      robotStateStr = "RUNNING_FAST";
+      isRunning = true;
+      Serial.printf("\n🎯 [KHÓA VẠCH THÀNH CÔNG] Đã bắt đúng vạch chặng %s tại Yaw = %.1f° -> Khởi hành bám line!\n",
+                    LEG_TABLE[currentLeg].name, yawDeg);
+      return;
+    }
+
+    // Nếu góc Gyro đã đạt mục tiêu (|err| <= 2.5°):
+    if (absErr <= 2.5f) {
+      setMotors(0, 0);
+      smoothedBaseSpeed = 0.0f;
+      loadBoostPwm = 0.0f;
+      turnBoostPwm = 0.0f;
+      yawDeg = legTargetHeadingDeg;
+
+      // Kiểm tra nếu mắt giữa đã chạm vạch đen:
+      if ((lineMask & 0b01110) != 0) {
+        prevTicksL = globalTicksL;
+        prevTicksR = globalTicksR;
+        legProgressM = 0.0f;
+        lastLineError = 0.0f;
+        lastValidError = 0.0f;
+        lastHeadingErr = 0.0f;
+        inGapBridgeMode = false;
+        consecutiveZeroLineFrames = 0;
+        cornerSensorTriggered = false;
+        cornerStartWheelDistM = 0.0f;
+        robotSubState = SUB_LINE_FOLLOWING;
+        robotStateStr = "RUNNING_FAST";
+        isRunning = true;
+        Serial.printf("\n🎯 [ĐẠT GÓC & BẮT VẠCH] Chặng %s Yaw = %.1f° -> Khởi hành bám line!\n",
+                      LEG_TABLE[currentLeg].name, yawDeg);
+        return;
+      } else {
+        // Góc đã tới nhưng mắt chưa thấy vạch -> Chuyển sang quét tìm vạch nhẹ nhàng (Reverse Search)
+        robotSubState = SUB_TURNING_REVERSE_SEARCH;
+        turnSearchStartMs = millis();
+        return;
+      }
+    }
+
+    // Bù mô-men xoay vòng kín (Closed-Loop Turn Torque Boost):
+    // Nếu xe mang tải nặng làm vận tốc góc |liveGzDps| < 18 deg/s, tự động đẩy thêm PWM xoay tới 255
+    if (fabsf(liveGzDps) < 18.0f) {
+      turnBoostPwm = min(55.0f, turnBoostPwm + 2.5f);
+    } else if (fabsf(liveGzDps) > 45.0f) {
+      turnBoostPwm = max(0.0f, turnBoostPwm - 1.5f);
+    }
+
+    int baseTurn = (absErr > 45.0f) ? turnPwm : ((absErr > 15.0f) ? (turnPwm - 10) : 172);
+    int turnFloor = (absErr > 15.0f) ? minMovePwm : 165;
+    int turnSpeed = constrain(baseTurn + (int)turnBoostPwm, turnFloor, maxPwm);
+    int dir = (absErr > 150.0f) ? turnDirectionSign : ((err < 0.0f) ? -1 : 1);
+    if (dir > 0) setMotors(-turnSpeed, turnSpeed); // Quay Trái (CCW, tăng Yaw)
+    else setMotors(turnSpeed, -turnSpeed);         // Quay Phải (CW, giảm Yaw)
+    return;
+  }
+
+  // ---------------------------------------------------------------------------------
+  // TRẠNG THÁI 1B: QUÉT TÌM VẠCH NẾU QUAY LỐ HOẶC CHƯA BẮT ĐƯỢC LINE
+  // ---------------------------------------------------------------------------------
+  if (robotSubState == SUB_TURNING_REVERSE_SEARCH) {
+    bool found = ((lineMask & 0b01110) != 0);
+    bool timeout = (millis() - turnSearchStartMs > 800);
+
+    if (found || timeout) {
+      setMotors(0, 0);
+      smoothedBaseSpeed = 0.0f;
+      loadBoostPwm = 0.0f;
+      turnBoostPwm = 0.0f;
+      prevTicksL = globalTicksL;
+      prevTicksR = globalTicksR;
+      legProgressM = 0.0f;
+      lastLineError = 0.0f;
+      lastValidError = 0.0f;
+      lastHeadingErr = 0.0f;
+      inGapBridgeMode = false;
+      consecutiveZeroLineFrames = 0;
+      cornerSensorTriggered = false;
+      cornerStartWheelDistM = 0.0f;
+      robotSubState = SUB_LINE_FOLLOWING;
+      robotStateStr = "RUNNING_FAST";
+      isRunning = true;
+      Serial.printf("\n🎯 [QUÉT TÌM VẠCH XONG] Chặng %s (%s) -> Tiến bám line!\n",
+                    LEG_TABLE[currentLeg].name, found ? "Đã bắt được vạch" : "Hết thời gian quét");
+      return;
+    }
+
+    float err = normalizeAngleDeg(legTargetHeadingDeg - startTurnYaw);
+    int sweepSpeed = 175;
+    // Đảo chiều quay chậm quét qua lại tìm line
+    if (err < 0.0f) setMotors(sweepSpeed, -sweepSpeed);
+    else setMotors(-sweepSpeed, sweepSpeed);
+    return;
+  }
+
+  // ---------------------------------------------------------------------------------
+  // TRẠNG THÁI 1C: XOAY THỦ CÔNG
+  // ---------------------------------------------------------------------------------
+  if (robotSubState == SUB_TURNING_MANUAL) {
+    float err = normalizeAngleDeg(legTargetHeadingDeg - yawDeg);
+    float absErr = fabsf(err);
+
+    if (absErr <= 2.5f) {
+      stopMotors();
+      yawDeg = legTargetHeadingDeg;
+      robotSubState = SUB_STOPPED;
+      robotStateStr = "STOPPED";
+      isRunning = false;
+      return;
+    }
+
+    if (fabsf(liveGzDps) < 18.0f) {
+      turnBoostPwm = min(55.0f, turnBoostPwm + 2.5f);
+    } else if (fabsf(liveGzDps) > 45.0f) {
+      turnBoostPwm = max(0.0f, turnBoostPwm - 1.5f);
+    }
+
+    int baseTurn = (absErr > 40.0f) ? turnPwm : ((absErr > 15.0f) ? (turnPwm - 6) : (turnPwm - 10));
+    int turnSpeed = constrain(baseTurn + (int)turnBoostPwm, minMovePwm, maxPwm);
+    int dir = (absErr > 150.0f) ? turnDirectionSign : ((err < 0.0f) ? -1 : 1);
+    if (dir > 0) setMotors(-turnSpeed, turnSpeed); // Quay Trái (CCW, tăng Yaw)
+    else setMotors(turnSpeed, -turnSpeed);         // Quay Phải (CW, giảm Yaw)
+    return;
+  }
+
+  // ---------------------------------------------------------------------------------
+  // TRẠNG THÁI 2: TEST ĐỘNG CƠ 1 GIÂY
+  // ---------------------------------------------------------------------------------
+  if (testMotorUntilMs > millis()) {
+    setMotors(205, 205);
+    robotStateStr = "MOTOR_TEST";
+    return;
+  }
+
+  if (!isRunning || robotSubState == SUB_STOPPED) {
+    stopMotors();
+    if (robotStateStr != "AT_STATION" && robotStateStr != "GAP_TIMEOUT_STOP") {
+      robotStateStr = "STOPPED";
+    }
+    return;
+  }
+
+  // ---------------------------------------------------------------------------------
+  // TRẠNG THÁI 3: DẪN ĐƯỜNG BẰNG BẢN ĐỒ & ĐẢM BẢO 2 BÁNH XE CHẠM VẠCH TRẠM ĐÍCH
+  // ---------------------------------------------------------------------------------
+  legProgressM += deltaS;
+  float remainingLegM = legTargetDistM - legProgressM;
+  float sensorReachCornerDistM = legTargetDistM - DIST_AXLE_TO_SENSOR_M;
+
+  StationId fromSt = LEG_TABLE[currentLeg].fromStation;
+  StationId destSt = LEG_TABLE[currentLeg].toStation;
+  float targetX = STATION_COORDS[destSt].x;
+  float targetY = STATION_COORDS[destSt].y;
+
+  int leftPwm  = 0;
+  int rightPwm = 0;
+
+  // BÙ MÔ-MEN TẢI VÒNG KÍN (CLOSED-LOOP LOAD TORQUE BOOST):
+  // Khi xe đang chạy hoặc giảm tốc về trạm mà mang tải nặng làm vận tốc thực (currentSpeed từ Encoder)
+  // tụt xuống dưới 12.0 cm/s, tự động cộng bù PWM (tối đa +43 PWM -> chạm ngưỡng 255 PWM = 100% công suất)
+  // giúp xe thắng hoàn toàn ma sát lăn/tĩnh để tiến dứt khoát tới vạch đích, tuyệt đối không bị đứng khựng!
+  if (currentSpeed < 12.0f) {
+    loadBoostPwm = min(43.0f, loadBoostPwm + 2.5f);
+  } else if (currentSpeed > 18.0f) {
+    loadBoostPwm = max(0.0f, loadBoostPwm - 1.0f);
+  }
+
+  // Phát hiện thời điểm dàn mắt cảm biến (cách 2 bánh xe L = 23cm về phía trước) chạm vạch ngang của trạm đích:
+  if (!cornerSensorTriggered && legProgressM >= (sensorReachCornerDistM - 0.08f)) {
+    if (activeCount >= 3 || legProgressM >= sensorReachCornerDistM) {
+      cornerSensorTriggered = true;
+      cornerStartWheelDistM = legProgressM;
+      Serial.printf("\n📐 [MẮT CHẠM VẠCH ĐÍCH] Tại %.2fm -> Đẩy thẳng 2 bánh xe thêm %.2fm để trục bánh đè đúng lên vạch Trạm %c!\n",
+                    legProgressM, DIST_AXLE_TO_SENSOR_M, "ABCD"[destSt]);
+    }
+  }
+
+  // GIAI ĐOẠN 3.1: ĐẨY TIẾP TRỤC 2 BÁNH XE THÊM ĐÚNG L = 23cm ĐỂ GIỮA 2 BÁNH XE CHẠM ĐÚNG VẠCH ĐÍCH
+  // CHỈ KÍCH HOẠT KHI MẮT CẢM BIẾN ĐÃ THỰC SỰ THẤY VẠCH TRẠM ĐÍCH (cornerSensorTriggered)
+  if (cornerSensorTriggered) {
+    float wheelRollPastSensorM = legProgressM - cornerStartWheelDistM;
+    bool wheelsOnTargetLine = (remainingLegM <= 0.005f) || (wheelRollPastSensorM >= (DIST_AXLE_TO_SENSOR_M - 0.01f));
+
+    if (wheelsOnTargetLine) {
+      stopMotors();
+
+      // Điểm giữa 2 bánh xe đã chạm đúng vạch trạm đích -> Cập nhật trạm & neo tọa độ Map chuẩn
+      currentStation = destSt;
+      odomX = targetX;
+      odomY = targetY;
+      yawDeg = legTargetHeadingDeg;
+
+      Serial.printf("\n🏁 [2 BÁNH XE ĐÃ CHẠM VẠCH TRẠM %c] Chặng %s hoàn tất | Tọa độ trục bánh: X=%.3fm, Y=%.3fm, Yaw=%.1f°\n",
+                    "ABCD"[currentStation], LEG_TABLE[currentLeg].name, odomX, odomY, yawDeg);
+
+      // Phân biệt trạm trung gian (TRANSIT_PAUSE) với trạm đích cuối (AT_STATION):
+      if (queueLength > 0 && (queueIndex + 1) < queueLength) {
+        stationPauseUntilMs = millis() + 1200;
+        robotSubState = SUB_PAUSE_AT_STATION;
+        robotStateStr = "TRANSIT_PAUSE";
+        isRunning = true;
+      } else if (autoLoopEnabled) {
+        stationPauseUntilMs = millis() + 2000;
+        robotSubState = SUB_PAUSE_AT_STATION;
+        robotStateStr = "AT_STATION";
+        isRunning = true;
+      } else {
+        queueLength = 0;
+        // Cập nhật sẵn chặng kế tiếp xuất phát từ trạm vừa tới để nếu bấm START xe đi tiếp luôn
+        if (currentStation == STATION_A) currentLeg = LEG_AB;
+        else if (currentStation == STATION_B) currentLeg = LEG_BC;
+        else if (currentStation == STATION_C) currentLeg = LEG_CD;
+        else if (currentStation == STATION_D) currentLeg = LEG_DA;
+        robotSubState = SUB_STOPPED;
+        robotStateStr = "AT_STATION";
+        isRunning = false;
+      }
+      return;
+    }
+
+    // Trong 23cm cuối đưa 2 bánh xe vào chạm vạch: Duy trì mô-men cao (brakePwm + loadBoostPwm >= minMovePwm)
+    // kết hợp khóa cứng hướng theo góc Map của chặng để xe mang tải nặng vẫn tiến dứt khoát tới đích
+    float hErr = normalizeAngleDeg(legTargetHeadingDeg - yawDeg);
+    float dHErr = (hErr - lastHeadingErr) / fmaxf(dt, 0.001f);
+    lastHeadingErr = hErr;
+    float u_h = (3.5f * hErr) + (0.40f * dHErr);
+    int approachBase = constrain((int)(brakePwm + loadBoostPwm), minMovePwm, maxPwm);
+    leftPwm  = constrain((int)(approachBase - u_h), minMovePwm, maxPwm);
+    rightPwm = constrain((int)(approachBase + u_h), minMovePwm, maxPwm);
+    robotStateStr = "APPROACH_CORNER";
+    setMotors(leftPwm, rightPwm);
+    return;
+  }
+
+  // Trường hợp xe chạy quá quãng đường chặng mà KHÔNG thấy vạch trạm đích:
+  // DỪNG KHẨN CẤP ĐỂ BẢO VỆ, TUYỆT ĐỐI KHÔNG ÉP CỨNG TỌA ĐỘ VỀ ĐÍCH ẢO!
+  if (!cornerSensorTriggered && remainingLegM <= -0.15f) {
+    stopMotors();
+    robotSubState = SUB_STOPPED;
+    robotStateStr = "MISSED_STATION_STOP";
+    isRunning = false;
+    Serial.printf("\n⚠️ [DỪNG BẢO VỆ] Đã chạy %.2fm quá trạm đích nhưng không thấy vạch trạm %c! Dừng xe kiểm tra.\n",
+                  legProgressM, "ABCD"[destSt]);
+    return;
+  }
+
+  // =================================================================================
+  // GIAI ĐOẠN 3.2: XỬ LÝ VƯỢT ĐỨT ĐOẠN / VẠCH MỜ / CẦU NỐI QUÁN TÍNH (ACTIVECOUNT == 0)
+  // =================================================================================
+  if (activeCount == 0) {
+    consecutiveZeroLineFrames++;
+
+    // Lọc nhiễu / vạch mờ thoáng qua (3 chu kỳ đầu ~30ms): Giữ lái theo quán tính lỗi vạch trước đó
+    if (consecutiveZeroLineFrames <= 3 && !inGapBridgeMode) {
+      float u = (Kp_line * lastValidError);
+      leftPwm  = constrain((int)(smoothedBaseSpeed + u), 0, maxPwm);
+      rightPwm = constrain((int)(smoothedBaseSpeed - u), 0, maxPwm);
+      robotStateStr = "LINE_FLICKER_FILTER";
+      setMotors(leftPwm, rightPwm);
+      return;
+    }
+
+    if (!inGapBridgeMode) {
+      inGapBridgeMode = true;
+      gapStartTimeMs = millis();
+      gapStartDistM = totalDistM;
+      gapHeadingHoldDeg = legTargetHeadingDeg;
+      lastValidError = 0.0f; // Reset lỗi cũ để không bị bẻ lái lệch hướng khi đang vượt đứt đoạn
+      lastHeadingErr = 0.0f;
+      Serial.printf("\n⚡ [VƯỢT ĐỨT ĐOẠN] Cầu Nối Quán Tính trên chặng %s! Khóa Yaw thẳng = %.1f°\n",
+                    LEG_TABLE[currentLeg].name, gapHeadingHoldDeg);
+    }
+
+    float gapTraveled = totalDistM - gapStartDistM;
+
+    // Giới hạn an toàn: Nếu vượt quá MAX_BRIDGE_DISTANCE_M (0.90m) hoặc quá 5s không thấy vạch -> DỪNG KHẨN CẤP
+    if (gapTraveled > MAX_BRIDGE_DISTANCE_M || (millis() - gapStartTimeMs > MAX_BRIDGE_TIME_MS)) {
+      stopMotors();
+      robotSubState = SUB_STOPPED;
+      robotStateStr = "GAP_TIMEOUT_STOP";
+      isRunning = false;
+      Serial.printf("\n❌ [DỪNG AN TOÀN] Vượt quá %.2fm không thấy lại vạch line! Dừng để tránh lệch đường.\n", gapTraveled);
+      return;
+    }
+
+    // Vượt đoạn đứt thẳng: Khóa góc Yaw thẳng theo hướng chặng legTargetHeadingDeg
+    // TUYỆT ĐỐI KHÔNG quay bánh tại chỗ (LOST_CURVE_LEFT/RIGHT) vì trên đường thẳng sẽ làm xe quay mòng mòng!
+    float hErr = normalizeAngleDeg(gapHeadingHoldDeg - yawDeg);
+    float dHErr = (hErr - lastHeadingErr) / fmaxf(dt, 0.001f);
+    lastHeadingErr = hErr;
+    float u_h = (3.5f * hErr) + (0.40f * dHErr);
+
+    int targetBase = (remainingLegM < 0.23f) ? brakePwm : bridgePwm;
+    if (targetBase > smoothedBaseSpeed) smoothedBaseSpeed = min((float)targetBase, smoothedBaseSpeed + MAX_RAMP_STEP);
+    else if (targetBase < smoothedBaseSpeed) smoothedBaseSpeed = max((float)targetBase, smoothedBaseSpeed - MAX_RAMP_STEP);
+
+    int effectiveBase = constrain((int)(smoothedBaseSpeed + loadBoostPwm), 170, maxPwm);
+
+    leftPwm  = constrain((int)(effectiveBase - u_h), 140, maxPwm);
+    rightPwm = constrain((int)(effectiveBase + u_h), 140, maxPwm);
+    robotStateStr = "DEAD_RECKONING_BRIDGE";
+    setMotors(leftPwm, rightPwm);
+    return;
+
+  } else {
+    // ===============================================================================
+    // GIAI ĐOẠN 3.3: BÁM LINE 100% QUANG HỌC KẾT HỢP NỘI SUY TỌA ĐỘ VÀ KHỬ TRÔI GYRO
+    // ===============================================================================
+    consecutiveZeroLineFrames = 0;
+
+    if (inGapBridgeMode) {
+      float gapCrossedM = totalDistM - gapStartDistM;
+      inGapBridgeMode = false;
+      Serial.printf("\n🎯 [BẮT LẠI VẠCH THÀNH CÔNG] Đã vượt qua %.2fm vạch đứt trên chặng %s -> Tiếp tục bám line!\n",
+                    gapCrossedM, LEG_TABLE[currentLeg].name);
+    }
+
+    lineLostTimeMs = 0;
+
+    currentLineErr = (float)(-2*sL2 + -1*sL1 + 0*sC + 1*sR1 + 2*sR2) / (float)activeCount;
+    lastValidError = currentLineErr;
+
+    // 1. Khử trôi góc Yaw và nội suy nhẹ tọa độ ngang (Cross-Track) vào đường thẳng chuẩn của Bản đồ:
+    // Chỉ thực hiện khi xe đang bám vạch tương đối chính xác ở giữa (|err| < 0.6)
+    if (fabsf(currentLineErr) < 0.6f) {
+      float expectedHeading = legTargetHeadingDeg - (currentLineErr * 3.0f);
+      float headingDiff = normalizeAngleDeg(expectedHeading - yawDeg);
+      if (fabsf(headingDiff) < 25.0f) {
+        yawDeg = normalizeAngleDeg(yawDeg + 0.015f * headingDiff);
+
+        // Nội suy nhẹ tọa độ vuông góc với đường đi theo Map lý thuyết
+        if (currentLeg == LEG_AB || currentLeg == LEG_BA) {
+          odomX = 0.96f * odomX + 0.04f * STATION_COORDS[STATION_A].x;
+        } else if (currentLeg == LEG_CD || currentLeg == LEG_DC) {
+          odomX = 0.96f * odomX + 0.04f * STATION_COORDS[STATION_C].x;
+        } else if (currentLeg == LEG_BC || currentLeg == LEG_CB) {
+          odomY = 0.96f * odomY + 0.04f * STATION_COORDS[STATION_B].y;
+        } else if (currentLeg == LEG_DA || currentLeg == LEG_AD) {
+          odomY = 0.96f * odomY + 0.04f * STATION_COORDS[STATION_A].y;
+        }
+      }
+    }
+
+    float dErr = (currentLineErr - lastLineError) / fmaxf(dt, 0.001f);
+    lastLineError = currentLineErr;
+
+    float absErr = fabsf(currentLineErr);
+    int targetBase = straightPwm - (int)(absErr * (straightPwm - curvePwm));
+    targetBase = constrain(targetBase, curvePwm, straightPwm);
+
+    // Chỉ giảm tốc nhẹ trong 23cm cuối cùng (khi mắt bắt đầu chạm vạch trạm)
+    if (remainingLegM < 0.23f) {
+      targetBase = min(targetBase, brakePwm);
+      robotStateStr = "DECELERATING";
+    } else {
+      robotStateStr = (absErr < 0.35f) ? "RUNNING_FAST" : "TURNING_LINE";
+    }
+
+    if (targetBase > smoothedBaseSpeed) smoothedBaseSpeed = min((float)targetBase, smoothedBaseSpeed + MAX_RAMP_STEP);
+    else if (targetBase < smoothedBaseSpeed) smoothedBaseSpeed = max((float)targetBase, smoothedBaseSpeed - MAX_RAMP_STEP);
+
+    int effectiveBase = constrain((int)(smoothedBaseSpeed + loadBoostPwm), 170, maxPwm);
+
+    // KHI CÓ LINE: ĐIỀU KHIỂN 100% THEO CẢM BIẾN DÒ LINE (PD QUANG HỌC)
+    // TUYỆT ĐỐI KHÔNG CỘNG THÊM u_map GÂY XUNG ĐỘT BẺ LỆCH XE!
+    float u = (Kp_line * currentLineErr) + (Kd_line * dErr);
+
+    // Phân cấp phản ứng: Lệch quá nặng thì PIVOT xoay bánh ngược chiều, lệch bình thường thì vi sai mượt
+    if (currentLineErr <= -1.8f) {
+      leftPwm  = -turnPwm;
+      rightPwm = curvePwm + 25;
+      robotStateStr = "PIVOT_LEFT";
+    } else if (currentLineErr >= 1.8f) {
+      leftPwm  = curvePwm + 25;
+      rightPwm = -turnPwm;
+      robotStateStr = "PIVOT_RIGHT";
+    } else {
+      leftPwm  = constrain((int)(effectiveBase + u), 0, maxPwm);
+      rightPwm = constrain((int)(effectiveBase - u), 0, maxPwm);
+    }
+  }
+
+  setMotors(leftPwm, rightPwm);
+}
+
+void controlLoopTask(void *pvParameters) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(10);
+
+  while (true) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    updateControlAndOdometry(0.010f);
+  }
+}
+
+// ===================================================================================
+// CORE 0: TELEMETRY & NHẬN LỆNH ĐIỀU PHỐI ĐA TRẠM 2 CHIỀU
+// ===================================================================================
+bool resolveServerMdns(int maxAttempts = 2, int timeoutMs = 900) {
+  Serial.printf(">> [mDNS Client]: Đang phân giải tên miền http://%s.local:5000...\n", mdns_hostname);
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+    IPAddress mdnsIp = MDNS.queryHost(mdns_hostname, timeoutMs);
+    if (mdnsIp != INADDR_NONE && mdnsIp.toString() != "0.0.0.0") {
+      serverUrl = "http://" + mdnsIp.toString() + ":5000/api/telemetry";
+      lastKnownServerUrl = serverUrl;
+      Serial.printf("🎯 [mDNS THÀNH CÔNG - Lần %d]: Server IP = %s -> URL: %s\n", attempt, mdnsIp.toString().c_str(), serverUrl.c_str());
+      return true;
+    }
+    delay(150);
+  }
+  if (lastKnownServerUrl.length() > 0 && serverUrl.length() == 0) {
+    serverUrl = lastKnownServerUrl;
+  }
+  Serial.printf("⚠️ [mDNS]: Không nhận được gói Multicast '%s.local' -> Duy trì kết nối qua URL: %s\n",
+                mdns_hostname, serverUrl.c_str());
+  return false;
+}
+
+void telemetryTask(void *pvParameters) {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);         // Tắt chế độ ngủ Modem (WIFI_PS_NONE) để chống rớt gói khi động cơ ăn dòng lớn
+  WiFi.setAutoReconnect(true);  // Tự động kết nối lại ở tầng phần cứng lwIP
+  WiFi.begin(wifi_ssid, wifi_pass);
+  Serial.print(">> [WI-FI]: Đang kết nối tới ");
+  Serial.println(wifi_ssid);
+
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 25) {
+    delay(400);
+    Serial.print(".");
+    retry++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.setSleep(false);
+    Serial.printf("\n✅ [WI-FI]: Đã kết nối! IP = %s\n", WiFi.localIP().toString().c_str());
+
+    // Khởi động mDNS client và phân giải tên miền http://agv-wms.local:5000
+    if (MDNS.begin("agv-esp32")) {
+      delay(200);
+      resolveServerMdns(3, 1000);
+    }
+  } else {
+    Serial.println("\n⚠️ [WI-FI]: Không kết nối được Wi-Fi -> Chạy nội bộ.");
+  }
+
+  HTTPClient http;
+  http.setTimeout(1500);
+  http.setReuse(true); // Tái sử dụng kết nối TCP Keep-Alive tránh cạn kiệt socket lwIP
+  unsigned long lastMdnsRetryMs = 0;
+  unsigned long lastHttpErrMs = 0;
+  unsigned long lastWifiRetryMs = 0;
+  int consecutiveHttpErrors = 0;
+
+  while (true) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (serverUrl.length() == 0) {
+        // Chưa có URL Server -> Tự động truy vấn mDNS định kỳ mỗi 3 giây
+        if (millis() - lastMdnsRetryMs > 3000) {
+          lastMdnsRetryMs = millis();
+          resolveServerMdns();
+        }
+      } else {
+        portENTER_CRITICAL(&stateMux);
+        float snapX = odomX;
+        float snapY = odomY;
+        float snapYaw = yawDeg;
+        float snapDist = totalDistM;
+        float snapSpeed = currentSpeed;
+        int   snapMask = lineMask;
+        float snapLineErr = currentLineErr;
+        long  snapTicksL = globalTicksL;
+        long  snapTicksR = globalTicksR;
+        int   snapPwmL = cmdPwmL;
+        int   snapPwmR = cmdPwmR;
+        StationId snapStation = currentStation;
+        LegId snapLeg = currentLeg;
+        bool  snapAutoLoop = autoLoopEnabled;
+        const char* snapState = (const char*)robotStateStr;
+        portEXIT_CRITICAL(&stateMux);
+
+        String payload = "{";
+        payload += "\"x\":" + String(snapX, 3) + ",";
+        payload += "\"y\":" + String(snapY, 3) + ",";
+        payload += "\"yaw\":" + String(snapYaw, 1) + ",";
+        payload += "\"dist\":" + String(snapDist, 3) + ",";
+        payload += "\"speed\":" + String(snapSpeed, 1) + ",";
+        payload += "\"line_mask\":" + String(snapMask) + ",";
+        payload += "\"line_err\":" + String(snapLineErr, 2) + ",";
+        payload += "\"ticks_l\":" + String(snapTicksL) + ",";
+        payload += "\"ticks_r\":" + String(snapTicksR) + ",";
+        payload += "\"pwm_l\":" + String(snapPwmL) + ",";
+        payload += "\"pwm_r\":" + String(snapPwmR) + ",";
+        payload += "\"station\":\"" + String("ABCD"[snapStation]) + "\",";
+        payload += "\"leg\":\"" + String(LEG_TABLE[snapLeg].name) + "\",";
+        payload += "\"ack_id\":" + String(lastAckId) + ",";
+        payload += "\"auto_loop\":" + String(snapAutoLoop ? "true" : "false") + ",";
+        payload += "\"voltage\":" + String(liveBusV, 3) + ",";
+        payload += "\"current\":" + String(liveCurrentA, 3) + ",";
+        payload += "\"power\":" + String(livePowerW, 3) + ",";
+        payload += "\"energy_mah\":" + String(liveEnergyMah, 1) + ",";
+        payload += "\"ina_ok\":" + String(inaDetected ? "true" : "false") + ",";
+        payload += "\"state\":\"" + String(snapState) + "\"";
+        payload += "}";
+
+        http.begin(serverUrl);
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("X-Device-Token", agv_device_token); // Xác thực bảo mật RBAC với Server
+        int httpCode = http.POST(payload);
+
+        if (httpCode == 200) {
+          consecutiveHttpErrors = 0;
+          lastKnownServerUrl = serverUrl;
+          String resp = http.getString();
+
+          // Đồng bộ kích thước Bản đồ động (map_w, map_h) đang nạp trên Server để dẫn đường chính xác
+          int mwIdx = resp.indexOf("\"map_w\":");
+          int mhIdx = resp.indexOf("\"map_h\":");
+          if (mwIdx >= 0 && mhIdx >= 0) {
+            int wStart = mwIdx + 8;
+            while (wStart < (int)resp.length() && resp.charAt(wStart) == ' ') wStart++;
+            int hStart = mhIdx + 8;
+            while (hStart < (int)resp.length() && resp.charAt(hStart) == ' ') hStart++;
+            float srvW = resp.substring(wStart).toFloat();
+            float srvH = resp.substring(hStart).toFloat();
+            syncMapDimensionsFromServer(srvW, srvH);
+          }
+
+          int idIdx = resp.indexOf("\"cmd_id\":");
+          int incomingId = 0;
+          if (idIdx >= 0) {
+            int numStart = idIdx + 9;
+            while (numStart < (int)resp.length() && resp.charAt(numStart) == ' ') numStart++;
+            incomingId = resp.substring(numStart).toInt();
+          }
+
+          // Trích xuất chính xác giá trị trường "cmd" (Tránh quét nhầm chữ "STOP" trong "agv_state":"EMERGENCY_STOP")
+          String cmdStr = "";
+          int cmdIdx = resp.indexOf("\"cmd\":");
+          if (cmdIdx >= 0) {
+            int valStart = cmdIdx + 6;
+            while (valStart < (int)resp.length() && resp.charAt(valStart) == ' ') valStart++;
+            if (valStart < (int)resp.length() && resp.charAt(valStart) == '\"') {
+              int valEnd = resp.indexOf('\"', valStart + 1);
+              if (valEnd > valStart) {
+                cmdStr = resp.substring(valStart + 1, valEnd);
+              }
+            }
+          }
+
+          if (incomingId > 0 && incomingId != lastAckId && cmdStr.length() > 0) {
+            lastAckId = incomingId;
+            Serial.printf("\n>> [LỆNH MẠNG #%d]: cmd='%s' | raw=%s\n", incomingId, cmdStr.c_str(), resp.c_str());
+
+            // 1. Lệnh cơ bản
+            if (cmdStr == "START") {
+              startMission(currentLeg);
+            } else if (cmdStr == "STOP") {
+              portENTER_CRITICAL(&stateMux);
+              autoLoopEnabled = false;
+              queueLength = 0;
+              robotSubState = SUB_STOPPED;
+              isRunning = false;
+              robotStateStr = "STOPPED";
+              portEXIT_CRITICAL(&stateMux);
+              stopMotors();
+            } else if (cmdStr == "RESET_ODOM") {
+              stopMotors();
+              noInterrupts(); rawTicksL = 0; rawTicksR = 0; interrupts();
+              portENTER_CRITICAL(&stateMux);
+              odomX = 0.0f; odomY = 0.0f; yawDeg = 90.0f; totalDistM = 0.0f; legProgressM = 0.0f;
+              currentLeg = LEG_AB;
+              currentStation = STATION_A;
+              autoLoopEnabled = false;
+              queueLength = 0;
+              prevTicksL = 0; prevTicksR = 0;
+              robotSubState = SUB_STOPPED;
+              isRunning = false;
+              robotStateStr = "STOPPED";
+              portEXIT_CRITICAL(&stateMux);
+              Serial.println(">> [LỆNH]: RESET ODOMETRY VỀ GỐC A (0,0) 90°!");
+            } else if (cmdStr == "CALIBRATE_GYRO") {
+              calibrateGyroZ(400);
+              yawDeg = 90.0f;
+            } 
+            // 2. Chạy từng chặng cụ thể trong 8 chặng 2 chiều
+            else if (cmdStr == "MISSION:AB" || cmdStr == "MISSION:M1") {
+              autoLoopEnabled = false; startMission(LEG_AB);
+            } else if (cmdStr == "MISSION:BC" || cmdStr == "MISSION:M2") {
+              autoLoopEnabled = false; startMission(LEG_BC);
+            } else if (cmdStr == "MISSION:CD" || cmdStr == "MISSION:M3") {
+              autoLoopEnabled = false; startMission(LEG_CD);
+            } else if (cmdStr == "MISSION:DA" || cmdStr == "MISSION:M4") {
+              autoLoopEnabled = false; startMission(LEG_DA);
+            } else if (cmdStr == "MISSION:BA") {
+              autoLoopEnabled = false; startMission(LEG_BA);
+            } else if (cmdStr == "MISSION:CB") {
+              autoLoopEnabled = false; startMission(LEG_CB);
+            } else if (cmdStr == "MISSION:DC") {
+              autoLoopEnabled = false; startMission(LEG_DC);
+            } else if (cmdStr == "MISSION:AD") {
+              autoLoopEnabled = false; startMission(LEG_AD);
+            }
+            // 3. Điều hướng tiến / lùi tuần tự
+            else if (cmdStr == "MISSION:NEXT") {
+              advanceToNextLeg();
+            } else if (cmdStr == "MISSION:PREV") {
+              advanceToPrevLeg();
+            }
+            // 4. Lập lộ trình Điểm - Điểm tự động (GO_TO)
+            else if (cmdStr == "GO_TO:A") {
+              planAndExecuteRoute(currentStation, STATION_A);
+            } else if (cmdStr == "GO_TO:B") {
+              planAndExecuteRoute(currentStation, STATION_B);
+            } else if (cmdStr == "GO_TO:C") {
+              planAndExecuteRoute(currentStation, STATION_C);
+            } else if (cmdStr == "GO_TO:D") {
+              planAndExecuteRoute(currentStation, STATION_D);
+            }
+            // 5. Vòng lặp tuần hoàn xuôi / ngược
+            else if (cmdStr == "AUTO_LOOP:ON") {
+              autoLoopEnabled = true;
+              autoLoopReverse = false;
+              startMission(currentLeg);
+            } else if (cmdStr == "AUTO_LOOP:REVERSE") {
+              autoLoopEnabled = true;
+              autoLoopReverse = true;
+              advanceToPrevLeg();
+            } else if (cmdStr == "AUTO_LOOP:OFF") {
+              autoLoopEnabled = false;
+            }
+            // 6. Xoay thủ công & Giả lập đứt vạch (Quy ước Đề-các: Trái CCW = +90°, Phải CW = -90°)
+            else if (cmdStr == "TURN_LEFT_90") {
+              startManualTurn(90.0f);
+            } else if (cmdStr == "TURN_RIGHT_90") {
+              startManualTurn(-90.0f);
+            } else if (cmdStr == "TURN_180") {
+              startManualTurn(180.0f);
+            } else if (cmdStr == "SIMULATE_GAP") {
+              simulateGapActive = true;
+              simGapStartLegDistM = legProgressM;
+            } else if (cmdStr == "RESET_ENERGY") {
+              liveEnergyMah = 0.0f;
+              liveEnergyWh = 0.0f;
+              Serial.println(">> [LỆNH]: ĐÃ ĐẶT LẠI NĂNG LƯỢNG TIÊU THỤ VỀ 0.0 mAh!");
+            }
+          }
+        } else {
+          consecutiveHttpErrors++;
+          if (millis() - lastHttpErrMs > 3000) {
+            lastHttpErrMs = millis();
+            if (httpCode == 401) {
+              Serial.printf("❌ [LỖI BẢO MẬT 401]: Mã khóa X-Device-Token bị từ chối bởi Server!\n");
+            } else {
+              Serial.printf("⚠️ [CẢNH BÁO MẠNG]: HTTP %d tại %s (Lỗi liên tiếp: %d)\n",
+                            httpCode, serverUrl.c_str(), consecutiveHttpErrors);
+            }
+          }
+          // Tuyệt đối KHÔNG xóa trắng serverUrl ngay ở lần rớt gói đầu tiên!
+          // Chỉ thử dò lại mDNS nhanh (1 lần 600ms) nếu mất kết nối liên tiếp >= 15 chu kỳ (~3 giây)
+          // và nếu mDNS bị nghẽn thì vẫn giữ nguyên lastKnownServerUrl để gửi tiếp ngay.
+          if (consecutiveHttpErrors >= 15 && (millis() - lastMdnsRetryMs > 5000)) {
+            lastMdnsRetryMs = millis();
+            consecutiveHttpErrors = 0;
+            resolveServerMdns(1, 600);
+          }
+        }
+        http.end();
+      }
+    } else {
+      if (millis() - lastWifiRetryMs > 5000) {
+        lastWifiRetryMs = millis();
+        Serial.println("⚠️ [WI-FI]: Mất kết nối Wi-Fi, đang thử kết nối lại...");
+        WiFi.reconnect();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(150));
+  }
+}
+
+// ===================================================================================
+// SETUP
+// ===================================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(600);
+
+  initMotors();
+  initLineSensors();
+  initMPU();
+  initINA226();
+
+  pinMode(ENC_L_A_PIN, INPUT_PULLUP);
+  pinMode(ENC_L_B_PIN, INPUT_PULLUP);
+  pinMode(ENC_R_A_PIN, INPUT_PULLUP);
+  pinMode(ENC_R_B_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_A_PIN), isrEncLeftA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_B_PIN), isrEncLeftB, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_A_PIN), isrEncRightA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_B_PIN), isrEncRightB, CHANGE);
+
+  odomX = 0.00f;
+  odomY = 0.00f;
+  yawDeg = 90.0f;
+  legProgressM = 0.0f;
+  currentStation = STATION_A;
+  currentLeg = LEG_AB;
+
+  Serial.println("\n=========================================================================");
+  Serial.println("   AGV_VER2 - TEST 09: ĐIỀU HƯỚNG ĐỒ THỊ 2 CHIỀU & ĐIỂM - ĐIỂM LINH HOẠT");
+  Serial.println("=========================================================================");
+  Serial.printf("Tọa độ khởi đầu: X=%.2fm | Y=%.2fm | Yaw=%.1f° | Trạm hiện tại: Trạm A\n", odomX, odomY, yawDeg);
+  Serial.println(">> PHÍM TẮT ĐIỀU CHUYỂN:");
+  Serial.println("   [Space / s] : START / STOP");
+  Serial.println("   [n]         : Đến Trạm Kế Tiếp (Next Leg)");
+  Serial.println("   [p]         : Lùi Về Trạm Trước Đó (Prev Leg - Ngược Chiều)");
+  Serial.println("   [u]         : Quay Đầu 180° Tại Chỗ");
+  Serial.println("   [g]         : Giả Lập Đứt Vạch 25cm");
+  Serial.println("   [z]         : Đặt lại năng lượng tiêu thụ (Reset 0.0 mAh)");
+  Serial.println("   [A, B, C, D]: Ra lệnh đến thẳng Trạm tương ứng (Point-to-Point)");
+  Serial.println("-------------------------------------------------------------------------");
+
+  xTaskCreatePinnedToCore(telemetryTask, "TelemetryTask", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(controlLoopTask, "Control100Hz", 8192, NULL, 2, NULL, 1);
+}
+
+// ===================================================================================
+// LOOP CHÍNH (XỬ LÝ PHÍM SERIAL)
+// ===================================================================================
+void loop() {
+  if (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == ' ' || ch == 's') {
+      if (isRunning) {
+        portENTER_CRITICAL(&stateMux);
+        autoLoopEnabled = false;
+        queueLength = 0;
+        robotSubState = SUB_STOPPED;
+        robotStateStr = "STOPPED";
+        isRunning = false;
+        portEXIT_CRITICAL(&stateMux);
+        stopMotors();
+      } else {
+        startMission(currentLeg);
+      }
+      Serial.printf("\n[SERIAL KEY]: %s\n", isRunning ? "START" : "STOP");
+    } 
+    else if (ch == 'n' || ch == 'N') {
+      advanceToNextLeg();
+    }
+    else if (ch == 'p' || ch == 'P') {
+      advanceToPrevLeg();
+    }
+    else if (ch == 'u' || ch == 'U') {
+      startManualTurn(180.0f);
+    }
+    else if (ch == 'g' || ch == 'G') {
+      if (isRunning && robotSubState == SUB_LINE_FOLLOWING) {
+        simulateGapActive = true;
+        simGapStartLegDistM = legProgressM;
+        Serial.printf("\n⚡ [TEST ĐỨT VẠCH]: Bật giả lập đứt 25cm tại %.2fm!\n", legProgressM);
+      }
+    }
+    else if (ch == 'z' || ch == 'Z') {
+      liveEnergyMah = 0.0f;
+      liveEnergyWh = 0.0f;
+      Serial.println("\n⚡ [SERIAL KEY]: Đã reset năng lượng tiêu thụ về 0.0 mAh!");
+    }
+    else if (ch == 'a' || ch == 'A') {
+      planAndExecuteRoute(currentStation, STATION_A);
+    }
+    else if (ch == 'b' || ch == 'B') {
+      planAndExecuteRoute(currentStation, STATION_B);
+    }
+    else if (ch == 'c' || ch == 'C') {
+      planAndExecuteRoute(currentStation, STATION_C);
+    }
+    else if (ch == 'd' || ch == 'D') {
+      planAndExecuteRoute(currentStation, STATION_D);
+    }
+  }
+
+  // Nút BOOT
+  int reading = digitalRead(BUTTON_BOOT_PIN);
+  static int lastBtn = HIGH;
+  static unsigned long lastDeb = 0;
+  if (reading != lastBtn) lastDeb = millis();
+  if ((millis() - lastDeb) > 50) {
+    if (reading == LOW && lastBtn == HIGH) {
+      if (isRunning) {
+        portENTER_CRITICAL(&stateMux);
+        autoLoopEnabled = false;
+        queueLength = 0;
+        robotSubState = SUB_STOPPED;
+        robotStateStr = "STOPPED";
+        isRunning = false;
+        portEXIT_CRITICAL(&stateMux);
+        stopMotors();
+      } else {
+        advanceToNextLeg();
+      }
+    }
+  }
+  lastBtn = reading;
+
+  vTaskDelay(pdMS_TO_TICKS(50));
+}

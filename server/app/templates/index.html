@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+  <title>AGV_Ver2 WMS Digital Twin & Smart Dispatching Console</title>
+  
+  <!-- Google Fonts & Material Symbols -->
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin=""/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Serif:wght@600;700&display=swap" rel="stylesheet"/>
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
+
+  <!-- Tailwind CSS via CDN -->
+  <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+  <script id="tailwind-config">
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          colors: {
+            "primary": "#3366cc",
+            "primary-hover": "#2554b0",
+            "primary-container": "#e7ebff",
+            "secondary": "#5a5f63",
+            "surface": "#ffffff",
+            "surface-container": "#f8fafc",
+            "surface-container-high": "#f1f5f9",
+            "background": "#f8fafc",
+            "on-surface": "#1e293b",
+            "on-surface-variant": "#64748b",
+            "outline": "#94a3b8",
+            "outline-variant": "#e2e8f0",
+            "error": "#dc2626",
+            "error-container": "#fee2e2"
+          },
+          fontFamily: {
+            headline: ["Noto Serif", "serif"],
+            body: ["Inter", "sans-serif"],
+            mono: ["JetBrains Mono", "monospace"]
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    @layer base {
+      html, body { margin: 0; padding: 0; }
+      body { overscroll-behavior: none; }
+    }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #f1f5f9; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+  </style>
+</head>
+
+<body class="bg-[#f8fafc] font-body text-slate-800 antialiased min-h-screen border-slate-200">
+
+  <!-- ========================================== -->
+  <!-- 1. TOP NAVIGATION HEADER                   -->
+  <!-- ========================================== -->
+  <header class="fixed top-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200 shadow-[0_1px_4px_rgba(0,0,0,0.03)]">
+    <div class="h-16 w-full px-4 md:px-6 flex items-center justify-between">
+      
+      <!-- Brand & Identity -->
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-md bg-[#e7ebff] text-primary flex items-center justify-center border border-[#3366cc]/20 shadow-sm">
+          <span class="material-symbols-outlined text-[22px]">smart_toy</span>
+        </div>
+        <div class="flex flex-col">
+          <div class="flex items-center gap-2">
+            <span class="font-headline text-[16px] md:text-[17px] text-slate-900 tracking-tight font-bold">AGV_Ver2 WMS Digital Twin</span>
+            <span class="font-mono text-[10px] text-primary font-semibold bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded">V2.1</span>
+            <span class="hidden sm:inline font-mono text-[10px] uppercase px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200 font-medium">SCADA CONSOLE</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Center Status Badges -->
+      <div class="hidden md:flex items-center gap-2.5">
+        <!-- Connectivity Badge -->
+        <div id="connBadge" class="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-50 border border-slate-200">
+          <span class="w-2 h-2 rounded-full bg-slate-400"></span>
+          <span class="font-mono text-xs text-slate-600 tracking-tight">Chưa kết nối (Offline)</span>
+        </div>
+
+        <!-- Robot State Badge -->
+        <div id="valStateBadge" class="flex items-center px-2.5 py-1 rounded bg-slate-100 border border-slate-200">
+          <span id="valState" class="font-mono text-xs text-slate-700 font-medium tracking-wide uppercase">TRẠNG THÁI: OFFLINE</span>
+        </div>
+
+        <!-- Battery Summary Badge -->
+        <div class="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-50 border border-slate-200">
+          <span class="material-symbols-outlined text-amber-500 text-[15px]">bolt</span>
+          <span class="font-mono text-xs text-slate-600">
+            <span id="valBatteryPct">--%</span> 
+            <span id="valVoltHeader" class="text-slate-800 font-medium">(-- V)</span>
+          </span>
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="flex items-center gap-2">
+        <a href="/logs" target="_blank" class="flex items-center gap-1 px-3 py-1.5 rounded bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 font-sans text-xs font-semibold shadow-xs transition-colors" title="Mở trang xem và lưu vết nhật ký di chuyển của AGV">
+          <span class="material-symbols-outlined text-[16px] text-blue-600">receipt_long</span>
+          <span>Nhật Ký Log</span>
+        </a>
+        <button onclick="openConfigModal()" class="flex items-center gap-1 px-3 py-1.5 rounded bg-white text-slate-700 border border-slate-200 hover:bg-slate-50 font-sans text-xs font-semibold shadow-xs transition-colors" type="button">
+          <span class="material-symbols-outlined text-[16px] text-primary">settings</span>
+          <span>Cấu Hình WMS</span>
+        </button>
+        <button onclick="exportCsv()" class="hidden sm:flex items-center gap-1 px-3 py-1.5 rounded bg-white text-slate-700 border border-slate-200 hover:bg-slate-50 font-sans text-xs font-medium shadow-xs transition-colors" type="button">
+          <span class="material-symbols-outlined text-[16px] text-slate-500">download</span>
+          <span>Xuất CSV</span>
+        </button>
+        <button onclick="sendCmd('stop')" class="flex items-center gap-1 px-3 py-1.5 rounded bg-red-600 hover:bg-red-700 text-white font-mono text-xs uppercase tracking-wider font-semibold transition-all shadow-sm shadow-red-200" type="button">
+          <span class="material-symbols-outlined text-[16px]">fmd_bad</span>
+          <span>E-STOP</span>
+        </button>
+      </div>
+
+    </div>
+  </header>
+
+  <!-- ========================================== -->
+  <!-- 2. FAIL-SAFE OFFLINE ALERT BANNER          -->
+  <!-- ========================================== -->
+  <div id="offlineAlertBanner" class="w-full bg-amber-50/95 border-b border-amber-200 px-4 md:px-6 py-2.5 flex flex-col sm:flex-row items-center justify-between gap-2 mt-16 transition-all duration-300">
+    <div class="flex items-center gap-2">
+      <span class="material-symbols-outlined text-amber-600 text-[20px] animate-pulse">sensors_off</span>
+      <div class="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2">
+        <span class="font-mono text-xs text-amber-900 font-bold uppercase tracking-wide">Chế độ Chờ Telemetry:</span>
+        <span class="text-xs text-slate-700 font-medium">Robot AGV_Ver2 chưa kết nối Wi-Fi hoặc đang ngủ. Số liệu cảm biến INA226 &amp; Odom được giữ an toàn ở mức 0.</span>
+      </div>
+    </div>
+    <div class="flex items-center gap-2 shrink-0">
+      <span id="txtHeartbeatWait" class="font-mono text-[11px] text-slate-500">UDP Beacon: Port 5005</span>
+      <button onclick="updateState()" class="px-2.5 py-1 rounded bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-mono text-[11px] font-semibold transition-colors flex items-center gap-1 shadow-xs">
+        <span class="material-symbols-outlined text-[13px]">refresh</span>Quét lại
+      </button>
+    </div>
+  </div>
+
+  <!-- ========================================== -->
+  <!-- 3. MAIN DASHBOARD CONTENT (60% / 40%)      -->
+  <!-- ========================================== -->
+  <main class="w-full pt-4 pb-10 bg-[#f8fafc]">
+    <div class="w-full px-4 md:px-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+        
+        <!-- ======================================== -->
+        <!-- LEFT COLUMN: 60% Width (col-span-7)     -->
+        <!-- ======================================== -->
+        <div class="lg:col-span-7 flex flex-col gap-4">
+          
+          <!-- WIDGET 1: BẢN ĐỒ MẠNG LƯỚI LINE TÔ-PÔ ĐỘNG (CANVAS 2D) -->
+          <div class="rounded-lg bg-white p-4 shadow-[0_1px_3px_rgba(0,0,0,0.05)] border border-slate-200/90 flex flex-col">
+            <!-- Header -->
+            <div class="flex items-center justify-between pb-3 border-b border-slate-100 mb-3">
+              <div class="flex items-center gap-2">
+                <span class="material-symbols-outlined text-primary text-[20px]">map</span>
+                <span id="mapTitle" class="font-headline text-[16px] font-bold text-slate-900">Bản Đồ Mạng Lưới Line Tô-pô Động</span>
+                <span class="font-mono text-[10px] text-primary bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded uppercase font-semibold">2D Floor Twin</span>
+              </div>
+              <div class="flex items-center gap-1.5 font-mono text-[11px]">
+                <span class="bg-blue-50 border border-blue-200/60 px-2 py-0.5 rounded text-primary flex items-center gap-1 font-medium">
+                  <span class="w-1.5 h-1.5 rounded-full bg-primary animate-pulse"></span>Dijkstra Router
+                </span>
+                <span id="lblActiveMapBadge" class="bg-slate-100 border border-slate-200 text-slate-700 px-2 py-0.5 rounded font-medium">
+                  SABAN_154_151
+                </span>
+              </div>
+            </div>
+
+            <!-- Dynamic Coordinate Canvas Viewport -->
+            <div class="relative w-full h-[320px] bg-[#fbfcfd] border border-slate-200 rounded-md overflow-hidden flex items-center justify-center">
+              <!-- Grid Blueprint SVG Pattern -->
+              <svg class="absolute inset-0 w-full h-full opacity-60 pointer-events-none" xmlns="http://www.w3.org/2000/svg">
+                <defs>
+                  <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+                    <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#e2e8f0" stroke-width="0.75"/>
+                  </pattern>
+                  <pattern id="grid-major" width="120" height="120" patternUnits="userSpaceOnUse">
+                    <path d="M 120 0 L 0 0 0 120" fill="none" stroke="#cbd5e1" stroke-width="1.2" opacity="0.9"/>
+                  </pattern>
+                </defs>
+                <rect width="100%" height="100%" fill="url(#grid)"/>
+                <rect width="100%" height="100%" fill="url(#grid-major)"/>
+              </svg>
+
+              <!-- Dynamic Map Canvas Layer -->
+              <canvas id="mapCanvas" class="relative z-10 w-full h-full block"></canvas>
+
+              <!-- HUD Coordinate Ruler Tags -->
+              <div id="lblHudX" class="absolute top-2 left-2 z-20 font-mono text-[10px] text-slate-500 bg-white/90 px-1.5 py-0.5 rounded border border-slate-200/80 shadow-2xs pointer-events-none">
+                X: 0.00m → 1.54m
+              </div>
+              <div id="lblHudY" class="absolute bottom-2 right-2 z-20 font-mono text-[10px] text-slate-500 bg-white/90 px-1.5 py-0.5 rounded border border-slate-200/80 shadow-2xs pointer-events-none">
+                Y: 0.00m → 1.51m
+              </div>
+
+              <!-- Traffic Lock Warning Pill (Floating) -->
+              <div id="trafficLockBadge" class="hidden absolute top-2 left-1/2 -translate-x-1/2 z-20 bg-amber-50/95 border border-amber-300 backdrop-blur-md px-3 py-1 rounded shadow-xs flex items-center gap-1.5">
+                <span class="material-symbols-outlined text-amber-600 text-[15px] animate-bounce">lock</span>
+                <span id="trafficLockText" class="font-mono text-[10px] text-amber-900 font-semibold uppercase tracking-wide">
+                  ĐOẠN ĐANG KHÓA (FAIL-SAFE TRAFFIC GUARD)
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <!-- WIDGET 2: THỊ GIÁC AI PHÂN LOẠI HÀNG HÓA (ANDROID PHONECAMERA) -->
+          <div class="rounded-lg bg-white p-4 shadow-[0_1px_3px_rgba(0,0,0,0.05)] border border-slate-200/90">
+            <div class="flex items-center justify-between pb-3 border-b border-slate-100 mb-3">
+              <div class="flex items-center gap-2">
+                <span class="material-symbols-outlined text-primary text-[20px]">photo_camera</span>
+                <span class="font-headline text-[16px] font-bold text-slate-900">Thị Giác AI Phân Loại Hàng Hóa</span>
+                <span class="font-mono text-[10px] text-slate-600 bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded">Android PhoneCamera</span>
+              </div>
+              <div class="flex items-center gap-2 font-mono text-[11px] text-slate-500">
+                <button onclick="triggerShot1()" id="btnTriggerShot1" class="flex items-center gap-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-300 px-2 py-0.5 rounded font-sans text-xs font-semibold cursor-pointer transition-colors shadow-xs" title="Phát lệnh từ xa yêu cầu điện thoại chụp ảnh khay hàng">
+                  <span class="material-symbols-outlined text-[15px]">photo_camera</span>
+                  <span>Chụp Khay Hàng</span>
+                </button>
+                <span id="camOnlineDot" class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
+                <span id="camStatus">Chờ điện thoại kết nối...</span>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-12 gap-3.5 items-center">
+              <!-- Left: Viewport Ảnh & Bounding Box -->
+              <div class="md:col-span-7 relative h-40 bg-slate-950 rounded-md overflow-hidden flex items-center justify-center border border-slate-200">
+                <img id="camImg" src="" alt="Chưa có ảnh" class="w-full h-full object-contain opacity-90 hidden" onerror="this.classList.add('hidden'); document.getElementById('camPlaceholder').classList.remove('hidden');"/>
+                
+                <!-- Placeholder Frame khi chưa có ảnh -->
+                <div id="camPlaceholder" class="flex flex-col items-center justify-center text-slate-500 gap-1.5">
+                  <span class="material-symbols-outlined text-[32px] text-slate-600">center_focus_weak</span>
+                  <span class="font-mono text-[11px]">Sẵn sàng nhận ảnh từ CameraX</span>
+                  <span class="font-sans text-[10px] text-slate-600 text-center px-4">Khi AGV dừng ở Trạm Nhập A, ứng dụng Android sẽ tự động chụp và gửi ảnh phân loại.</span>
+                </div>
+
+                <!-- Industrial Crosshair Overlay -->
+                <div class="absolute inset-0 pointer-events-none p-2 flex flex-col justify-between">
+                  <div class="flex justify-between items-start">
+                    <span class="font-mono text-[9px] text-sky-300 bg-black/60 px-1.5 py-0.5 rounded">SOURCE: /api/camera</span>
+                    <span class="font-mono text-[9px] text-slate-200 bg-black/60 px-1.5 py-0.5 rounded">YOLOv11 Nano</span>
+                  </div>
+                  <div class="flex justify-between items-end">
+                    <span class="font-mono text-[9px] text-slate-300 bg-black/60 px-1 rounded">ROI: WMS Inbound</span>
+                    <span id="aiConfidenceBadge" class="font-mono text-[9px] text-emerald-400 bg-black/60 px-1 rounded font-semibold">AI CONF: --</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Right: Vision Telemetry Chips -->
+              <div class="md:col-span-5 flex flex-col justify-between h-40 gap-2 bg-slate-50 border border-slate-200/80 p-3 rounded-md">
+                <div class="flex items-center justify-between">
+                  <span class="font-mono text-[11px] text-slate-500">Mã Nhận Diện:</span>
+                  <span id="aiDetectedCode" class="font-mono text-xs text-primary font-bold bg-blue-50 border border-blue-200 px-2 py-0.5 rounded">--</span>
+                </div>
+                <div class="flex items-center justify-between">
+                  <span class="font-mono text-[11px] text-slate-500">Phân Loại Hàng:</span>
+                  <span id="aiCategory" class="font-mono text-[11px] text-slate-800 bg-white border border-slate-200 px-2 py-0.5 rounded font-bold">--</span>
+                </div>
+                <div class="flex items-center justify-between">
+                  <span class="font-mono text-[11px] text-slate-500">Điểm Đến Tự Động:</span>
+                  <span id="aiTargetStation" class="font-mono text-[11px] text-primary bg-blue-50 border border-blue-200 px-2 py-0.5 rounded font-semibold">--</span>
+                </div>
+                <div class="flex items-center justify-between pt-1 border-t border-slate-200/60">
+                  <span class="font-mono text-[10px] text-slate-400">Timestamp:</span>
+                  <span id="aiTimestamp" class="font-mono text-[10px] text-slate-600 font-medium">--</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- WIDGET 3: CHỈ SỐ ĐỘNG HỌC & CẢM BIẾN REAL-TIME -->
+          <div class="rounded-lg bg-white p-4 shadow-[0_1px_3px_rgba(0,0,0,0.05)] border border-slate-200/90">
+            <div class="flex items-center justify-between pb-3 border-b border-slate-100 mb-3">
+              <div class="flex items-center gap-2">
+                <span class="material-symbols-outlined text-primary text-[20px]">speed</span>
+                <span class="font-headline text-[16px] font-bold text-slate-900">Chỉ Số Động Học &amp; Cảm Biến Real-Time</span>
+              </div>
+              <span class="font-mono text-[11px] text-slate-500 bg-slate-100 px-2 py-0.5 rounded">ESP32 MPU6050 &amp; Encoders</span>
+            </div>
+
+            <!-- 6 High-Contrast Kinematic Tiles Grid -->
+            <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2.5">
+              <!-- X Coordinate -->
+              <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col items-center justify-center text-center">
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">TỌA ĐỘ X</span>
+                <span class="font-mono text-[17px] text-primary font-bold mt-0.5">
+                  <span id="valOdomX">--</span> <span class="text-[11px] font-normal text-slate-400">m</span>
+                </span>
+                <span class="font-mono text-[10px] text-slate-400 mt-0.5">Trục ngang</span>
+              </div>
+
+              <!-- Y Coordinate -->
+              <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col items-center justify-center text-center">
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">TỌA ĐỘ Y</span>
+                <span class="font-mono text-[17px] text-primary font-bold mt-0.5">
+                  <span id="valOdomY">--</span> <span class="text-[11px] font-normal text-slate-400">m</span>
+                </span>
+                <span class="font-mono text-[10px] text-slate-400 mt-0.5">Trục dọc</span>
+              </div>
+
+              <!-- Compass Yaw Angle -->
+              <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col items-center justify-center text-center">
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">GÓC YAW</span>
+                <span class="font-mono text-[17px] text-slate-800 font-bold mt-0.5">
+                  <span id="valYaw">--</span>
+                </span>
+                <span id="valYawDir" class="font-mono text-[10px] text-slate-500 mt-0.5">Góc hướng</span>
+              </div>
+
+              <!-- Speed Velocity -->
+              <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col items-center justify-center text-center">
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">VẬN TỐC</span>
+                <span class="font-mono text-[17px] text-slate-900 font-bold mt-0.5">
+                  <span id="valSpeed">--</span>
+                </span>
+                <span class="font-mono text-[10px] text-slate-500 mt-0.5">cm/giây</span>
+              </div>
+
+              <!-- 6-CH Line IR Sensors -->
+              <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col items-center justify-center text-center">
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">CẢM BIẾN LINE</span>
+                <div id="irDotsContainer" class="flex items-center gap-1 my-1.5">
+                  <span class="w-2 h-2 rounded-full bg-slate-300"></span>
+                  <span class="w-2 h-2 rounded-full bg-slate-300"></span>
+                  <span class="w-2 h-2 rounded-full bg-slate-300"></span>
+                  <span class="w-2 h-2 rounded-full bg-slate-300"></span>
+                  <span class="w-2 h-2 rounded-full bg-slate-300"></span>
+                  <span class="w-2 h-2 rounded-full bg-slate-300"></span>
+                </div>
+                <span id="valLineMaskStr" class="font-mono text-[10px] text-slate-600 font-semibold">[ 0 0 0 0 0 0 ]</span>
+              </div>
+
+              <!-- Line Offset Error (PID) -->
+              <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col items-center justify-center text-center">
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">LỆCH LINE</span>
+                <span class="font-mono text-[17px] text-primary font-bold mt-0.5">
+                  <span id="valLineErr">--</span> <span class="text-[11px] font-normal text-slate-400">cm</span>
+                </span>
+                <span id="valPidStatus" class="font-mono text-[10px] text-slate-600 mt-0.5">PID: Chờ</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- ======================================== -->
+        <!-- RIGHT COLUMN: 40% Width (col-span-5)    -->
+        <!-- ======================================== -->
+        <div class="lg:col-span-5 flex flex-col gap-4">
+          
+          <!-- WIDGET 4: QUẢN LÝ NĂNG LƯỢNG & PIN INA226 -->
+          <div class="rounded-lg bg-white p-4 shadow-[0_1px_3px_rgba(0,0,0,0.05)] border border-slate-200/90">
+            <div class="flex items-center justify-between pb-3 border-b border-slate-100 mb-3">
+              <div class="flex items-center gap-2">
+                <span class="material-symbols-outlined text-primary text-[20px]">battery_charging_full</span>
+                <span class="font-headline text-[16px] font-bold text-slate-900">Quản Lý Năng Lượng &amp; Pin INA226</span>
+              </div>
+              <span id="valInaStatusBadge" class="font-mono text-[11px] text-primary bg-blue-50 border border-blue-200 px-2 py-0.5 rounded font-medium">I2C: 0x40 (INA226)</span>
+            </div>
+
+            <!-- 4 Technical KPI Cards -->
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+              <!-- BUS VOLTAGE -->
+              <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col">
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">ĐIỆN ÁP BUS</span>
+                <span class="font-mono text-[18px] text-slate-900 font-bold mt-0.5">
+                  <span id="valVolt">--</span> <span class="text-[11px] font-normal text-slate-400">V</span>
+                </span>
+                <span class="font-mono text-[10px] text-slate-400 mt-1">Chuẩn 3S: 11.1V</span>
+              </div>
+
+              <!-- CURRENT CONSUMPTION -->
+              <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col">
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">DÒNG TIÊU THỤ</span>
+                <span class="font-mono text-[18px] text-primary font-bold mt-0.5">
+                  <span id="valCurr">--</span> <span class="text-[11px] font-normal text-slate-400">A</span>
+                </span>
+                <span class="font-mono text-[10px] text-slate-400 mt-1">Shunt: 0.01Ω</span>
+              </div>
+
+              <!-- LOAD POWER -->
+              <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col">
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">CÔNG SUẤT</span>
+                <span class="font-mono text-[18px] text-slate-900 font-bold mt-0.5">
+                  <span id="valPower">--</span> <span class="text-[11px] font-normal text-slate-400">W</span>
+                </span>
+                <span class="font-mono text-[10px] text-slate-400 mt-1">V x I Tức thời</span>
+              </div>
+
+              <!-- CAPACITY CONSUMED -->
+              <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col">
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">ĐÃ TIÊU THỤ</span>
+                <span class="font-mono text-[18px] text-slate-900 font-bold mt-0.5">
+                  <span id="valEnergy">--</span>
+                </span>
+                <span class="font-mono text-[10px] text-slate-400 mt-1">mAh</span>
+              </div>
+            </div>
+
+            <!-- Segmented Battery Gauge (10 discrete tick bars) -->
+            <div class="mt-3 bg-slate-50 border border-slate-200 p-2.5 rounded-md flex flex-col gap-1.5">
+              <div class="flex items-center justify-between font-mono text-[11px]">
+                <span class="text-slate-600 flex items-center gap-1.5 font-medium">
+                  <span id="valBatteryDot" class="w-2 h-2 rounded-full bg-slate-400"></span>
+                  Gói Pin Li-ion 3S (9.9V - 12.6V)
+                </span>
+                <span id="valBatteryText" class="text-primary font-semibold">Chưa kết nối pin</span>
+              </div>
+              <div id="batteryTicksContainer" class="grid grid-cols-10 gap-1 h-2.5 mt-0.5">
+                <div class="bg-slate-200 rounded-xs"></div>
+                <div class="bg-slate-200 rounded-xs"></div>
+                <div class="bg-slate-200 rounded-xs"></div>
+                <div class="bg-slate-200 rounded-xs"></div>
+                <div class="bg-slate-200 rounded-xs"></div>
+                <div class="bg-slate-200 rounded-xs"></div>
+                <div class="bg-slate-200 rounded-xs"></div>
+                <div class="bg-slate-200 rounded-xs"></div>
+                <div class="bg-slate-200 rounded-xs"></div>
+                <div class="bg-slate-200 rounded-xs"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- WIDGET 5: QUẢN LÝ TỒN KHO ĐA MẶT HÀNG THEO TRẠM -->
+          <div class="rounded-lg bg-white p-4 shadow-[0_1px_3px_rgba(0,0,0,0.05)] border border-slate-200/90">
+            <div class="flex items-center justify-between pb-3 border-b border-slate-100 mb-3">
+              <div class="flex items-center gap-2">
+                <span class="material-symbols-outlined text-primary text-[20px]">inventory_2</span>
+                <span class="font-headline text-[16px] font-bold text-slate-900">Quản Lý Tồn Kho Đa Mặt Hàng Theo Trạm</span>
+              </div>
+              <span class="font-mono text-[11px] text-slate-500 bg-slate-100 px-2 py-0.5 rounded">Sức Chứa: 30 kiện/trạm</span>
+            </div>
+
+            <!-- Dynamic Station Inventory Container -->
+            <div id="inventoryContainer" class="flex flex-col gap-2.5">
+              <div class="text-center font-mono text-xs text-slate-400 py-4">Đang tải danh mục kho...</div>
+            </div>
+          </div>
+
+          <!-- WIDGET 6: HÀNG ĐỢI NHIỆM VỤ ĐIỀU PHỐI (DISPATCH TASKS) -->
+          <div class="rounded-lg bg-white p-4 shadow-[0_1px_3px_rgba(0,0,0,0.05)] border border-slate-200/90">
+            <div class="flex items-center justify-between pb-3 border-b border-slate-100 mb-3">
+              <div class="flex items-center gap-2">
+                <span class="material-symbols-outlined text-primary text-[20px]">view_list</span>
+                <span class="font-headline text-[16px] font-bold text-slate-900">Hàng Đợi Nhiệm Vụ Điều Phối</span>
+              </div>
+              <span id="taskQueueCountBadge" class="font-mono text-[11px] text-slate-500">Gần nhất</span>
+            </div>
+            
+            <div class="overflow-x-auto">
+              <table class="w-full text-left font-mono text-xs">
+                <thead>
+                  <tr class="bg-slate-100/80 text-slate-600 font-semibold border-b border-slate-200">
+                    <th class="py-2 px-2.5">TASK</th>
+                    <th class="py-2 px-2.5">MẶT HÀNG</th>
+                    <th class="py-2 px-2.5">LỘ TRÌNH</th>
+                    <th class="py-2 px-2.5 text-right">TRẠNG THÁI</th>
+                  </tr>
+                </thead>
+                <tbody id="taskTableBody" class="divide-y divide-slate-100">
+                  <tr>
+                    <td colspan="4" class="py-4 text-center text-slate-400 font-mono">Chưa có nhiệm vụ vận chuyển</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- WIDGET 7: BẢNG ĐIỀU KHIỂN & ĐIỀU HƯỚNG NHANH -->
+          <div class="rounded-lg bg-white p-4 shadow-[0_1px_3px_rgba(0,0,0,0.05)] border border-slate-200/90">
+            <div class="flex items-center justify-between pb-3 border-b border-slate-100 mb-3">
+              <div class="flex items-center gap-2">
+                <span class="material-symbols-outlined text-primary text-[20px]">sports_esports</span>
+                <span class="font-headline text-[16px] font-bold text-slate-900">Bảng Điều Khiển &amp; Điều Hướng Nhanh</span>
+              </div>
+              <span class="font-mono text-[11px] text-slate-500">SCADA Manual</span>
+            </div>
+
+            <!-- Quick Dispatch Waypoint Targets -->
+            <div class="grid grid-cols-4 gap-2 mb-3">
+              <button onclick="sendGoTo('A')" class="py-1.5 px-2 rounded-md bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 text-center transition-colors font-sans text-xs font-semibold" type="button">
+                Đến Trạm A
+              </button>
+              <button onclick="sendGoTo('B')" class="py-1.5 px-2 rounded-md bg-blue-50 hover:bg-blue-100 border border-blue-200 text-primary text-center transition-colors font-sans text-xs font-semibold" type="button">
+                Đến Kho B
+              </button>
+              <button onclick="sendGoTo('C')" class="py-1.5 px-2 rounded-md bg-purple-50 hover:bg-purple-100 border border-purple-200 text-purple-700 text-center transition-colors font-sans text-xs font-semibold" type="button">
+                Đến Kho C
+              </button>
+              <button onclick="sendGoTo('D')" class="py-1.5 px-2 rounded-md bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-700 text-center transition-colors font-sans text-xs font-semibold" type="button">
+                Đến Kho D
+              </button>
+            </div>
+
+            <!-- Primary Operational Actuation Buttons -->
+            <div class="grid grid-cols-4 gap-2 mb-2">
+              <button onclick="sendCmd('start')" class="flex items-center justify-center gap-1 py-2 rounded-md bg-[#3366cc] text-white hover:bg-blue-700 font-sans text-xs font-semibold shadow-sm transition-all" type="button">
+                <span class="material-symbols-outlined text-[16px]">play_arrow</span>
+                <span>Chạy</span>
+              </button>
+              <button onclick="sendCmd('stop')" class="flex items-center justify-center gap-1 py-2 rounded-md bg-slate-100 border border-slate-200 text-slate-800 hover:bg-slate-200 font-sans text-xs font-semibold transition-colors" type="button">
+                <span class="material-symbols-outlined text-[16px]">stop</span>
+                <span>Dừng</span>
+              </button>
+              <button onclick="sendCmd('reset_odom')" class="flex items-center justify-center gap-1 py-2 rounded-md bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 font-sans text-xs font-medium transition-colors" type="button">
+                <span class="material-symbols-outlined text-[16px]">restart_alt</span>
+                <span>Reset Odom</span>
+              </button>
+              <button onclick="sendCmd('auto_loop_on')" class="flex items-center justify-center gap-1 py-2 rounded-md bg-blue-50 border border-blue-200 text-primary hover:bg-blue-100 font-sans text-xs font-semibold transition-colors" type="button">
+                <span class="material-symbols-outlined text-[16px]">sync</span>
+                <span>Tự Động Lặp</span>
+              </button>
+            </div>
+
+            <!-- Vision Remote Capture Trigger Button -->
+            <button onclick="triggerShot1()" class="w-full flex items-center justify-center gap-1.5 py-2 rounded-md bg-gradient-to-r from-sky-500 to-blue-600 text-white hover:from-sky-600 hover:to-blue-700 font-sans text-xs font-bold shadow-xs transition-all cursor-pointer" type="button">
+              <span class="material-symbols-outlined text-[16px]">photo_camera</span>
+              <span>📸 Phát Lệnh Chụp Khay Hàng (Remote Camera Trigger)</span>
+            </button>
+
+            <!-- Command Notification Line -->
+            <div class="mt-3 pt-2 border-t border-slate-100 flex items-center justify-between font-mono text-[10px] text-slate-400">
+              <span id="cmdNotify" class="text-slate-600 font-medium">Sẵn sàng nhận lệnh điều khiển</span>
+              <span class="text-primary font-semibold">Port 5000 REST</span>
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+    </div>
+  </main>
+
+  <!-- ========================================== -->
+  <!-- 4. MODAL CẤU HÌNH KHO VẬN THÔNG MINH WMS   -->
+  <!-- ========================================== -->
+  <div id="configModal" class="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-md flex items-center justify-center p-4 transition-all duration-200 hidden">
+    <div class="max-w-[620px] w-full max-h-[92vh] bg-white border border-slate-200 rounded-xl shadow-2xl flex flex-col overflow-hidden text-slate-900 animate-in fade-in zoom-in-95 duration-150">
+      
+      <!-- Modal Header -->
+      <div class="flex items-center justify-between px-5 py-3.5 border-b border-slate-200 bg-white">
+        <div class="flex items-center gap-2.5">
+          <span class="text-[20px]">⚙️</span>
+          <div>
+            <div class="flex items-center gap-2">
+              <h3 class="font-headline text-[16px] font-bold text-slate-900 leading-snug">Cấu Hình Kho Vận Thông Minh WMS</h3>
+              <span class="font-mono text-[10px] text-primary bg-blue-50 border border-blue-200/80 px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider">v2.1 SCADA CONFIG</span>
+            </div>
+            <p class="text-slate-500 text-[11px] mt-0.5">Quản trị bản đồ line tô-pô, trạm đón trả &amp; luật định tuyến AI</p>
+          </div>
+        </div>
+        <button onclick="closeConfigModal()" class="text-slate-400 hover:text-slate-700 hover:bg-slate-100 p-1.5 rounded-lg transition-colors flex items-center justify-center border border-transparent hover:border-slate-200" title="Đóng hộp thoại" type="button">
+          <span class="material-symbols-outlined text-[19px]">close</span>
+        </button>
+      </div>
+
+      <!-- Modal Tabs Switcher -->
+      <div class="flex border-b border-slate-200 bg-slate-50/70 text-[12px] font-medium">
+        <button id="tabBtnMap" onclick="switchModalTab('map')" class="flex-1 py-2.5 px-3 border-b-2 border-primary text-primary font-semibold bg-white flex items-center justify-center gap-1.5 transition-colors shadow-[0_1px_0_0_#ffffff]" type="button">
+          <span class="material-symbols-outlined text-[16px]">map</span>
+          <span>Bản Đồ Sa Bàn (Topological Maps)</span>
+        </button>
+        <button id="tabBtnProduct" onclick="switchModalTab('product')" class="flex-1 py-2.5 px-3 border-b-2 border-transparent text-slate-500 hover:text-slate-800 hover:bg-white/60 flex items-center justify-center gap-1.5 transition-colors" type="button">
+          <span class="material-symbols-outlined text-[16px]">inventory_2</span>
+          <span>Danh Mục Hàng &amp; Phân Bổ Kho</span>
+        </button>
+      </div>
+
+      <!-- Modal Body Content -->
+      <div class="overflow-y-auto p-5 flex flex-col gap-3.5 max-h-[calc(92vh-125px)] bg-white">
+        
+        <!-- TAB 1: BẢN ĐỒ SA BÀN & NẠP MAP LINH HOẠT -->
+        <div id="modalTabMap" class="flex flex-col gap-3">
+          <p class="text-[12px] text-slate-600 leading-relaxed">
+            Chọn bản đồ sa bàn có sẵn hoặc nạp file cấu hình bản đồ mới (JSON) để AGV tự động tải mạng lưới line, trạm dừng và thuật toán Dijkstra:
+          </p>
+
+          <!-- Dropdown Bản đồ có sẵn -->
+          <div class="flex items-center gap-2 bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+            <div class="flex-1 flex flex-col">
+              <span class="text-[10px] text-slate-500 uppercase font-mono tracking-wider font-semibold">Bản Đồ Hiện Tuyến</span>
+              <select id="selMapList" onchange="previewMapDetails()" class="bg-white text-slate-800 text-[12px] font-mono rounded px-2.5 py-1.5 border border-slate-300 focus:border-primary focus:ring-1 focus:ring-primary outline-none transition-colors">
+                <!-- Sẽ được nạp tự động qua JavaScript -->
+              </select>
+            </div>
+            <button onclick="applySwitchMap()" class="self-end bg-primary hover:bg-primary-hover text-white font-semibold px-3.5 py-1.5 rounded text-[12px] flex items-center gap-1 transition-colors shadow-sm" type="button">
+              <span class="material-symbols-outlined text-[15px]">check_circle</span>
+              <span>Kích Hoạt</span>
+            </button>
+          </div>
+
+          <!-- Thông số kỹ thuật tuyến đang áp dụng -->
+          <div class="bg-slate-50 border border-slate-200 rounded-lg p-3.5 flex flex-col gap-2.5">
+            <div class="flex items-center justify-between pb-1.5 border-b border-slate-200/80">
+              <span class="text-[12px] text-primary font-bold flex items-center gap-1.5">
+                <span class="material-symbols-outlined text-[16px]">info</span>
+                Thông Số Kỹ Thuật Tuyến Đang Áp Dụng
+              </span>
+              <span class="text-[10px] text-blue-700 font-mono bg-blue-50 border border-blue-200 px-2 py-0.5 rounded flex items-center gap-1 font-semibold">
+                <span class="material-symbols-outlined text-[12px]">shield</span>Traffic Guard Active
+              </span>
+            </div>
+            <div class="grid grid-cols-2 gap-2 text-[11px] font-mono">
+              <div class="bg-white p-2.5 rounded border border-slate-200 flex flex-col shadow-2xs">
+                <span class="text-slate-500 text-[10px] font-sans">Tên Bản Đồ</span>
+                <span id="lblMapName" class="text-slate-900 font-semibold mt-0.5">--</span>
+              </div>
+              <div class="bg-white p-2.5 rounded border border-slate-200 flex flex-col shadow-2xs">
+                <span class="text-slate-500 text-[10px] font-sans">Kích Thước Sa Bàn</span>
+                <span id="lblMapDim" class="text-slate-900 font-semibold mt-0.5">--</span>
+              </div>
+              <div class="col-span-2 bg-white p-2.5 rounded border border-slate-200 flex flex-col shadow-2xs">
+                <span class="text-slate-500 text-[10px] font-sans">Mô Tả &amp; Phân Vùng</span>
+                <span id="lblMapDesc" class="text-slate-700 text-[11px] font-medium mt-0.5">--</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Nạp bản đồ tùy biến linh hoạt JSON -->
+          <div class="bg-slate-50 border border-slate-200 rounded-lg p-3.5 flex flex-col gap-2.5">
+            <div class="flex items-center justify-between">
+              <span class="text-[12px] text-slate-800 font-bold flex items-center gap-1.5">
+                <span class="material-symbols-outlined text-primary text-[17px]">upload_file</span>
+                Nạp Bản Đồ Tùy Biến Linh Hoạt (JSON)
+              </span>
+              <div class="flex items-center gap-1.5">
+                <button onclick="downloadMapTemplate()" class="text-[10px] font-mono text-slate-600 hover:text-slate-900 bg-white border border-slate-200 px-2 py-1 rounded flex items-center gap-1 transition-colors" type="button">
+                  <span class="material-symbols-outlined text-[12px] text-primary">download</span>Mẫu JSON
+                </button>
+                <button onclick="exportCurrentMap()" class="text-[10px] font-mono text-slate-600 hover:text-slate-900 bg-white border border-slate-200 px-2 py-1 rounded flex items-center gap-1 transition-colors" type="button">
+                  <span class="material-symbols-outlined text-[12px] text-primary">file_export</span>Xuất Hiện Tại
+                </button>
+              </div>
+            </div>
+
+            <!-- Upload drag/drop box -->
+            <input type="file" id="inpMapFile" accept=".json" class="hidden" onchange="handleMapFileUpload(event)"/>
+            <div onclick="document.getElementById('inpMapFile').click()" class="border border-dashed border-slate-300 hover:border-primary bg-white p-3.5 rounded-lg text-center cursor-pointer transition-colors flex flex-col items-center justify-center gap-1 group">
+              <span class="material-symbols-outlined text-primary group-hover:scale-110 transition-transform text-[24px]">cloud_upload</span>
+              <span class="text-[12px] text-slate-700 font-medium">Chọn file bản đồ JSON từ máy tính</span>
+              <span class="text-[10px] text-slate-500 font-mono">Hỗ trợ: map_id, nodes (x, y), segments (khoảng cách, hướng)</span>
+            </div>
+
+            <div class="flex items-center justify-between">
+              <button onclick="toggleJsonPasteBox()" class="text-[11px] font-mono text-primary hover:underline flex items-center gap-1 font-semibold" type="button">
+                <span class="material-symbols-outlined text-[14px]">code</span>
+                <span>&lt;&gt; Dán mã JSON trực tiếp (Editor)</span>
+              </button>
+            </div>
+
+            <div id="jsonPasteBox" class="hidden flex flex-col gap-1.5">
+              <textarea id="txtMapJson" rows="6" placeholder="Dán cấu trúc JSON bản đồ vào đây..." class="w-full bg-white text-slate-800 font-mono text-[10px] p-2.5 rounded border border-slate-300 focus:border-primary focus:ring-1 focus:ring-primary outline-none" spellcheck="false"></textarea>
+              <button onclick="applyJsonMapPaste()" class="w-full py-2 rounded-lg font-bold text-white bg-primary hover:bg-primary-hover text-[12px] flex items-center justify-center gap-1.5 shadow-sm transition-colors" type="button">
+                <span class="material-symbols-outlined text-[16px]">bolt</span>
+                <span>Nạp &amp; Kích Hoạt Bản Đồ Này</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 2: DANH MỤC HÀNG & PHÂN BỔ KHO -->
+        <div id="modalTabProduct" class="hidden flex flex-col gap-3">
+          <p class="text-[12px] text-slate-600 leading-relaxed">
+            Quản lý danh mục sản phẩm AI và cấu hình quy tắc phân bổ kho đích tự động:
+          </p>
+
+          <!-- Bảng danh mục sản phẩm hiện có -->
+          <div class="border border-slate-200 rounded-lg overflow-hidden bg-white max-h-[180px] overflow-y-auto">
+            <table class="w-full text-left text-[11px]">
+              <thead class="bg-slate-50 text-slate-600 font-mono border-b border-slate-200 sticky top-0">
+                <tr>
+                  <th class="p-2.5 font-semibold">MÃ HÀNG</th>
+                  <th class="p-2.5 font-semibold">TÊN SẢN PHẨM</th>
+                  <th class="p-2.5 font-semibold">YOLO CLASS</th>
+                  <th class="p-2.5 font-semibold">NHÓM</th>
+                  <th class="p-2.5 text-right font-semibold">THAO TÁC</th>
+                </tr>
+              </thead>
+              <tbody id="tblProductList" class="divide-y divide-slate-100 text-slate-800">
+                <tr><td colspan="5" class="p-3 text-center text-slate-400">Đang tải danh mục...</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Form thêm mặt hàng mới -->
+          <div class="bg-slate-50 border border-slate-200 rounded-lg p-3.5 flex flex-col gap-2.5">
+            <div class="flex items-center gap-1.5 pb-1.5 border-b border-slate-200">
+              <span class="material-symbols-outlined text-primary text-[17px]">add_circle</span>
+              <span class="text-[12px] text-slate-900 font-bold">Thêm Mặt Hàng &amp; Gán Luật Phân Bổ Mới</span>
+            </div>
+
+            <div class="grid grid-cols-2 gap-2 text-[11px]">
+              <div class="flex flex-col gap-0.5">
+                <label class="text-[10px] text-slate-500 font-mono font-semibold">MÃ HÀNG (SKU)</label>
+                <input id="inpProdCode" placeholder="vd: PKG_FOOD" class="bg-white text-primary font-mono px-2.5 py-1.5 rounded border border-slate-300 focus:border-primary outline-none uppercase"/>
+              </div>
+              <div class="flex flex-col gap-0.5">
+                <label class="text-[10px] text-slate-500 font-semibold">TÊN SẢN PHẨM</label>
+                <input id="inpProdName" placeholder="vd: Đồ Hộp Thực Phẩm" class="bg-white text-slate-800 px-2.5 py-1.5 rounded border border-slate-300 focus:border-primary outline-none"/>
+              </div>
+              <div class="flex flex-col gap-0.5">
+                <label class="text-[10px] text-slate-500 font-mono font-semibold">YOLO CLASS ID</label>
+                <input id="inpProdYoloId" type="number" value="3" class="bg-white text-slate-800 font-mono px-2.5 py-1.5 rounded border border-slate-300 focus:border-primary outline-none"/>
+              </div>
+              <div class="flex flex-col gap-0.5">
+                <label class="text-[10px] text-slate-500 font-semibold">NHÓM NGÀNH</label>
+                <select id="selProdCategory" class="bg-white text-slate-800 px-2.5 py-1.5 rounded border border-slate-300 focus:border-primary outline-none">
+                  <option value="ELECTRONIC">ELECTRONIC</option>
+                  <option value="MECHANICAL">MECHANICAL</option>
+                  <option value="TOOL">TOOL</option>
+                  <option value="FOOD" selected>FOOD</option>
+                  <option value="MEDICAL">MEDICAL</option>
+                  <option value="GENERAL">GENERAL</option>
+                </select>
+              </div>
+              <div class="col-span-2 flex flex-col gap-0.5">
+                <label class="text-[10px] text-slate-500 font-semibold">KHO ĐÍCH ƯU TIÊN</label>
+                <select id="selProdTargetNode" class="bg-white text-primary px-2.5 py-1.5 rounded border border-slate-300 focus:border-primary outline-none font-medium">
+                  <option value="B">Kho B (Kệ 1) - Tự động định tuyến Trạm B</option>
+                  <option value="C">Kho C (Kệ 2) - Tự động định tuyến Trạm C</option>
+                  <option value="D">Kho D (Kệ 3) - Tự động định tuyến Trạm D</option>
+                  <option value="E">Kho E (Kệ Dự phòng)</option>
+                </select>
+              </div>
+            </div>
+
+            <button onclick="submitNewProduct()" class="w-full py-2.5 rounded-lg font-bold text-white bg-primary hover:bg-primary-hover text-[12px] flex items-center justify-center gap-1.5 shadow-sm transition-colors mt-1" type="button">
+              <span class="material-symbols-outlined text-[17px]">save</span>
+              <span>Lưu Mặt Hàng &amp; Luật Phân Bổ</span>
+            </button>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ========================================== -->
+  <!-- 5. FOOTER                                  -->
+  <!-- ========================================== -->
+  <footer class="w-full bg-white border-t border-slate-200 py-3 mt-6">
+    <div class="w-full px-4 md:px-6 flex flex-col md:flex-row items-center justify-between gap-2 text-xs text-slate-500">
+      <div class="flex items-center gap-3">
+        <span class="font-mono text-slate-600 uppercase tracking-wider font-semibold">Hệ Thống AGV_Ver2 SCADA Core</span>
+        <span class="text-slate-300">|</span>
+        <span class="font-mono text-slate-500">Hub: DC-HANOI-01 (100ms Telemetry Loop)</span>
+      </div>
+      <div>
+        Dự án Công nghệ thông tin &amp; Robot • AGV WMS Digital Twin Architecture
+      </div>
+    </div>
+  </footer>
+
+  <!-- ========================================== -->
+  <!-- 6. CORE JAVASCRIPT CONTROLLER              -->
+  <!-- ========================================== -->
+  <script src="/static/js/dashboard.js"></script>
+
+</body>
+</html>

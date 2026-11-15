@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AGV_Ver2 - Nhật Ký Di Chuyển & Đo Kiểm</title>
+  <style>
+    :root {
+      --bg-main: #0f172a;
+      --bg-card: #1e293b;
+      --bg-header: #0b1120;
+      --border-color: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #38bdf8;
+      --primary-hover: #0284c7;
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --indigo: #6366f1;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    body { background-color: var(--bg-main); color: var(--text-main); min-height: 100vh; display: flex; flex-direction: column; }
+
+    /* Header */
+    header {
+      background-color: var(--bg-header);
+      border-bottom: 1px solid var(--border-color);
+      padding: 0.75rem 1.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+
+    .brand { display: flex; align-items: center; gap: 0.75rem; }
+    .brand-icon {
+      width: 38px; height: 38px; border-radius: 8px;
+      background: linear-gradient(135deg, #0284c7, #6366f1);
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 2px 8px rgba(56, 189, 248, 0.25);
+    }
+    .brand-title { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.02em; color: #fff; }
+    .brand-subtitle { font-size: 0.75rem; color: var(--text-muted); font-family: monospace; }
+
+    .header-actions { display: flex; align-items: center; gap: 0.75rem; }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      padding: 0.5rem 0.85rem; border-radius: 6px; font-size: 0.82rem;
+      font-weight: 600; cursor: pointer; text-decoration: none;
+      transition: all 0.15s ease; border: 1px solid transparent;
+    }
+    .btn-outline { background: var(--bg-card); color: var(--text-main); border-color: var(--border-color); }
+    .btn-outline:hover { background: #334155; border-color: #475569; }
+    .btn-primary { background: var(--primary); color: #0b1120; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-danger { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
+    .btn-danger:hover { background: rgba(239, 68, 68, 0.25); }
+    .btn-success { background: rgba(34, 197, 94, 0.15); color: #86efac; border-color: rgba(34, 197, 94, 0.3); }
+    .btn-success:hover { background: rgba(34, 197, 94, 0.25); }
+
+    /* Main Container */
+    main { flex: 1; padding: 1.25rem 1.5rem; max-width: 1700px; margin: 0 auto; width: 100%; display: flex; flex-direction: column; gap: 1.25rem; }
+
+    /* Summary Grid */
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 1rem;
+    }
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
+    .card-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); font-weight: 600; }
+    .card-value { font-size: 1.45rem; font-weight: 700; color: #fff; font-family: monospace; display: flex; align-items: baseline; gap: 0.3rem; }
+    .card-sub { font-size: 0.78rem; color: var(--text-muted); }
+
+    /* Badges */
+    .badge {
+      display: inline-block; padding: 0.2rem 0.55rem; border-radius: 9999px;
+      font-size: 0.75rem; font-weight: 700; font-family: monospace; text-transform: uppercase;
+    }
+    .badge-running { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
+    .badge-station { background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); }
+    .badge-stopped { background: rgba(148, 163, 184, 0.15); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.3); }
+    .badge-bridge { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+    .badge-turning { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+    .badge-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+
+    /* Map & Control Section */
+    .map-controls-row {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 1.25rem;
+    }
+    @media (max-width: 900px) {
+      .map-controls-row { grid-template-columns: 1fr; }
+    }
+
+    .canvas-container {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 0.85rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.6rem;
+    }
+    canvas {
+      background: #0b1120;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      width: 100%;
+      height: 260px;
+    }
+
+    /* Toolbar */
+    .toolbar {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 0.85rem 1.2rem;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.85rem;
+    }
+    .toolbar-group { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+    select, input {
+      background: #0b1120;
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 0.45rem 0.75rem;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      outline: none;
+    }
+    select:focus, input:focus { border-color: var(--primary); }
+
+    /* Table Container */
+    .table-container {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+    }
+    .table-wrapper {
+      max-height: 520px;
+      overflow-y: auto;
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+      text-align: left;
+    }
+    thead th {
+      background: #0b1120;
+      color: var(--text-muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.72rem;
+      letter-spacing: 0.05em;
+      padding: 0.75rem 1rem;
+      position: sticky;
+      top: 0;
+      border-bottom: 1px solid var(--border-color);
+      z-index: 10;
+    }
+    tbody td {
+      padding: 0.6rem 1rem;
+      border-bottom: 1px solid rgba(51, 65, 85, 0.4);
+      font-family: monospace;
+      color: #e2e8f0;
+    }
+    tbody tr:hover { background-color: rgba(56, 189, 248, 0.04); }
+    tbody tr:nth-child(even) { background-color: rgba(15, 23, 42, 0.35); }
+
+    /* Dot Pulse */
+    .pulse-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background-color: var(--success);
+      display: inline-block;
+      box-shadow: 0 0 8px var(--success);
+      animation: pulse 1.8s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(1.2); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+    .pulse-dot.offline { background-color: var(--danger); box-shadow: 0 0 8px var(--danger); animation: none; }
+
+    /* Empty state */
+    .empty-row td {
+      text-align: center; padding: 3rem; color: var(--text-muted); font-family: sans-serif;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ==================== HEADER ==================== -->
+  <header>
+    <div class="brand">
+      <div class="brand-icon">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+          <line x1="8" y1="21" x2="16" y2="21"></line>
+          <line x1="12" y1="17" x2="12" y2="21"></line>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-title">AGV_Ver2 Movement & Telemetry Logger</div>
+        <div class="brand-subtitle">Hệ Thống Lưu Vết & Đo Kiểm Di Chuyển Thời Gian Thực</div>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <!-- Live Status Indicator -->
+      <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem; font-family:monospace; padding:0.35rem 0.75rem; background:#0b1120; border-radius:6px; border:1px solid var(--border-color);">
+        <span id="livePulse" class="pulse-dot"></span>
+        <span id="connText">Đang Kết Nối...</span>
+      </div>
+
+      <!-- Action Buttons -->
+      <button id="btnToggleLog" onclick="toggleLogging()" class="btn btn-success" title="Bật hoặc tạm dừng ghi dữ liệu">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+        <span id="toggleLogText">Ghi Log: BẬT</span>
+      </button>
+
+      <a href="/api/logs/export" class="btn btn-outline" download title="Xuất toàn bộ dữ liệu ra tệp CSV">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+        <span>Tải CSV</span>
+      </a>
+
+      <button onclick="clearLogs()" class="btn btn-danger" title="Xóa toàn bộ log đo kiểm hiện tại">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+        <span>Xóa Log</span>
+      </button>
+
+      <a href="/" class="btn btn-outline" title="Quay lại giao diện SCADA Digital Twin">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+        <span>Dashboard</span>
+      </a>
+    </div>
+  </header>
+
+  <!-- ==================== MAIN CONTENT ==================== -->
+  <main>
+
+    <!-- Row 1: Telemetry Summary Cards -->
+    <div class="summary-grid">
+      <div class="card">
+        <div class="card-label">Tọa Độ & Góc Hướng</div>
+        <div class="card-value" id="cardCoord">X: 0.00 | Y: 0.00</div>
+        <div class="card-sub" id="cardYaw">Yaw: 90.0° | Sai số vạch: 0.00</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Trạng Thái Robot</div>
+        <div class="card-value" style="font-size:1.15rem;">
+          <span id="cardStateBadge" class="badge badge-stopped">STOPPED</span>
+        </div>
+        <div class="card-sub" id="cardLegInfo">Chặng: -- | Trạm: Trạm A</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Vận Tốc & Quãng Đường</div>
+        <div class="card-value" id="cardSpeed">0.0 <span style="font-size:0.8rem; color:var(--text-muted);">cm/s</span></div>
+        <div class="card-sub" id="cardDist">Tổng quãng đường: 0.000 m</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Năng Lượng INA226</div>
+        <div class="card-value" id="cardVoltage">-- <span style="font-size:0.8rem; color:var(--text-muted);">V</span></div>
+        <div class="card-sub" id="cardEnergy">Dòng: 0.00A | 0.0 mAh</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Bộ Đệm Nhật Ký</div>
+        <div class="card-value" id="cardTotalLogs" style="color:var(--primary);">0</div>
+        <div class="card-sub" id="cardLoggingStatus">Trạng thái: Đang ghi (Auto)</div>
+      </div>
+    </div>
+
+    <!-- Row 2: Mini Canvas Map + Quick Controls -->
+    <div class="map-controls-row">
+      <!-- Mini Map Viewer -->
+      <div class="canvas-container">
+        <div style="width:100%; display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-size:0.8rem; font-weight:700; color:var(--text-muted); text-transform:uppercase;">Quỹ Đạo Sa Bàn Thực Tế (2D)</span>
+          <span style="font-size:0.75rem; color:var(--primary); font-family:monospace;">1.54m × 1.51m</span>
+        </div>
+        <canvas id="trailCanvas" width="320" height="260"></canvas>
+      </div>
+
+      <!-- Log Toolbar & Settings -->
+      <div style="display:flex; flex-direction:column; gap:0.75rem;">
+        <div class="toolbar">
+          <div class="toolbar-group">
+            <label for="stateFilter" style="font-size:0.8rem; color:var(--text-muted); font-weight:600;">Lọc Trạng Thái:</label>
+            <select id="stateFilter" onchange="loadLogs()">
+              <option value="ALL">-- Tất Cả Trạng Thái --</option>
+              <option value="RUNNING_FAST">RUNNING_FAST (Chạy thẳng nhanh)</option>
+              <option value="APPROACH_CORNER">APPROACH_CORNER (Tiếp cận trạm 23cm)</option>
+              <option value="AT_STATION">AT_STATION (Đã tới trạm)</option>
+              <option value="DEAD_RECKONING_BRIDGE">DEAD_RECKONING_BRIDGE (Vượt vạch đứt)</option>
+              <option value="TURNING_STATION">TURNING_STATION (Xoay tại trạm)</option>
+              <option value="LINE_FLICKER_FILTER">LINE_FLICKER_FILTER (Lọc vạch mờ)</option>
+              <option value="PIVOT_LEFT">PIVOT_LEFT (Bẻ lái trái gắt)</option>
+              <option value="PIVOT_RIGHT">PIVOT_RIGHT (Bẻ lái phải gắt)</option>
+              <option value="STOPPED">STOPPED (Dừng xe)</option>
+            </select>
+          </div>
+
+          <div class="toolbar-group">
+            <label for="limitSelect" style="font-size:0.8rem; color:var(--text-muted); font-weight:600;">Hiển Thị:</label>
+            <select id="limitSelect" onchange="loadLogs()">
+              <option value="50">50 dòng</option>
+              <option value="100" selected>100 dòng</option>
+              <option value="200">200 dòng</option>
+              <option value="500">500 dòng</option>
+              <option value="1000">1000 dòng</option>
+            </select>
+          </div>
+
+          <div class="toolbar-group">
+            <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.8rem; color:var(--text-muted); cursor:pointer;">
+              <input type="checkbox" id="chkAutoRefresh" checked onchange="toggleAutoRefresh(this.checked)">
+              <span>Tự động làm mới (1s)</span>
+            </label>
+            <button onclick="loadLogs()" class="btn btn-outline" style="padding:0.4rem 0.75rem;" title="Làm mới bảng log">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
+              <span>Tải Lại</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Realtime Data Table -->
+        <div class="table-container">
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width: 60px;"># ID</th>
+                  <th style="width: 155px;">Thời Gian</th>
+                  <th style="width: 140px;">Trạng Thái</th>
+                  <th style="width: 90px;">Trạm</th>
+                  <th style="width: 110px;">Chặng</th>
+                  <th>X (m)</th>
+                  <th>Y (m)</th>
+                  <th>Yaw (°)</th>
+                  <th>Tốc Độ (cm/s)</th>
+                  <th>Quãng Đường (m)</th>
+                  <th>Lỗi Line</th>
+                  <th>Điện Áp</th>
+                  <th>Năng Lượng</th>
+                </tr>
+              </thead>
+              <tbody id="logsTableBody">
+                <tr class="empty-row">
+                  <td colspan="13">Đang tải dữ liệu nhật ký di chuyển từ máy chủ...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ==================== LOGIC JAVASCRIPT ==================== -->
+  <script>
+    let autoRefreshTimer = null;
+    let isLoggingActive = true;
+    let trailData = [];
+
+    // Map Coordinates: A(0,0), B(0, 1.51), C(1.54, 1.51), D(1.54, 0)
+    const MAP_W = 1.54;
+    const MAP_H = 1.51;
+
+    // 1. Tải trạng thái AGV và cập nhật Canvas mini
+    async function updateLiveDashboard() {
+      try {
+        const res = await fetch('/api/state');
+        if (!res.ok) throw new Error('Network error');
+        const d = await res.json();
+
+        // Cập nhật thẻ kết nối
+        const connText = document.getElementById('connText');
+        const livePulse = document.getElementById('livePulse');
+        if (d.connected) {
+          connText.innerText = d.last_seen_str || 'Online';
+          livePulse.className = 'pulse-dot';
+        } else {
+          connText.innerText = 'Mất kết nối';
+          livePulse.className = 'pulse-dot offline';
+        }
+
+        // Cập nhật các thẻ thông số
+        const curX = Number(d.odom_x || 0).toFixed(3);
+        const curY = Number(d.odom_y || 0).toFixed(3);
+        const curYaw = Number(d.yaw_deg || 0).toFixed(1);
+        const lineErr = Number(d.line_error || 0).toFixed(2);
+        document.getElementById('cardCoord').innerText = `X: ${curX} | Y: ${curY}`;
+        document.getElementById('cardYaw').innerText = `Yaw: ${curYaw}° | Lỗi Line: ${lineErr}`;
+
+        const stateStr = d.robot_state || 'STOPPED';
+        const badgeElem = document.getElementById('cardStateBadge');
+        badgeElem.innerText = stateStr;
+        badgeElem.className = 'badge ' + getStateBadgeClass(stateStr);
+
+        const st = (d.camera && d.camera.station) ? d.camera.station : (d.station || '--');
+        const leg = d.leg || '--';
+        document.getElementById('cardLegInfo').innerText = `Chặng: ${leg} | Trạm: ${st}`;
+
+        document.getElementById('cardSpeed').innerHTML = `${Number(d.speed_cm_s || 0).toFixed(1)} <span style="font-size:0.8rem; color:var(--text-muted);">cm/s</span>`;
+        document.getElementById('cardDist').innerText = `Tổng quãng đường: ${Number(d.total_distance_m || 0).toFixed(3)} m`;
+
+        document.getElementById('cardVoltage').innerHTML = `${Number(d.voltage || 0).toFixed(2)} <span style="font-size:0.8rem; color:var(--text-muted);">V (${d.battery_pct || 0}%)</span>`;
+        document.getElementById('cardEnergy').innerText = `Dòng: ${Number(d.current || 0).toFixed(2)}A | ${Number(d.energy_mah || 0).toFixed(1)} mAh`;
+
+        // Vẽ vệt di chuyển trên Canvas
+        if (d.trail && Array.isArray(d.trail)) {
+          trailData = d.trail;
+        }
+        drawTrailCanvas(Number(d.odom_x || 0), Number(d.odom_y || 0), Number(d.yaw_deg || 90));
+
+      } catch (e) {
+        document.getElementById('connText').innerText = 'Lỗi Server';
+        document.getElementById('livePulse').className = 'pulse-dot offline';
+      }
+    }
+
+    // 2. Tải danh sách Log từ API /api/logs
+    async function loadLogs() {
+      const state = document.getElementById('stateFilter').value;
+      const limit = document.getElementById('limitSelect').value;
+
+      try {
+        const res = await fetch(`/api/logs?limit=${limit}&state=${encodeURIComponent(state)}`);
+        if (!res.ok) throw new Error('API logs failed');
+        const json = await res.json();
+
+        // Cập nhật trạng thái logging
+        isLoggingActive = json.is_logging_active;
+        const btnToggle = document.getElementById('btnToggleLog');
+        const txtToggle = document.getElementById('toggleLogText');
+        const cardLoggingStatus = document.getElementById('cardLoggingStatus');
+        if (isLoggingActive) {
+          btnToggle.className = 'btn btn-success';
+          txtToggle.innerText = 'Ghi Log: BẬT';
+          cardLoggingStatus.innerText = 'Trạng thái: Đang ghi (Auto)';
+        } else {
+          btnToggle.className = 'btn btn-danger';
+          txtToggle.innerText = 'Ghi Log: TẮT';
+          cardLoggingStatus.innerText = 'Trạng thái: Tạm dừng ghi';
+        }
+
+        document.getElementById('cardTotalLogs').innerText = json.total_count || 0;
+
+        const tbody = document.getElementById('logsTableBody');
+        const logs = json.logs || [];
+        if (logs.length === 0) {
+          tbody.innerHTML = `
+            <tr class="empty-row">
+              <td colspan="13">Chưa có nhật ký nào được ghi nhận. Nhấn Bắt đầu di chuyển trên AGV để ghi vết!</td>
+            </tr>`;
+          return;
+        }
+
+        let html = '';
+        logs.forEach(r => {
+          const badgeClass = getStateBadgeClass(r.state);
+          html += `
+            <tr>
+              <td style="color:var(--text-muted); font-size:0.75rem;">#${r.log_id}</td>
+              <td style="color:#93c5fd;">${r.timestamp || '--'}</td>
+              <td><span class="badge ${badgeClass}">${r.state || 'N/A'}</span></td>
+              <td style="font-weight:700; color:#38bdf8;">${r.station || '--'}</td>
+              <td style="color:#cbd5e1;">${r.leg || '--'}</td>
+              <td>${Number(r.x || 0).toFixed(3)}</td>
+              <td>${Number(r.y || 0).toFixed(3)}</td>
+              <td style="color:#fde047;">${Number(r.yaw || 0).toFixed(1)}°</td>
+              <td>${Number(r.speed || 0).toFixed(1)}</td>
+              <td>${Number(r.dist || 0).toFixed(3)}</td>
+              <td>${Number(r.line_err || 0).toFixed(2)}</td>
+              <td>${Number(r.voltage || 0).toFixed(2)} V</td>
+              <td>${Number(r.energy_mah || 0).toFixed(1)} mAh</td>
+            </tr>`;
+        });
+        tbody.innerHTML = html;
+
+      } catch (e) {
+        console.error('Lỗi khi tải bảng log:', e);
+      }
+    }
+
+    function getStateBadgeClass(state) {
+      if (!state) return 'badge-stopped';
+      const s = state.toUpperCase();
+      if (s.includes('RUNNING')) return 'badge-running';
+      if (s.includes('STATION')) return 'badge-station';
+      if (s.includes('BRIDGE') || s.includes('GAP')) return 'badge-bridge';
+      if (s.includes('TURN') || s.includes('PIVOT')) return 'badge-turning';
+      if (s.includes('STOP') || s.includes('OFFLINE')) return 'badge-stopped';
+      return 'badge-running';
+    }
+
+    // 3. Bật/Tắt ghi log
+    async function toggleLogging() {
+      try {
+        const nextState = !isLoggingActive;
+        const res = await fetch('/api/logs/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: nextState })
+        });
+        const data = await res.json();
+        isLoggingActive = data.is_logging_active;
+        loadLogs();
+      } catch (e) {
+        alert('Lỗi gửi lệnh bật/tắt ghi log: ' + e);
+      }
+    }
+
+    // 4. Xóa log
+    async function clearLogs() {
+      if (!confirm('Bạn có chắc chắn muốn xóa toàn bộ nhật ký di chuyển trong Cơ sở dữ liệu?')) return;
+      try {
+        const res = await fetch('/api/logs/clear', { method: 'POST' });
+        const data = await res.json();
+        alert(data.message || 'Đã xóa log thành công!');
+        loadLogs();
+      } catch (e) {
+        alert('Lỗi xóa log: ' + e);
+      }
+    }
+
+    // 5. Điều khiển Auto Refresh
+    function toggleAutoRefresh(enabled) {
+      if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = null;
+      }
+      if (enabled) {
+        autoRefreshTimer = setInterval(() => {
+          updateLiveDashboard();
+          loadLogs();
+        }, 1200);
+      }
+    }
+
+    // 6. Vẽ vệt di chuyển (Trail Canvas 2D)
+    function drawTrailCanvas(robotX, robotY, yawDeg) {
+      const cvs = document.getElementById('trailCanvas');
+      if (!cvs) return;
+      const ctx = cvs.getContext('2d');
+      const w = cvs.width;
+      const h = cvs.height;
+
+      ctx.clearRect(0, 0, w, h);
+
+      // Margin
+      const padX = 35;
+      const padY = 30;
+      const drawW = w - padX * 2;
+      const drawH = h - padY * 2;
+
+      // Coordinate mapping: Sa bàn X(0->1.54m), Y(0->1.51m)
+      // Gốc A(0,0) ở dưới-trái
+      function toScreen(x, y) {
+        const sx = padX + (x / MAP_W) * drawW;
+        const sy = (h - padY) - (y / MAP_H) * drawH;
+        return [sx, sy];
+      }
+
+      // Vẽ khung sa bàn chữ nhật nối 4 trạm A-B-C-D
+      const [ax, ay] = toScreen(0, 0);
+      const [bx, by] = toScreen(0, 1.51);
+      const [cx, cy] = toScreen(1.54, 1.51);
+      const [dx, dy] = toScreen(1.54, 0);
+
+      ctx.strokeStyle = '#334155';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(bx, by);
+      ctx.lineTo(cx, cy);
+      ctx.lineTo(dx, dy);
+      ctx.closePath();
+      ctx.stroke();
+
+      // Vẽ vệt di chuyển (Trail)
+      if (trailData.length > 1) {
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        const [p0x, p0y] = toScreen(trailData[0][0], trailData[0][1]);
+        ctx.moveTo(p0x, p0y);
+        for (let i = 1; i < trailData.length; i++) {
+          const [px, py] = toScreen(trailData[i][0], trailData[i][1]);
+          ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+      }
+
+      // Vẽ 4 Trạm
+      const stations = [
+        { name: 'A', x: 0, y: 0, col: '#22c55e' },
+        { name: 'B', x: 0, y: 1.51, col: '#38bdf8' },
+        { name: 'C', x: 1.54, y: 1.51, col: '#f59e0b' },
+        { name: 'D', x: 1.54, y: 0, col: '#a855f7' }
+      ];
+
+      stations.forEach(s => {
+        const [sx, sy] = toScreen(s.x, s.y);
+        ctx.fillStyle = s.col;
+        ctx.beginPath();
+        ctx.arc(sx, sy, 5, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = 'bold 11px monospace';
+        ctx.fillText(s.name, sx - 4, sy - 8);
+      });
+
+      // Vẽ Robot AGV
+      const [rx, ry] = toScreen(robotX, robotY);
+      ctx.save();
+      ctx.translate(rx, ry);
+      // Góc yaw: 90° hướng lên (-Y màn hình), 0° sang phải (+X màn hình)
+      ctx.rotate(-yawDeg * Math.PI / 180);
+
+      // Thân robot
+      ctx.fillStyle = '#ef4444';
+      ctx.fillRect(-8, -6, 16, 12);
+
+      // Mũi hướng robot
+      ctx.fillStyle = '#fde047';
+      ctx.beginPath();
+      ctx.moveTo(8, 0);
+      ctx.lineTo(3, -4);
+      ctx.lineTo(3, 4);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.restore();
+    }
+
+    // Khởi động khi tải trang
+    window.addEventListener('DOMContentLoaded', () => {
+      updateLiveDashboard();
+      loadLogs();
+      toggleAutoRefresh(true);
+    });
+  </script>
+
+</body>
+</html>

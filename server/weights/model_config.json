@@ -1,0 +1,78 @@
+{
+  "system_name": "SLAM_KLTN_Hybrid_CV_Module",
+  "version": "1.0.0-final",
+  "description": "Standalone Hybrid Computer Vision for Station A tray object sorting: YOLO11n object localization + MobileNetV3-Small classification + OpenCV geometric verification.",
+  "checkpoint_sha256": "31efdf26a79220994c6a42dc014b036a78e1fe4bb97c2e5eaf17fc894f4e2620",
+  "detector_sha256": "0f434fd6af532213a60f1daadee48354af85127c93e68f7b8a6f304109baf62c",
+  "architecture": "mobilenet_v3_small",
+  "num_classes": 3,
+  "classes": [
+    "cylinder",
+    "rectangular_box",
+    "triangular_prism"
+  ],
+  "class_to_idx": {
+    "cylinder": 0,
+    "rectangular_box": 1,
+    "triangular_prism": 2
+  },
+  "idx_to_class": {
+    "0": "cylinder",
+    "1": "rectangular_box",
+    "2": "triangular_prism"
+  },
+  "input_resolution": [224, 224],
+  "models": {
+    "classifier": {
+      "name": "MobileNetV3-Small-Improved",
+      "weights_file": "best.pth",
+      "sha256": "31efdf26a79220994c6a42dc014b036a78e1fe4bb97c2e5eaf17fc894f4e2620",
+      "architecture": "mobilenet_v3_small",
+      "num_classes": 3,
+      "classes": [
+        "cylinder",
+        "rectangular_box",
+        "triangular_prism"
+      ],
+      "input_resolution": [224, 224],
+      "normalization": {
+        "mean": [0.485, 0.456, 0.406],
+        "std": [0.229, 0.224, 0.225]
+      },
+      "roi_pad_ratio": 0.14
+    },
+    "detector": {
+      "name": "YOLO11n-StationA-Detector",
+      "weights_file": "yolo11n_v5b_best.pt",
+      "sha256": "0f434fd6af532213a60f1daadee48354af85127c93e68f7b8a6f304109baf62c",
+      "framework": "ultralytics",
+      "confidence_threshold": 0.25,
+      "purpose": "Autonomous bounding box localization on full-resolution Station A Android images"
+    }
+  },
+  "fusion_thresholds": {
+    "confidence_threshold_high": 0.85,
+    "uncertainty_margin": 0.20,
+    "cylinder_circularity_confirm": 0.80,
+    "cylinder_circularity_contradiction": 0.50,
+    "prism_acute_angle_max_deg": 55.0,
+    "prism_p_nn_rescue_min": 0.25,
+    "box_extent_min": 0.80,
+    "box_prism_borderline_margin": 0.10
+  },
+  "decision_statuses": [
+    "CLASSIFIED",
+    "NEEDS_REVIEW",
+    "NO_OBJECT",
+    "INVALID_IMAGE"
+  ],
+  "operating_constraints": {
+    "station_id": "Station A",
+    "target_object_count": 1,
+    "background_surface": "matte black tray",
+    "lighting_requirements": "controlled diffuse illumination, eliminate harsh diagonal shadows",
+    "camera_view": "fixed overhead or angled (approx 60 deg), no motorized tilt required",
+    "placement_guidelines": "place triangular prisms so that either the triangular cross-section or longitudinal apex ridge is visible to the overhead camera",
+    "escalation_policy": "on NEEDS_REVIEW, return warning status to caller; do not execute automatic robot motion or false WMS placement"
+  }
+}
