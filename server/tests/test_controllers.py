@@ -150,7 +150,9 @@ def run_controller_tests():
 
     # Kiểm thử Cơ chế Tự động Kích hoạt Shot 1 tại Trạm A khi khởi động
     cam_ctrl.record_poll()
-    agv_ctrl.handle_telemetry({"station": "A", "state": "IDLE", "speed": 0.0, "x": 0.0, "y": 0.0, "voltage": 12.4})
+    ret_cmd = workflow_manager.agv_fsm.pending_command
+    ret_ack = ret_cmd["cmd_id"] if ret_cmd else 0
+    agv_ctrl.handle_telemetry({"station": "A", "state": "AT_STATION", "speed": 0.0, "x": 0.0, "y": 0.0, "voltage": 12.4, "ack_id": ret_ack})
     # Giả lập mốc thời gian khởi động ổn định 3.0s
     now_ts = time.time()
     cam_ctrl.first_poll_time = now_ts - 3.0

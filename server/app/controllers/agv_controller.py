@@ -8,7 +8,7 @@ XỬ LÝ TELEMETRY CHU KỲ (100ms), PHÁT LỆNH ĐIỀU KHIỂN & LƯU VẾT D
 import json
 import time
 from typing import Dict, Any, Tuple
-from app.config import DEFAULT_AGV_ID, DEFAULT_MAP_ID
+from app.config import DEFAULT_AGV_ID, DEFAULT_MAP_ID, AGV_WATCHDOG_TIMEOUT_SEC
 
 class AGVController:
     def __init__(self, workflow_manager):
@@ -35,7 +35,7 @@ class AGVController:
           - ticks_l, ticks_r, pwm_l, pwm_r, state, ack_id, station, leg
         """
         now = time.time()
-        if not self.first_seen_time or (now - self.last_seen_time > 6.0):
+        if not self.first_seen_time or (now - self.last_seen_time > AGV_WATCHDOG_TIMEOUT_SEC):
             self.first_seen_time = now
         self.last_seen_time = now
         self.last_telemetry_data = body_json
@@ -142,28 +142,53 @@ class AGVController:
                 return 400, {"status": "error", "message": "Camera controller chưa được kích hoạt"}
         elif action == "reset_odom":
             self.trail = []
-            self.workflow_manager.active_unloading_tasks.clear()
-            self.workflow_manager.map_repo.unlock_all_by_agv(self.agv_id)
+            self.workflow_manager.abort_active_missions(
+                reason="RESET_ODOM",
+                clear_agv_cmd=False,
+                clear_camera=True
+            )
+            self.workflow_manager.last_reported_station = "A"
             cmd_obj = self.workflow_manager.agv_fsm.queue_command("RESET_ODOM")
         elif action == "reset_energy":
             cmd_obj = self.workflow_manager.agv_fsm.queue_command("RESET_ENERGY")
         elif action == "start":
             cmd_obj = self.workflow_manager.agv_fsm.queue_command("START")
         elif action == "stop":
-            self.workflow_manager.active_unloading_tasks.clear()
-            self.workflow_manager.map_repo.unlock_all_by_agv(self.agv_id)
+            self.workflow_manager.abort_active_missions(
+                reason="MANUAL_STOP",
+                clear_agv_cmd=False,
+                clear_camera=True
+            )
             cmd_obj = self.workflow_manager.agv_fsm.queue_command("STOP")
+        elif action in ("abort_missions", "abort_mission", "reset_wms"):
+            recovery = self.workflow_manager.abort_active_missions(
+                reason="MANUAL_ABORT_MISSION",
+                clear_agv_cmd=True,
+                clear_camera=True
+            )
+            return 200, {
+                "status": "mission_reset",
+                "cmd_id": 0,
+                "cmd": "ABORT_MISSIONS",
+                "aborted_task_ids": recovery["aborted_task_ids"],
+                "message": f"Đã hủy nhiệm vụ kẹt ({len(recovery['aborted_task_ids'])} task) và đưa WMS về trạng thái sẵn sàng."
+            }
         elif action in ("go_to", "return_home"):
             st = "A" if action == "return_home" else str(body_json.get("station", "A")).upper()
-            if st == "A":
-                # Dọn dẹp các task dỡ hàng cũ và mở khóa toàn bộ đường line khi gọi về Trạm A
-                self.workflow_manager.active_unloading_tasks.clear()
-                self.workflow_manager.mission_queue.clear()
-                self.workflow_manager.active_mission = None
-                self.workflow_manager.map_repo.unlock_all_by_agv(self.agv_id)
-            cmd_obj = self.workflow_manager.agv_fsm.queue_command(f"GO_TO:{st}")
+            active_map = self.workflow_manager.map_repo.get_active_map()
+            map_id = active_map["map_id"] if active_map else DEFAULT_MAP_ID
+            cur_st = str(self.last_telemetry_data.get("station", "")).strip().upper() or None
+            dispatch_res = self.workflow_manager.dispatch_manual_goto(
+                map_id=map_id,
+                target_node=st,
+                current_station=cur_st,
+                clear_missions=(action == "return_home" or st == "A")
+            )
+            cmd_obj = dispatch_res["command"]
         elif action == "auto_loop_on":
             cmd_obj = self.workflow_manager.agv_fsm.queue_command("AUTO_LOOP:ON")
+        elif action == "auto_loop_reverse":
+            cmd_obj = self.workflow_manager.agv_fsm.queue_command("AUTO_LOOP:REVERSE")
         elif action == "auto_loop_off":
             cmd_obj = self.workflow_manager.agv_fsm.queue_command("AUTO_LOOP:OFF")
         elif action == "turn_left_90":
@@ -174,6 +199,8 @@ class AGVController:
             cmd_obj = self.workflow_manager.agv_fsm.queue_command("TURN_180")
         elif action == "calibrate_gyro":
             cmd_obj = self.workflow_manager.agv_fsm.queue_command("CALIBRATE_GYRO")
+        elif action == "simulate_gap":
+            cmd_obj = self.workflow_manager.agv_fsm.queue_command("SIMULATE_GAP")
         else:
             cmd_str = action.upper()
             cmd_obj = self.workflow_manager.agv_fsm.queue_command(cmd_str)
@@ -187,15 +214,32 @@ class AGVController:
     def get_dashboard_state(self, camera_info: Dict[str, Any]) -> Dict[str, Any]:
         """Tổng hợp toàn bộ trạng thái hệ thống trả về cho Web Dashboard"""
         now = time.time()
-        # Nâng ngưỡng timeout từ 2.5s lên 6.0s để chống báo mất kết nối giả khi Wi-Fi nhiễu thoáng qua
-        is_connected = (now - self.last_seen_time) < 6.0
+        is_connected = (now - self.last_seen_time) < AGV_WATCHDOG_TIMEOUT_SEC
         
         agv_record = self.workflow_manager.fleet_repo.get_agv(self.agv_id) or {}
         last_t = self.last_telemetry_data
 
         if not is_connected:
+            if self.last_seen_time > 0.0:
+                agv_fsm = self.workflow_manager.agv_fsm
+                agv_fsm.last_heartbeat = min(agv_fsm.last_heartbeat or self.last_seen_time, self.last_seen_time)
+                agv_fsm.check_watchdog(AGV_WATCHDOG_TIMEOUT_SEC)
+                if agv_record.get("status") != "OFFLINE":
+                    self.workflow_manager.fleet_repo.update_telemetry(
+                        agv_id=self.agv_id,
+                        x=float(last_t.get("x", agv_record.get("x", 0.0))),
+                        y=float(last_t.get("y", agv_record.get("y", 0.0))),
+                        yaw=float(last_t.get("yaw", agv_record.get("yaw_deg", 90.0))),
+                        speed=0.0,
+                        voltage=float(last_t.get("voltage", agv_record.get("voltage_v", 0.0))),
+                        current=0.0,
+                        battery_pct=float(agv_record.get("battery_pct", 0.0)),
+                        status="OFFLINE",
+                        ack_id=int(agv_record.get("last_ack_id", 0))
+                    )
             if not self._unlocked_while_offline:
                 self.workflow_manager.map_repo.unlock_all_by_agv(self.agv_id)
+                self.workflow_manager.manual_route_target = None
                 self._unlocked_while_offline = True
             return {
                 "robot_id": self.agv_id,
@@ -210,6 +254,8 @@ class AGVController:
                 "line_mask": 0,
                 "line_error": 0.0,
                 "robot_state": "OFFLINE",
+                "station": str(last_t.get("station", self.workflow_manager.last_reported_station)),
+                "leg": str(last_t.get("leg", "")),
                 "ticks_l": 0,
                 "ticks_r": 0,
                 "pwm_l": 0,
@@ -221,7 +267,8 @@ class AGVController:
                 "battery_pct": 0.0,
                 "ina_ok": False,
                 "camera": camera_info,
-                "pending_command": self.workflow_manager.agv_fsm.pending_command
+                "pending_command": self.workflow_manager.agv_fsm.pending_command,
+                "active_mission": self.workflow_manager.active_mission
             }
 
         # KHI ĐANG KẾT NỐI (TELEMETRY THỜI GIAN THỰC TỪ ESP32-S3)
@@ -252,6 +299,8 @@ class AGVController:
             "line_mask": int(last_t.get("line_mask", 0)),
             "line_error": float(last_t.get("line_err", 0.0)),
             "robot_state": str(last_t.get("state", agv_record.get("status", "IDLE"))),
+            "station": str(last_t.get("station", self.workflow_manager.last_reported_station)),
+            "leg": str(last_t.get("leg", "")),
             "ticks_l": int(last_t.get("ticks_l", 0)),
             "ticks_r": int(last_t.get("ticks_r", 0)),
             "pwm_l": int(last_t.get("pwm_l", 0)),
@@ -263,7 +312,8 @@ class AGVController:
             "battery_pct": b_pct,
             "ina_ok": bool(last_t.get("ina_ok", True)),
             "camera": camera_info,
-            "pending_command": self.workflow_manager.agv_fsm.pending_command
+            "pending_command": self.workflow_manager.agv_fsm.pending_command,
+            "active_mission": self.workflow_manager.active_mission
         }
 
     def get_logs_data(self, limit: int = 100, offset: int = 0, state: str = "ALL") -> Dict[str, Any]:

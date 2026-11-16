@@ -70,10 +70,47 @@ async function loadMapData() {
       if (hudX) hudX.innerText = `X: 0.00m → ${mapConfig.width_m.toFixed(2)}m`;
       if (hudY) hudY.innerText = `Y: 0.00m → ${mapConfig.length_m.toFixed(2)}m`;
 
+      renderDynamicMapNodesUI(mapNodes);
       resizeCanvas();
     }
   } catch (e) {
     console.error("Lỗi nạp bản đồ:", e);
+  }
+}
+
+function renderDynamicMapNodesUI(nodes) {
+  if (!Array.isArray(nodes) || !nodes.length) return;
+  const grid = document.getElementById("quickDispatchGrid");
+  if (grid) {
+    const palette = [
+      "bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-700",
+      "bg-blue-50 hover:bg-blue-100 border-blue-200 text-primary",
+      "bg-purple-50 hover:bg-purple-100 border-purple-200 text-purple-700",
+      "bg-amber-50 hover:bg-amber-100 border-amber-200 text-amber-700",
+      "bg-emerald-50 hover:bg-emerald-100 border-emerald-200 text-emerald-700",
+      "bg-rose-50 hover:bg-rose-100 border-rose-200 text-rose-700"
+    ];
+    grid.className = nodes.length <= 4 ? "grid grid-cols-4 gap-2 mb-3" : "grid grid-cols-3 sm:grid-cols-4 gap-2 mb-3";
+    grid.innerHTML = nodes.map((n, idx) => {
+      const nid = String(n.node_id || "").toUpperCase();
+      const label = (n.node_type === "INBOUND" || nid === "A") ? `Đến Trạm ${nid}` : `Đến Kho ${nid}`;
+      const cls = palette[idx % palette.length];
+      return `<button onclick="sendGoTo('${nid}')" class="py-1.5 px-2 rounded-md border text-center transition-colors font-sans text-xs font-semibold ${cls}" type="button">${label}</button>`;
+    }).join("");
+  }
+
+  const selTarget = document.getElementById("selProdTargetNode");
+  if (selTarget) {
+    const prevVal = selTarget.value;
+    const targetNodes = nodes.filter(n => n.node_type !== "INBOUND");
+    const listToShow = targetNodes.length ? targetNodes : nodes;
+    selTarget.innerHTML = listToShow.map(n => {
+      const nid = String(n.node_id || "").toUpperCase();
+      return `<option value="${nid}">Kho ${nid} (${n.name || ("Trạm " + nid)})</option>`;
+    }).join("");
+    if ([...selTarget.options].some(o => o.value === prevVal)) {
+      selTarget.value = prevVal;
+    }
   }
 }
 
@@ -106,7 +143,7 @@ function drawMap() {
   }
 
   // (A) VẼ CÁC ĐOẠN ĐƯỜNG LINE (TRACK SEGMENTS)
-  let activeLockSegment = null;
+  const lockedSegments = [];
   mapSegments.forEach(seg => {
     const nFrom = mapNodes.find(n => n.node_id === seg.from_node);
     const nTo = mapNodes.find(n => n.node_id === seg.to_node);
@@ -120,7 +157,7 @@ function drawMap() {
     ctx.lineTo(p2.cx, p2.cy);
 
     if (seg.is_locked) {
-      activeLockSegment = seg;
+      lockedSegments.push(seg);
       // Vùng highlight cảnh báo an toàn
       ctx.lineWidth = 10;
       ctx.strokeStyle = "rgba(245, 158, 11, 0.18)";
@@ -161,9 +198,13 @@ function drawMap() {
   const lockBadge = document.getElementById("trafficLockBadge");
   const lockText = document.getElementById("trafficLockText");
   if (lockBadge && lockText) {
-    if (activeLockSegment) {
+    if (lockedSegments.length > 0) {
+      const segLabels = lockedSegments.map(s => `${s.from_node}→${s.to_node}`).join(", ");
+      const owner = lockedSegments[0].locked_by_agv || "AGV_Ver2";
       lockBadge.classList.remove("hidden");
-      lockText.innerText = `ĐOẠN ${activeLockSegment.from_node}→${activeLockSegment.to_node} ĐANG KHÓA (AGV_Ver2 Chiếm Dụng)`;
+      lockText.innerText = lockedSegments.length === 1
+        ? `ĐOẠN ${segLabels} ĐANG KHÓA (${owner} Chiếm Dụng)`
+        : `ĐANG KHÓA ${lockedSegments.length} ĐOẠN: ${segLabels} (${owner})`;
     } else {
       lockBadge.classList.add("hidden");
     }
@@ -461,14 +502,14 @@ async function updateState() {
   }
 }
 
-// Cập nhật hiển thị 6 bóng cảm biến line IR
+// Cập nhật hiển thị 5 bóng cảm biến line IR (L2, L1, C, R1, R2)
 function updateIrSensors(mask) {
   const container = document.getElementById("irDotsContainer");
   const maskStr = document.getElementById("valLineMaskStr");
   if (!container) return;
 
   const bits = [];
-  for (let i = 5; i >= 0; i--) {
+  for (let i = 4; i >= 0; i--) {
     bits.push((mask >> i) & 1);
   }
 
@@ -507,13 +548,29 @@ function updateCameraVision(cam) {
   const camStatus = document.getElementById("camStatus");
   const camImg = document.getElementById("camImg");
   const placeholder = document.getElementById("camPlaceholder");
+  const reasonEl = document.getElementById("autoCaptureReason");
+
+  if (reasonEl) {
+    const reason = (cam && cam.auto_capture_reason) ? cam.auto_capture_reason : "Chờ camera điện thoại kết nối...";
+    reasonEl.innerText = reason;
+    const isReady = reason.includes("Đang phát lệnh") || reason.includes("chụp kiểm tra");
+    const isBlocked = reason.includes("kẹt") || reason.includes("Task #") || reason.includes("mất") || reason.includes("chưa");
+    reasonEl.className = isReady
+      ? "text-emerald-700 truncate font-semibold"
+      : isBlocked
+        ? "text-amber-700 truncate font-semibold"
+        : "text-slate-700 truncate font-medium";
+  }
 
   if (cam && cam.online) {
     if (onlineDot) onlineDot.className = "w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping";
-    if (camStatus) camStatus.innerText = `Nhận lúc: ${cam.received_at} @ Wi-Fi`;
+    const recText = (cam.received_at && cam.received_at !== "Chưa nhận ảnh")
+      ? `Nhận lúc: ${cam.received_at} @ Wi-Fi`
+      : "CameraX đã kết nối (chờ ảnh) @ Wi-Fi";
+    if (camStatus) camStatus.innerText = recText;
     
     setText("aiDetectedCode", cam.product_code || "--");
-    setText("aiConfidenceBadge", `AI CONF: ${(cam.confidence * 100).toFixed(1)}%`);
+    setText("aiConfidenceBadge", `AI CONF: ${(Number(cam.confidence || 0) * 100).toFixed(1)}%`);
     
     const disp = cam.dispatch || {};
     setText("aiCategory", disp.category || "ELECTRONIC");
@@ -555,11 +612,21 @@ async function updateWmsData() {
   if (isUpdatingWms) return;
   isUpdatingWms = true;
   try {
-    // (0) Đồng bộ trạng thái khóa đường line (Segments Lock) thời gian thực
+    // (0) Đồng bộ trạng thái bản đồ & khóa đường line (Segments Lock) thời gian thực
     const resMap = await fetch("/api/wms/map");
     const dataMap = await resMap.json();
     if (dataMap.status === "success" && dataMap.segments) {
+      const mapChanged = dataMap.map && (!mapConfig || mapConfig.map_id !== dataMap.map.map_id);
+      if (dataMap.map) mapConfig = dataMap.map;
+      if (dataMap.nodes) mapNodes = dataMap.nodes;
       mapSegments = dataMap.segments;
+      if (mapChanged) {
+        setText("mapTitle", `Bản Đồ Mạng Lưới: ${mapConfig.name}`);
+        setText("lblActiveMapBadge", mapConfig.map_id);
+        setText("lblHudX", `X: 0.00m → ${mapConfig.width_m.toFixed(2)}m`);
+        setText("lblHudY", `Y: 0.00m → ${mapConfig.length_m.toFixed(2)}m`);
+        renderDynamicMapNodesUI(mapNodes);
+      }
       drawMap();
     }
 
@@ -667,7 +734,12 @@ async function sendCmd(action, payload = {}) {
     });
     const d = await res.json();
     if (notifyEl) {
-      notifyEl.innerText = `📡 Đã phát lệnh #${d.cmd_id}: ${d.cmd}`;
+      notifyEl.innerText = d.message
+        ? `✅ ${d.message}`
+        : `📡 Đã phát lệnh #${d.cmd_id}: ${d.cmd}`;
+    }
+    if (action === "abort_missions" || action === "stop" || action === "reset_odom") {
+      updateWmsData();
     }
   } catch (e) {
     if (notifyEl) notifyEl.innerText = `❌ Lỗi phát lệnh: ${e}`;
@@ -806,6 +878,7 @@ async function applySwitchMap() {
       setText("lblHudX", `X: 0.00m → ${mapConfig.width_m.toFixed(2)}m`);
       setText("lblHudY", `Y: 0.00m → ${mapConfig.length_m.toFixed(2)}m`);
 
+      renderDynamicMapNodesUI(mapNodes);
       resizeCanvas();
       updateWmsData();
       alert(`🎉 Đã kích hoạt bản đồ thành công: ${mapConfig.name}`);
@@ -908,6 +981,7 @@ async function sendImportMap(mapJson) {
       setText("lblHudX", `X: 0.00m → ${mapConfig.width_m.toFixed(2)}m`);
       setText("lblHudY", `Y: 0.00m → ${mapConfig.length_m.toFixed(2)}m`);
 
+      renderDynamicMapNodesUI(mapNodes);
       resizeCanvas();
       updateWmsData();
       alert(`🎉 Đã nạp và kích hoạt bản đồ mới thành công: ${mapConfig.name}`);

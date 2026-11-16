@@ -39,6 +39,18 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, socket.error):
             pass
 
+    def _extract_device_token(self) -> str:
+        """Trích xuất token thiết bị từ Header hoặc URL query param."""
+        token = self.headers.get("X-Device-Token", "").strip()
+        if not token:
+            auth_header = self.headers.get("Authorization", "").strip()
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:].strip()
+        if not token:
+            qs = parse_qs(urlparse(self.path).query)
+            token = qs.get("token", [""])[0].strip()
+        return token
+
     def _verify_token(self, allowed_tokens: list) -> bool:
         """
         Xác thực bảo mật kiểm soát truy cập (Device RBAC Authentication Guard):
@@ -57,19 +69,7 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
         if sec_fetch in ("same-origin", "none") or "localhost" in referer or "127.0.0.1" in referer:
             return True
 
-        # 1. Header 'X-Device-Token'
-        token = self.headers.get("X-Device-Token", "").strip()
-        
-        # 2. Header 'Authorization: Bearer <token>'
-        if not token:
-            auth_header = self.headers.get("Authorization", "").strip()
-            if auth_header.startswith("Bearer "):
-                token = auth_header[7:].strip()
-                
-        # 3. URL Query Param '?token=...'
-        if not token:
-            qs = parse_qs(urlparse(self.path).query)
-            token = qs.get("token", [""])[0].strip()
+        token = self._extract_device_token()
 
         # Cho phép nếu khớp với Token của thiết bị hoặc Master Admin Token
         if token and (token in allowed_tokens or token == ADMIN_API_TOKEN):
@@ -190,8 +190,13 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
                             self.camera_controller.ack_command(ack_cam_id)
                     except ValueError:
                         pass
+                is_camera_client = (
+                    ack_cam_id_str is not None
+                    or self._extract_device_token() == CAMERA_DEVICE_TOKEN
+                )
                 if self.camera_controller:
-                    self.camera_controller.record_poll()
+                    if is_camera_client:
+                        self.camera_controller.record_poll()
                     self.camera_controller.check_auto_inbound_capture(self.agv_controller)
                 cam_info = self.camera_controller.get_latest_info() if self.camera_controller else {}
                 state = self.agv_controller.get_dashboard_state(cam_info)

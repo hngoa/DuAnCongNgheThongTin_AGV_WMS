@@ -23,6 +23,7 @@ from tests.test_db import run_tests as run_db_tests
 from tests.test_fsm import run_tests as run_fsm_tests
 from tests.test_controllers import run_controller_tests
 from tests.test_two_shot_workflow import run_tests as run_two_shot_tests
+from tests.test_bugfixes_regression import run_tests as run_regression_tests
 
 def main():
     start_time = time.time()
@@ -33,7 +34,7 @@ def main():
     test_results = {}
     
     # 1. Database Repositories Test
-    print("\n[1/4] ĐANG KIỂM THỬ TẦNG DATABASE & REPOSITORIES...")
+    print("\n[1/5] ĐANG KIỂM THỬ TẦNG DATABASE & REPOSITORIES...")
     try:
         run_db_tests()
         test_results["Database Repositories"] = "PASSED"
@@ -42,7 +43,7 @@ def main():
         test_results["Database Repositories"] = f"FAILED: {e}"
 
     # 2. Finite State Machine (FSM) Test
-    print("\n[2/4] ĐANG KIỂM THỬ TẦNG TRẠNG THÁI FSM (AGV & TASK)...")
+    print("\n[2/5] ĐANG KIỂM THỬ TẦNG TRẠNG THÁI FSM (AGV & TASK)...")
     try:
         run_fsm_tests()
         test_results["Finite State Machine"] = "PASSED"
@@ -51,7 +52,7 @@ def main():
         test_results["Finite State Machine"] = f"FAILED: {e}"
 
     # 3. HTTP Controllers Test
-    print("\n[3/4] ĐANG KIỂM THỬ TẦNG CONTROLLERS & ENDPOINTS...")
+    print("\n[3/5] ĐANG KIỂM THỬ TẦNG CONTROLLERS & ENDPOINTS...")
     try:
         run_controller_tests()
         test_results["HTTP Controllers & APIs"] = "PASSED"
@@ -60,13 +61,22 @@ def main():
         test_results["HTTP Controllers & APIs"] = f"FAILED: {e}"
 
     # 4. Two-Shot AI & Nearest Warehouse Test
-    print("\n[4/4] ĐANG KIỂM THỬ QUY TRÌNH 2-SHOT AI & CHỌN KHO GẦN NHẤT...")
+    print("\n[4/5] ĐANG KIỂM THỬ QUY TRÌNH 2-SHOT AI & CHỌN KHO GẦN NHẤT...")
     try:
         run_two_shot_tests()
         test_results["2-Shot Vision & Nearest Warehouse"] = "PASSED"
     except Exception as e:
         print(f"[-] LỖI 2-SHOT AI: {e}")
         test_results["2-Shot Vision & Nearest Warehouse"] = f"FAILED: {e}"
+
+    # 5. Bugfix Regression Suite
+    print("\n[5/5] ĐANG KIỂM THỬ HỒI QUY CÁC BUG ĐÃ FIX...")
+    try:
+        run_regression_tests()
+        test_results["Bugfix Regression Suite"] = "PASSED"
+    except Exception as e:
+        print(f"[-] LỖI REGRESSION SUITE: {e}")
+        test_results["Bugfix Regression Suite"] = f"FAILED: {e}"
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 70)
@@ -82,7 +92,7 @@ def main():
     print("-" * 70)
     print(f"  Thời gian hoàn thành: {elapsed:.2f}s")
     if all_passed:
-        print("  => TOÀN BỘ 4 MODULE ĐẠT TIÊU CHUẨN 100% (READY FOR DEPLOYMENT)")
+        print("  => TOÀN BỘ 5 MODULE ĐẠT TIÊU CHUẨN 100% (READY FOR DEPLOYMENT)")
     else:
         print("  => CÓ MODULE BỊ LỖI, VUI LÒNG KIỂM TRA LẠI LOG")
     print("=" * 70)

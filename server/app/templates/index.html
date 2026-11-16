@@ -228,6 +228,11 @@
               </div>
             </div>
 
+            <div class="flex items-center justify-between gap-2 mb-2 px-2.5 py-1 bg-slate-50 border border-slate-200/80 rounded text-[11px] font-mono">
+              <span class="text-slate-500 shrink-0">Auto Shot 1:</span>
+              <span id="autoCaptureReason" class="text-slate-700 truncate font-medium">Đang chờ đồng bộ kết nối...</span>
+            </div>
+
             <div class="grid grid-cols-1 md:grid-cols-12 gap-3.5 items-center">
               <!-- Left: Viewport Ảnh & Bounding Box -->
               <div class="md:col-span-7 relative h-40 bg-slate-950 rounded-md overflow-hidden flex items-center justify-center border border-slate-200">
@@ -323,18 +328,17 @@
                 <span class="font-mono text-[10px] text-slate-500 mt-0.5">cm/giây</span>
               </div>
 
-              <!-- 6-CH Line IR Sensors -->
+              <!-- 5-CH Line IR Sensors -->
               <div class="bg-slate-50 border border-slate-200/80 p-2.5 rounded-md flex flex-col items-center justify-center text-center">
-                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">CẢM BIẾN LINE</span>
+                <span class="font-mono text-[10px] text-slate-500 uppercase tracking-wide">CẢM BIẾN LINE (5 MẮT)</span>
                 <div id="irDotsContainer" class="flex items-center gap-1 my-1.5">
                   <span class="w-2 h-2 rounded-full bg-slate-300"></span>
                   <span class="w-2 h-2 rounded-full bg-slate-300"></span>
                   <span class="w-2 h-2 rounded-full bg-slate-300"></span>
                   <span class="w-2 h-2 rounded-full bg-slate-300"></span>
                   <span class="w-2 h-2 rounded-full bg-slate-300"></span>
-                  <span class="w-2 h-2 rounded-full bg-slate-300"></span>
                 </div>
-                <span id="valLineMaskStr" class="font-mono text-[10px] text-slate-600 font-semibold">[ 0 0 0 0 0 0 ]</span>
+                <span id="valLineMaskStr" class="font-mono text-[10px] text-slate-600 font-semibold">[ 0 0 0 0 0 ]</span>
               </div>
 
               <!-- Line Offset Error (PID) -->
@@ -483,8 +487,8 @@
               <span class="font-mono text-[11px] text-slate-500">SCADA Manual</span>
             </div>
 
-            <!-- Quick Dispatch Waypoint Targets -->
-            <div class="grid grid-cols-4 gap-2 mb-3">
+            <!-- Quick Dispatch Waypoint Targets (Đồng bộ tự động theo Bản đồ active) -->
+            <div id="quickDispatchGrid" class="grid grid-cols-4 gap-2 mb-3">
               <button onclick="sendGoTo('A')" class="py-1.5 px-2 rounded-md bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 text-center transition-colors font-sans text-xs font-semibold" type="button">
                 Đến Trạm A
               </button>
@@ -515,7 +519,40 @@
               </button>
               <button onclick="sendCmd('auto_loop_on')" class="flex items-center justify-center gap-1 py-2 rounded-md bg-blue-50 border border-blue-200 text-primary hover:bg-blue-100 font-sans text-xs font-semibold transition-colors" type="button">
                 <span class="material-symbols-outlined text-[16px]">sync</span>
-                <span>Tự Động Lặp</span>
+                <span>Lặp Xuôi</span>
+              </button>
+            </div>
+
+            <!-- Secondary Loop / Rotation / Calibration Actuation Buttons -->
+            <div class="grid grid-cols-3 sm:grid-cols-6 gap-1.5 mb-2.5 text-[11px]">
+              <button onclick="sendCmd('auto_loop_reverse')" class="py-1.5 px-1.5 rounded bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 font-semibold transition-colors" type="button" title="Vòng lặp tự động ngược chiều">
+                ↺ Lặp Ngược
+              </button>
+              <button onclick="sendCmd('auto_loop_off')" class="py-1.5 px-1.5 rounded bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-600 font-medium transition-colors" type="button" title="Tắt chế độ tự động lặp">
+                Tắt Lặp
+              </button>
+              <button onclick="sendCmd('turn_left_90')" class="py-1.5 px-1.5 rounded bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 font-medium transition-colors" type="button" title="Xoay trái 90 độ tại chỗ">
+                ↶ Trái 90°
+              </button>
+              <button onclick="sendCmd('turn_right_90')" class="py-1.5 px-1.5 rounded bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 font-medium transition-colors" type="button" title="Xoay phải 90 độ tại chỗ">
+                ↷ Phải 90°
+              </button>
+              <button onclick="sendCmd('turn_180')" class="py-1.5 px-1.5 rounded bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 font-medium transition-colors" type="button" title="Quay đầu 180 độ tại chỗ">
+                ⟲ Quay 180°
+              </button>
+              <button onclick="sendCmd('calibrate_gyro')" class="py-1.5 px-1.5 rounded bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-700 font-medium transition-colors" type="button" title="Hiệu chỉnh con quay MPU-6050">
+                Calib Gyro
+              </button>
+            </div>
+            <div class="grid grid-cols-3 gap-1.5 mb-2.5 text-[11px]">
+              <button onclick="sendCmd('simulate_gap')" class="py-1.5 px-2 rounded bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-800 font-medium transition-colors" type="button" title="Giả lập mất vạch 25cm để test cầu nối quán tính">
+                ⚡ Test Đứt Vạch
+              </button>
+              <button onclick="sendCmd('return_home')" class="py-1.5 px-2 rounded bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 font-semibold transition-colors" type="button" title="Hủy tác vụ hiện tại và điều hướng về Trạm A">
+                ⌂ Quay Về A
+              </button>
+              <button onclick="sendCmd('abort_missions')" class="py-1.5 px-2 rounded bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-800 font-semibold transition-colors" type="button" title="Hủy mission/task đang bị kẹt trên WMS mà không reset odometry xe">
+                🔄 Hủy Mission Kẹt
               </button>
             </div>
 

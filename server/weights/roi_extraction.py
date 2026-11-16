@@ -81,6 +81,28 @@ class ObjectDetector:
             )
             self.model = None
 
+    @staticmethod
+    def _is_nested_duplicate(
+        candidate: Tuple[int, int, int, int],
+        kept_boxes: List[Tuple[int, int, int, int]],
+        containment_thresh: float = 0.65,
+    ) -> bool:
+        """Return True if candidate heavily overlaps or encloses/sits inside an accepted box."""
+        cx1, cy1, cx2, cy2 = candidate
+        area_c = max(1, (cx2 - cx1) * (cy2 - cy1))
+        for kx1, ky1, kx2, ky2 in kept_boxes:
+            ix1 = max(cx1, kx1)
+            iy1 = max(cy1, ky1)
+            ix2 = min(cx2, kx2)
+            iy2 = min(cy2, ky2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            inter_area = (ix2 - ix1) * (iy2 - iy1)
+            area_k = max(1, (kx2 - kx1) * (ky2 - ky1))
+            if (inter_area / min(area_c, area_k)) >= containment_thresh:
+                return True
+        return False
+
     def detect(
         self,
         image_input: Union[str, Path, Image.Image, np.ndarray],
@@ -93,6 +115,7 @@ class ObjectDetector:
             - num_detections: Total count of detected objects
             - all_boxes: List of all detected bounding boxes
         """
+        self.yolo_detections = {}
         # Always apply EXIF orientation transpose first to ensure identical coordinate space
         pil_img = load_image_rgb(image_input)
         w_img, h_img = pil_img.size
@@ -128,6 +151,7 @@ class ObjectDetector:
                             "conf": float(boxes.conf[sorted_indices[0]])
                         }
                     }
+                    min_sec_conf = max(self.conf_threshold, 0.30)
                     for idx in sorted_indices[1:]:
                         b_raw = boxes.xyxy[idx].cpu().numpy().astype(int)
                         try:
@@ -139,8 +163,10 @@ class ObjectDetector:
                         area_b = w_b * h_b
                         conf_b = float(boxes.conf[idx])
 
-                        # Suppress tiny edge noise/reflections (< 12% area or conf < 0.30)
-                        if (area_b / area_pri < 0.12) or (conf_b < 0.30):
+                        # Suppress tiny edge noise/reflections or nested enclosing duplicate boxes
+                        if (area_b / area_pri < 0.12) or (conf_b < min_sec_conf):
+                            continue
+                        if self._is_nested_duplicate(vb, valid_boxes, containment_thresh=0.65):
                             continue
                         valid_boxes.append(vb)
                         self.yolo_detections[vb] = {

@@ -26,6 +26,8 @@ class CameraController:
         self.pending_cam_metadata = {}
         self.last_acked_cam_cmd_id = 0
         self.last_cmd_time = 0.0
+        self.cmd_timeout_sec = 8.0
+        self.camera_online_timeout = 5.0
         self.last_poll_time = 0.0
         self.first_poll_time = 0.0
         self.last_shot1_auto_trigger = 0.0
@@ -38,9 +40,28 @@ class CameraController:
             "task_id": 0,
             "image_url": "",
             "pending_cmd": None,
-            "pending_cmd_id": 0
+            "pending_cmd_id": 0,
+            "auto_capture_reason": "Đang chờ khởi tạo"
         }
         self.lock = threading.Lock()
+
+    def _set_auto_capture_reason(self, reason: str):
+        with self.lock:
+            self.latest_info["auto_capture_reason"] = reason
+
+    def clear_pending_command(self, only_if_mode: Optional[str] = None) -> bool:
+        """Hủy lệnh camera đang chờ (toàn bộ hoặc theo mode cụ thể)."""
+        with self.lock:
+            if self.pending_cam_cmd is None:
+                return False
+            if only_if_mode:
+                cur_mode = str(self.pending_cam_metadata.get("mode", "")).upper()
+                if cur_mode != only_if_mode.upper():
+                    return False
+            self.pending_cam_cmd = None
+            self.pending_cam_metadata = {}
+            self.latest_info["pending_cmd"] = None
+            return True
 
     def record_poll(self):
         """Ghi nhận điện thoại Android đang online và poll trạng thái"""
@@ -64,22 +85,33 @@ class CameraController:
              - Các lần tiếp theo nếu khay hàng trống (NO_OBJECT): Quét lại sau mỗi 8.0s để tự động nhận diện khi hàng được đặt lên khay.
         """
         if not self.auto_capture_enabled:
+            self._set_auto_capture_reason("Tự động chụp Shot 1 đang tắt")
             return False
 
         ctrl = agv_controller or self.agv_controller
         now = time.time()
 
         # 1. Camera phải đang online
-        if not self.last_poll_time or (now - self.last_poll_time) > 5.0:
+        if not self.last_poll_time or (now - self.last_poll_time) > self.camera_online_timeout:
+            self._set_auto_capture_reason("Camera điện thoại chưa kết nối hoặc mất tín hiệu")
             return False
 
-        # 2. Không có lệnh camera nào đang chờ thực thi
+        # 2. Không có lệnh camera nào đang chờ thực thi (tự động giải phóng nếu quá hạn)
         with self.lock:
             if self.pending_cam_cmd is not None:
-                return False
+                cmd_age = (now - self.last_cmd_time) if self.last_cmd_time else 0.0
+                if cmd_age > self.cmd_timeout_sec:
+                    print(f"⏱️ [Camera Controller] Hết thời gian chờ lệnh #{self.cam_cmd_id} ({self.pending_cam_cmd}) sau {cmd_age:.1f}s -> Tự động giải phóng")
+                    self.pending_cam_cmd = None
+                    self.pending_cam_metadata = {}
+                    self.latest_info["pending_cmd"] = None
+                else:
+                    self.latest_info["auto_capture_reason"] = f"Đang chờ Camera thực thi lệnh #{self.cam_cmd_id} ({self.pending_cam_cmd})"
+                    return False
 
         # 3. Xe AGV phải đang online
         if not ctrl or not ctrl.last_seen_time or (now - ctrl.last_seen_time) > 6.0:
+            self._set_auto_capture_reason("Xe AGV chưa online hoặc mất kết nối")
             return False
 
         # 4. Xe AGV phải đang dừng đỗ an toàn tại Trạm A
@@ -92,20 +124,30 @@ class CameraController:
         cur_y = float(last_t.get("y", 0.0))
         at_station_a = (st == "A") or (abs(cur_x) < 0.25 and abs(cur_y) < 0.25)
 
-        if not at_station_a or speed > 5.0 or ("RUNNING" in state or "TURNING" in state or "GAP" in state):
+        if not at_station_a:
+            self._set_auto_capture_reason(f"AGV đang ở Trạm {st or '?'} (cần về Trạm A)")
+            return False
+        if speed > 5.0 or ("RUNNING" in state or "TURNING" in state or "GAP" in state):
+            self._set_auto_capture_reason(f"AGV chưa dừng ổn định ({state})")
             return False
 
         # 5. Hệ thống WMS không có nhiệm vụ nào đang hoạt động
         wf = self.workflow_manager
         if wf.active_mission is not None:
+            m_to = wf.active_mission.get("to_node", "?")
+            self._set_auto_capture_reason(f"Đang kẹt/chạy mission tới Trạm {m_to}")
             return False
 
         recent_tasks = wf.task_repo.get_recent_tasks(limit=5)
-        has_active_tasks = any(
-            t["status"] in ("DISPATCHED", "IN_TRANSIT", "DELIVERED", "UNLOADING")
-            for t in recent_tasks
+        blocking_task = next(
+            (t for t in recent_tasks if t["status"] in ("DISPATCHED", "IN_TRANSIT", "DELIVERED", "UNLOADING")),
+            None
         )
-        if has_active_tasks or wf.active_unloading_tasks:
+        if blocking_task or wf.active_unloading_tasks:
+            if blocking_task:
+                self._set_auto_capture_reason(f"Task #{blocking_task['task_id']} đang ở trạng thái {blocking_task['status']}")
+            else:
+                self._set_auto_capture_reason("Đang có tác vụ dỡ hàng tại trạm đích")
             return False
 
         # 6. Kiểm tra thời gian Cooldown:
@@ -113,15 +155,20 @@ class CameraController:
         if self.last_shot1_auto_trigger == 0.0:
             # Lần đầu tiên sau khi khởi động: Đợi tối thiểu 2.0s sau khi cả Camera và AGV cùng online
             ready_start = max(self.first_poll_time, agv_first)
-            if (now - ready_start) < 2.0:
+            remain = 2.0 - (now - ready_start)
+            if remain > 0.0:
+                self._set_auto_capture_reason(f"Đợi ổn định kết nối ({remain:.1f}s)")
                 return False
         else:
             # Các lần tiếp theo nếu khay trống: Quét chu kỳ 8.0 giây
-            if (now - self.last_shot1_auto_trigger) < 8.0:
+            remain = 8.0 - (now - self.last_shot1_auto_trigger)
+            if remain > 0.0:
+                self._set_auto_capture_reason(f"Đang đếm chu kỳ quét khay ({remain:.1f}s)")
                 return False
 
         # ĐỦ ĐIỀU KIỆN -> PHÁT LỆNH CAPTURE_NOW TỰ ĐỘNG!
         self.last_shot1_auto_trigger = now
+        self._set_auto_capture_reason("Đang phát lệnh chụp kiểm tra khay tại Trạm A")
         print("🎯 [AUTO SHOT 1]: Tự động phát lệnh chụp kiểm tra hàng tại Trạm Tiếp Nhận A (AGV & Camera đã sẵn sàng)")
         self.queue_command("CAPTURE_NOW", metadata={"station": "A", "mode": "CAPTURE"})
         return True
@@ -139,16 +186,21 @@ class CameraController:
             return self.cam_cmd_id
 
     def ack_command(self, ack_id: int):
-        """Xác nhận điện thoại đã nhận và thực thi xong lệnh, đồng bộ cmd_id nếu app Android có id cao hơn"""
+        """Xác nhận điện thoại đã nhận và thực thi xong lệnh, đồng bộ cmd_id an toàn khi Server khởi động lại."""
         with self.lock:
-            # 1. Đồng bộ bộ đếm cam_cmd_id nếu điện thoại gửi lên ack_id cao hơn (tránh lệch bộ đếm khi khởi động lại Server)
-            if ack_id > self.cam_cmd_id:
-                self.cam_cmd_id = ack_id
-                if self.pending_cam_cmd and self.cam_cmd_id <= ack_id:
+            # Trường hợp Server vừa khởi động lại nhưng điện thoại giữ bộ đếm ack_id cũ cao hơn
+            if self.last_acked_cam_cmd_id == 0 and ack_id > self.cam_cmd_id:
+                self.last_acked_cam_cmd_id = ack_id
+                if self.pending_cam_cmd is not None:
                     self.cam_cmd_id = ack_id + 1
+                    self.last_cmd_time = time.time()
                     self.latest_info["pending_cmd_id"] = self.cam_cmd_id
+                else:
+                    self.cam_cmd_id = ack_id
+                return
 
             if ack_id >= self.cam_cmd_id:
+                self.cam_cmd_id = ack_id
                 self.last_acked_cam_cmd_id = ack_id
                 self.pending_cam_cmd = None
                 self.pending_cam_metadata = {}
@@ -168,6 +220,11 @@ class CameraController:
         mode = fields.get("mode", "CAPTURE").strip().upper()
 
         with self.lock:
+            now = time.time()
+            if not self.first_poll_time:
+                self.first_poll_time = now
+            self.last_poll_time = now
+            self.latest_info["online"] = True
             self.latest_frame_bytes = img_bytes
             meta = dict(self.pending_cam_metadata)
             # Sau khi nhận ảnh, giải phóng lệnh pending và metadata kèm theo
@@ -244,7 +301,7 @@ class CameraController:
             del ai_res["annotated_bytes"]
         ai_res["annotated_image_url"] = img_url
 
-        # 2b. Cổng an toàn: Nếu khay trống (NO_OBJECT), dừng tạo task
+        # 2b. Cổng an toàn: Nếu khay trống (NO_OBJECT) hoặc AI chưa đủ chắc chắn (NEEDS_REVIEW), dừng tạo task
         if dec_status == "NO_OBJECT" or detected_code == "NONE":
             self.last_shot1_auto_trigger = time.time()
             with self.lock:
@@ -260,6 +317,25 @@ class CameraController:
             return 200, {
                 "status": "warning",
                 "message": "Cảnh báo: Khay hàng trống (NO_OBJECT), hệ thống tạm dừng tạo nhiệm vụ chuyển kho",
+                "ai_result": ai_res,
+                "image_url": img_url
+            }
+
+        if dec_status == "NEEDS_REVIEW":
+            self.last_shot1_auto_trigger = time.time()
+            with self.lock:
+                self.latest_info.update({
+                    "online": True,
+                    "received_at": datetime.now().strftime("%H:%M:%S"),
+                    "product_code": "CẦN_KIỂM_TRA",
+                    "confidence": 0.0,
+                    "task_id": 0,
+                    "image_url": img_url,
+                    "ai_result": ai_res
+                })
+            return 200, {
+                "status": "warning",
+                "message": "Cảnh báo: Ảnh chưa đủ độ tin cậy hoặc vật bị che khuất/dính nhau (NEEDS_REVIEW). Vui lòng đặt lại và chụp lại!",
                 "ai_result": ai_res,
                 "image_url": img_url
             }
@@ -367,7 +443,12 @@ class CameraController:
 
     def get_latest_info(self) -> Dict[str, Any]:
         with self.lock:
-            return dict(self.latest_info)
+            info = dict(self.latest_info)
+            if self.last_poll_time > 0.0:
+                info["online"] = (time.time() - self.last_poll_time) <= self.camera_online_timeout
+            else:
+                info["online"] = False
+            return info
 
     def get_live_frame(self) -> Optional[bytes]:
         with self.lock:

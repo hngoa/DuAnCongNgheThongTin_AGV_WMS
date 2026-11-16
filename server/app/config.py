@@ -39,6 +39,7 @@ ADMIN_API_TOKEN = "agv_sec_admin_v2_1a2b3c"
 # Cấu hình Bản đồ mặc định
 DEFAULT_MAP_ID = "SABAN_154_151"
 DEFAULT_AGV_ID = "AGV_Ver2"
+AGV_WATCHDOG_TIMEOUT_SEC = 6.0
 
 # Ngưỡng an toàn điện áp pin LiPo 3S
 BATTERY_THRESHOLDS = {

@@ -415,8 +415,13 @@ class HybridClassifier:
         # Gate 2: MobileNet is highly confident (conf >= 0.85)
         elif nn_conf >= self.confidence_threshold_high:
             if nn_cls_name == "cylinder":
+                p_box_nn = float(probs[1])
+                p_prism_nn = float(probs[2])
+                can_override_high_cyl = (nn_conf < 0.92 and geo_quality in ("HIGH", "MEDIUM"))
                 if (
-                    flags.get("has_strictly_orthogonal_lines", False)
+                    can_override_high_cyl
+                    and p_box_nn >= 0.05
+                    and flags.get("has_strictly_orthogonal_lines", False)
                     and geom_res.extent >= 0.72
                     and geom_res.circularity < 0.65
                 ):
@@ -430,7 +435,9 @@ class HybridClassifier:
                         f"overrides Cylinder with low circularity ({geom_res.circularity:.2f})."
                     )
                 elif (
-                    (flags.get("has_acute_angle_junction") or flags.get("has_triangular_vertices"))
+                    can_override_high_cyl
+                    and p_prism_nn >= 0.05
+                    and (flags.get("has_acute_angle_junction") or flags.get("has_triangular_vertices"))
                     and geom_res.min_corner_angle <= 58.0
                     and geom_res.circularity < 0.65
                 ):
@@ -443,7 +450,7 @@ class HybridClassifier:
                         f"Override Cylinder -> Prism: Acute angle ({geom_res.min_corner_angle:.1f} deg) "
                         f"overrides Cylinder with low circularity ({geom_res.circularity:.2f})."
                     )
-                elif geom_res.circularity < 0.50:
+                elif geom_res.circularity < 0.45 and nn_conf < 0.95:
                     decision_type = "NEEDS_REVIEW"
                     decision_status = DECISION_STATUS_NEEDS_REVIEW
                     needs_review = True
@@ -578,11 +585,15 @@ class HybridClassifier:
 
             # Sub-case 3B: MobileNet predicted Cylinder
             elif nn_cls_name == "cylinder":
+                p_box_nn = float(probs[1])
+                p_prism_nn = float(probs[2])
                 # Rescue 1: Strong Box Geometry (strictly orthogonal lines + high rectangular extent)
                 if (
                     flags.get("has_strictly_orthogonal_lines", False)
+                    and geo_quality in ("HIGH", "MEDIUM")
                     and geom_res.extent >= 0.72
                     and geom_res.circularity < 0.68
+                    and (p_box_nn >= 0.20 or nn_conf < 0.65)
                 ):
                     final_id = 1
                     final_name = "rectangular_box"
@@ -591,13 +602,15 @@ class HybridClassifier:
                     is_override = True
                     explanation = (
                         f"Override Cylinder -> Box: Strongly orthogonal rectangular geometry (extent={geom_res.extent:.2f}, "
-                        f"circularity={geom_res.circularity:.2f} < 0.68)."
+                        f"circularity={geom_res.circularity:.2f} < 0.68, P(Box)={p_box_nn:.3f})."
                     )
-                # Rescue 2: Strong Prism Geometry (sharp acute angle + non-circular)
+                # Rescue 2: Strong Prism Geometry corroborated by NN (symmetric with Sub-case 3A)
                 elif (
                     (flags.get("has_acute_angle_junction") or flags.get("has_triangular_vertices"))
+                    and geo_quality in ("HIGH", "MEDIUM")
                     and geom_res.min_corner_angle <= 58.0
                     and geom_res.circularity < 0.68
+                    and p_prism_nn >= 0.30
                 ):
                     final_id = 2
                     final_name = "triangular_prism"
@@ -606,7 +619,7 @@ class HybridClassifier:
                     is_override = True
                     explanation = (
                         f"Override Cylinder -> Prism: Acute angle detected ({geom_res.min_corner_angle:.1f} deg) "
-                        f"with non-circular geometry ({geom_res.circularity:.2f})."
+                        f"with non-circular geometry ({geom_res.circularity:.2f}, P(Prism)={p_prism_nn:.3f})."
                     )
                 elif flags.get("is_highly_circular", False) or geom_res.circularity >= 0.75:
                     decision_type = "GEOMETRY_CONFIRM_CYLINDER"
@@ -633,7 +646,7 @@ class HybridClassifier:
                     flags.get("has_strictly_orthogonal_lines", False)
                     and geom_res.extent >= 0.88
                     and geom_res.acute_angles_count == 0
-                    and nn_conf < 0.60
+                    and (nn_conf < 0.60 or (geom_res.extent >= 0.92 and nn_conf < 0.75))
                 ):
                     final_id = 1
                     final_name = "rectangular_box"

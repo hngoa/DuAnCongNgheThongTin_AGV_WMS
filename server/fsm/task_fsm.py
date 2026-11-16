@@ -36,17 +36,13 @@ class TaskStateMachine:
             assigned_agv=assigned_agv
         )
 
-    def transition_to_dispatched(self, task_id: int, to_node: str, route_str: str) -> bool:
+    def transition_to_dispatched(self, task_id: int, to_node: str, route_str: str,
+                                 assigned_agv: Optional[str] = None) -> bool:
         """Chuyển sang DISPATCHED khi Allocation Engine đã cấp kho đích và Router đã lập lộ trình"""
         task = self.task_repo.get_by_id(task_id)
-        if not task:
+        if not task or task["status"] not in (TaskState.PENDING.value, TaskState.DISPATCHED.value):
             return False
-        
-        # Cập nhật kho đích và lộ trình vào DB
-        with self.task_repo.db_file as db_path:
-            pass # DB connection handled in repo
-        self.task_repo.update_status(task_id, TaskState.DISPATCHED.value)
-        return True
+        return self.task_repo.update_dispatch_target(task_id, to_node, route_str, assigned_agv)
 
     def transition_to_in_transit(self, task_id: int) -> bool:
         """Chuyển sang IN_TRANSIT khi xe AGV đã phản hồi ACK nhận lệnh"""

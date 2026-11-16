@@ -22,6 +22,7 @@ class AGVStateMachine:
         agv_rec = fleet_repo.get_agv(agv_id) if fleet_repo else None
         self.cmd_id_counter = int(agv_rec.get("last_ack_id", 0)) if agv_rec else 0
         self.pending_command: Optional[Dict[str, Any]] = None
+        self.ina_ok: Optional[bool] = None
 
     def update_from_telemetry(self, data: Dict[str, Any]) -> AGVState:
         """
@@ -52,29 +53,42 @@ class AGVStateMachine:
 
         # 2. Kiểm tra an toàn Điện áp Pin (INA226 - Tự động thích ứng Pin 2S 7.4V-8.4V và 3S 11.1V-12.6V)
         battery_fault = False
-        if (3.0 < voltage < 6.4) or (8.8 < voltage < 9.9):
-            self.current_state = AGVState.EMERGENCY_STOP
-            battery_fault = True
-        elif (6.4 <= voltage < 6.8) or (9.9 <= voltage < 10.5):
-            if self.current_state not in (AGVState.LINE_FOLLOWING, AGVState.DECELERATING):
-                self.current_state = AGVState.LOW_BATTERY
+        ina_ok = data.get("ina_ok")
+        if "ina_ok" in data and ina_ok is not None:
+            self.ina_ok = bool(ina_ok)
+        if ina_ok is not False:
+            if (3.0 < voltage < 6.4) or (8.8 < voltage < 9.9):
+                self.current_state = AGVState.EMERGENCY_STOP
                 battery_fault = True
+            elif (6.4 <= voltage < 6.8) or (9.9 <= voltage < 10.5):
+                if self.current_state not in (AGVState.LINE_FOLLOWING, AGVState.DECELERATING):
+                    self.current_state = AGVState.LOW_BATTERY
+                    battery_fault = True
 
         # 3. Đồng bộ trạng thái từ firmware nếu không bị sự cố pin
         if not battery_fault:
-            if "GAP" in reported_state:
+            if reported_state in ("LOST_LINE_STOP", "GAP_TIMEOUT_STOP", "EMERGENCY_STOP"):
+                self.current_state = AGVState.EMERGENCY_STOP
+            elif "GAP" in reported_state:
                 self.current_state = AGVState.GAP_CROSSING
-            elif "STATION" in reported_state:
+            elif reported_state.startswith("AT_STATION"):
                 self.current_state = AGVState.AT_STATION
-            elif speed > 5.0 or "RUNNING" in reported_state or "TURNING" in reported_state or "APPROACH" in reported_state or "DECELERATING" in reported_state:
+            elif (
+                speed > 5.0
+                or "RUNNING" in reported_state
+                or "TURNING" in reported_state
+                or "APPROACH" in reported_state
+                or "DECELERATING" in reported_state
+                or reported_state == "PAUSED_TRANSIT"
+            ):
                 self.current_state = AGVState.LINE_FOLLOWING
             else:
                 self.current_state = AGVState.IDLE
 
         return self.current_state
 
-    def check_watchdog(self, timeout_sec: float = 2.5) -> bool:
-        """Kiểm tra Watchdog: Nếu quá 2.5s không nhận được telemetry -> OFFLINE"""
+    def check_watchdog(self, timeout_sec: float = 6.0) -> bool:
+        """Kiểm tra Watchdog: Nếu quá timeout_sec không nhận được telemetry -> OFFLINE"""
         if time.time() - self.last_heartbeat > timeout_sec:
             self.current_state = AGVState.OFFLINE
             return True

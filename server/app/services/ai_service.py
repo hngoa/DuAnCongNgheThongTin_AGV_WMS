@@ -26,7 +26,7 @@ import traceback
 # Vô hiệu hóa auto update của Ultralytics để tăng tốc suy luận và chống lỗi quyền ghi
 os.environ["YOLO_AUTO_INSTALL"] = "0"
 from datetime import datetime
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # Đường dẫn thư mục lưu weights trong server
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -112,18 +112,88 @@ class AIProductClassifierService:
             print("ℹ️ [AI Service] Đang ở chế độ CỔNG CHỜ (Placeholder Mode) - Chờ tích hợp Model CV.")
             print(f"   (Khi có mô hình, đặt file vào: server/weights/)")
 
+    @staticmethod
+    def _fuse_box_prediction(
+        pred: Any,
+        y_cls: Optional[str],
+        y_conf: float,
+    ) -> Tuple[Optional[str], float, str, str]:
+        """Hợp nhất có kiểm soát giữa Hybrid (MobileNetV3 + OpenCV) và YOLO11n."""
+        nn_cls = getattr(pred, "mobilenet_class_name", None)
+        nn_probs = (
+            getattr(pred, "mobilenet_probabilities", None)
+            or getattr(pred, "neural_network_probabilities", {})
+            or {}
+        )
+        geo_cand = getattr(pred, "geometry_candidate", "UNKNOWN")
+        geo_qual = getattr(pred, "geometry_quality", "NO_SIGNAL")
+        geom_ev = getattr(pred, "geometry_evidence", {}) or {}
+        dec_type = getattr(pred, "decision_type", "") or ""
+        h_status = getattr(pred, "decision_status", "NEEDS_REVIEW")
+        h_cls = getattr(pred, "predicted_class", None)
+        h_conf = round(float(getattr(pred, "confidence", 0.0) or 0.0), 3)
+        has_yolo = (y_cls in CLASS_TO_WMS_MAPPING) and (y_conf > 0.0)
+
+        if h_status == "CLASSIFIED" and h_cls in CLASS_TO_WMS_MAPPING:
+            if has_yolo and y_cls == h_cls:
+                return h_cls, round(max(h_conf, y_conf), 3), "CLASSIFIED", "YOLO_HYBRID_CONSENSUS"
+
+            # Chỉ GEOMETRY_CONFIRM / MOBILENET_CONFIRM mới là đồng thuận 2 phiếu (MobileNet + OpenCV).
+            # Còn GEOMETRY_OVERRIDE là OpenCV đang phủ quyết MobileNet (1 chống 1).
+            is_geo_confirmed = dec_type.startswith(("GEOMETRY_CONFIRM", "MOBILENET_CONFIRM"))
+            is_geo_override = dec_type.startswith("GEOMETRY_OVERRIDE")
+
+            if has_yolo and y_cls != h_cls:
+                # Nếu OpenCV tự ý override MobileNet nhưng YOLO lại đồng thuận với MobileNet -> trả về đa số 2/3
+                if is_geo_override and y_cls == nn_cls and (y_conf >= 0.50 or h_conf < 0.30):
+                    nn_match_conf = float(nn_probs.get(nn_cls, 0.0))
+                    return y_cls, round(max(y_conf, nn_match_conf), 3), "CLASSIFIED", "YOLO_MOBILENET_MAJORITY"
+
+                yolo_geo_agree = geo_qual in ("HIGH", "MEDIUM") and geo_cand == y_cls
+                if yolo_geo_agree and (not is_geo_confirmed) and h_conf < 0.75:
+                    return y_cls, round(max(y_conf, 0.50), 3), "CLASSIFIED", "YOLO_GEOMETRY_CONSENSUS"
+                if (
+                    (not is_geo_confirmed)
+                    and h_conf < 0.55
+                    and y_conf >= 0.65
+                    and float(nn_probs.get(y_cls, 0.0)) >= 0.15
+                ):
+                    return y_cls, round(y_conf, 3), "CLASSIFIED", "YOLO_HIGH_CONF_OVERRIDE"
+
+            return h_cls, h_conf, "CLASSIFIED", dec_type or "HYBRID_CLASSIFIED"
+
+        # Hybrid trả về NEEDS_REVIEW: giải tỏa nếu YOLO >= 0.45 đồng thuận với MobileNet hoặc tín hiệu hình học rõ ràng
+        if has_yolo and y_conf >= 0.45:
+            nn_agree = y_cls == nn_cls
+            geo_agree = geo_qual in ("HIGH", "MEDIUM") and geo_cand == y_cls
+            flags = geom_ev.get("diagnostic_flags", {}) or {}
+            extent_val = float(geom_ev.get("extent", 0.0) or 0.0)
+            ortho_box_agree = (
+                y_cls == "rectangular_box"
+                and y_conf >= 0.75
+                and bool(flags.get("has_strictly_orthogonal_lines"))
+                and extent_val >= 0.85
+            )
+            if nn_agree or geo_agree or ortho_box_agree:
+                nn_match_conf = float(nn_probs.get(y_cls, 0.0))
+                return y_cls, round(max(y_conf, nn_match_conf), 3), "CLASSIFIED", "YOLO_TIEBREAK_REVIEW"
+
+        return None, 0.0, "NEEDS_REVIEW", "NEEDS_REVIEW"
+
     def classify_image(self, image_bytes: bytes, product_hint: str = "") -> Dict[str, Any]:
         """
         Giao diện phân loại chuẩn hóa:
           - Đầu vào: luồng byte ảnh JPEG từ điện thoại + mã hàng gợi ý từ App Android
           - Đầu ra: dict chuẩn {product_code, product_name, confidence, bbox, engine, decision_status}
         """
-        # Thử nạp ảnh bằng PIL để kiểm tra dữ liệu ảnh thực hay chuỗi giả lập test
+        # Thử nạp ảnh bằng PIL và chuẩn hóa hướng xoay EXIF trước khi đưa vào detector/visualizer
         pil_img: Optional[Image.Image] = None
         is_real_image = False
         try:
-            pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            # Ảnh thật của điện thoại thường có kích thước tối thiểu > 100x100
+            with Image.open(io.BytesIO(image_bytes)) as raw_img:
+                transposed = ImageOps.exif_transpose(raw_img) or raw_img
+                pil_img = transposed.convert("RGB")
+            # Ảnh thật của điện thoại thường có kích thước tối thiểu >= 64x64
             if pil_img.size[0] >= 64 and pil_img.size[1] >= 64:
                 is_real_image = True
         except Exception:
@@ -155,7 +225,9 @@ class AIProductClassifierService:
                     }
 
                 # 2. Phân loại toàn bộ các sản phẩm phát hiện được
-                detected_items = []
+                all_items: List[Dict[str, Any]] = []
+                classified_items: List[Dict[str, Any]] = []
+                review_items: List[Dict[str, Any]] = []
                 yolo_map = getattr(detector, "yolo_detections", {})
 
                 # Chuẩn hóa an toàn tuyệt đối tọa độ bounding box (tránh lỗi numpy.int32 unpack)
@@ -169,52 +241,81 @@ class AIProductClassifierService:
 
                 for box in clean_boxes:
                     pred = self.predictor.predict(pil_img, bbox=box, input_mode="pre_cropped_roi")
-                    pred_cls = pred.predicted_class or "rectangular_box"
-                    conf_val = round(float(pred.confidence), 3)
 
-                    # Tìm thông tin phát hiện từ YOLO (hỗ trợ so khớp xấp xỉ tọa độ BBox)
+                    # Tìm thông tin phát hiện từ YOLO (khớp chính xác hoặc sai số <= 8px)
                     y_info = yolo_map.get(box, {})
                     if not y_info:
                         for y_k, y_v in yolo_map.items():
                             if isinstance(y_k, (list, tuple)) and len(y_k) >= 4:
-                                if abs(int(y_k[0]) - box[0]) <= 8 and abs(int(y_k[1]) - box[1]) <= 8:
+                                if all(abs(int(y_k[i]) - box[i]) <= 8 for i in range(4)):
                                     y_info = y_v
                                     break
 
                     y_cls = y_info.get("class_name")
                     y_conf = round(float(y_info.get("conf", 0.0)), 3)
 
-                    # Chiến lược hợp nhất thông minh (YOLO best.pt + MobileNetV3 best.pth + OpenCV Geometry):
-                    # 1. Nếu cả YOLO và MobileNet/OpenCV đồng thuận: Lấy độ tự tin cao nhất
-                    # 2. Nếu YOLO có độ tự tin cao (>= 0.35) và cao hơn bộ phân loại đơn lẻ (hoặc bộ phân loại bị tụt < 0.40): Ưu tiên YOLO
-                    # 3. Tránh để nhãn bị ghi đè sai với độ tự tin quá thấp (< 0.30)
-                    if y_cls in CLASS_TO_WMS_MAPPING:
-                        if pred_cls == y_cls:
-                            conf_val = max(conf_val, y_conf)
-                        elif y_conf >= 0.50 or y_conf > conf_val:
-                            pred_cls = y_cls
-                            conf_val = y_conf
-                        elif conf_val < 0.35 and y_conf >= 0.25:
-                            pred_cls = y_cls
-                            conf_val = y_conf
+                    final_cls, final_conf, item_status, fusion_rule = self._fuse_box_prediction(
+                        pred, y_cls, y_conf
+                    )
 
-                    wms_info = CLASS_TO_WMS_MAPPING.get(pred_cls, CLASS_TO_WMS_MAPPING["rectangular_box"])
-                    detected_items.append({
-                        "product_code": wms_info["product_code"],
-                        "product_name": wms_info["product_name"],
-                        "category": wms_info["category"],
-                        "target_station": wms_info["target_node"],
-                        "target_node": wms_info["target_node"],
-                        "predicted_class": pred_cls,
-                        "confidence": conf_val,
-                        "bbox": list(box),
-                        "bbox_color": wms_info["bbox_color"],
-                        "short_vi": wms_info["short_vi"],
-                    })
+                    if item_status == "CLASSIFIED" and final_cls in CLASS_TO_WMS_MAPPING:
+                        wms_info = CLASS_TO_WMS_MAPPING[final_cls]
+                        item_dict = {
+                            "product_code": wms_info["product_code"],
+                            "product_name": wms_info["product_name"],
+                            "category": wms_info["category"],
+                            "target_station": wms_info["target_node"],
+                            "target_node": wms_info["target_node"],
+                            "predicted_class": final_cls,
+                            "confidence": final_conf,
+                            "decision_status": "CLASSIFIED",
+                            "fusion_rule": fusion_rule,
+                            "bbox": list(box),
+                            "bbox_color": wms_info["bbox_color"],
+                            "short_vi": wms_info["short_vi"],
+                        }
+                        all_items.append(item_dict)
+                        classified_items.append(item_dict)
+                    else:
+                        rev_dict = {
+                            "product_code": "NEEDS_REVIEW",
+                            "product_name": "Cần kiểm tra lại (Không rõ)",
+                            "category": "UNKNOWN",
+                            "target_station": "?",
+                            "target_node": "?",
+                            "predicted_class": None,
+                            "confidence": 0.0,
+                            "decision_status": "NEEDS_REVIEW",
+                            "fusion_rule": fusion_rule,
+                            "bbox": list(box),
+                            "bbox_color": (239, 68, 68),
+                            "short_vi": "Cần kiểm tra lại",
+                        }
+                        all_items.append(rev_dict)
+                        review_items.append(rev_dict)
 
-                primary_item = detected_items[0]
-                annotated_bytes = self._generate_multi_annotated_jpeg(pil_img, detected_items)
-                print(f"🧠 [AI Service] Hybrid CV phát hiện {len(detected_items)} sản phẩm: {[i['product_code'] for i in detected_items]}")
+                annotated_bytes = self._generate_multi_annotated_jpeg(pil_img, all_items)
+
+                if not classified_items:
+                    print(f"⚠️ [AI Service] Phát hiện {len(review_items)} vùng nhưng đều NEEDS_REVIEW (từ chối đoán bừa).")
+                    return {
+                        "product_code": "NEEDS_REVIEW",
+                        "product_name": "Cần kiểm tra lại (AI chưa đủ chắc chắn)",
+                        "predicted_class": None,
+                        "confidence": 0.0,
+                        "bbox": review_items[0]["bbox"] if review_items else None,
+                        "decision_status": "NEEDS_REVIEW",
+                        "detected_items": [],
+                        "review_items": review_items,
+                        "total_detected": 0,
+                        "explanation": f"Phát hiện {len(review_items)} vùng vật thể nhưng chưa đủ độ tin cậy hoặc mâu thuẫn hình học (NEEDS_REVIEW).",
+                        "engine": self.engine_name,
+                        "annotated_bytes": annotated_bytes,
+                        "success": False,
+                    }
+
+                primary_item = classified_items[0]
+                print(f"🧠 [AI Service] Hybrid CV phát hiện {len(classified_items)} sản phẩm: {[i['product_code'] for i in classified_items]}")
 
                 return {
                     "product_code": primary_item["product_code"],
@@ -226,9 +327,10 @@ class AIProductClassifierService:
                     "confidence": primary_item["confidence"],
                     "bbox": primary_item["bbox"],
                     "decision_status": "CLASSIFIED",
-                    "detected_items": detected_items,
-                    "total_detected": len(detected_items),
-                    "explanation": f"Đã nhận diện {len(detected_items)} sản phẩm trên khay xe.",
+                    "detected_items": classified_items,
+                    "review_items": review_items,
+                    "total_detected": len(classified_items),
+                    "explanation": f"Đã nhận diện {len(classified_items)} sản phẩm trên khay xe.",
                     "engine": self.engine_name,
                     "annotated_bytes": annotated_bytes,
                     "success": True,
@@ -370,15 +472,20 @@ class AIProductClassifierService:
                 for i in range(line_width):
                     draw.rectangle([x1 - i, y1 - i, x2 + i, y2 + i], outline=color_rgb)
 
-                banner_text = f" {label_text} -> Kho {target_node} [{conf * 100:.0f}%] "
+                if item.get("decision_status") == "NEEDS_REVIEW" or not target_node or target_node == "?":
+                    banner_text = f" {label_text} [NEEDS_REVIEW] "
+                else:
+                    banner_text = f" {label_text} -> Kho {target_node} [{conf * 100:.0f}%] "
                 try:
                     tb = draw.textbbox((x1, y1), banner_text, font=font)
                     tw, th = tb[2] - tb[0], tb[3] - tb[1]
                 except Exception:
                     tw, th = len(banner_text) * (font_size // 2), font_size + 4
 
-                draw.rectangle([x1, max(0, y1 - th - 6), x1 + tw + 8, y1], fill=color_rgb)
-                draw.text((x1 + 4, max(0, y1 - th - 4)), banner_text, fill=(255, 255, 255), font=font)
+                bx = min(x1, max(0, w - tw - 10))
+                by = max(0, y1 - th - 6)
+                draw.rectangle([bx, by, min(w, bx + tw + 8), y1], fill=color_rgb)
+                draw.text((bx + 4, max(0, by + 2)), banner_text, fill=(255, 255, 255), font=font)
 
             buf = io.BytesIO()
             img_out.save(buf, format="JPEG", quality=85)

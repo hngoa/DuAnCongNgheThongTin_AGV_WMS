@@ -518,6 +518,23 @@ class TaskRepository:
                              (new_status, error_msg, task_id))
             return True
 
+    def update_dispatch_target(self, task_id: int, to_node: str, route_path: str, assigned_agv: Optional[str] = None) -> bool:
+        """Cập nhật trạm đích, lộ trình và chuyển trạng thái task sang DISPATCHED."""
+        with get_db(self.db_file) as conn:
+            if assigned_agv:
+                conn.execute("""
+                    UPDATE dispatch_tasks
+                    SET to_node = ?, route_path = ?, assigned_agv = ?, status = 'DISPATCHED'
+                    WHERE task_id = ?;
+                """, (to_node, route_path, assigned_agv, task_id))
+            else:
+                conn.execute("""
+                    UPDATE dispatch_tasks
+                    SET to_node = ?, route_path = ?, status = 'DISPATCHED'
+                    WHERE task_id = ?;
+                """, (to_node, route_path, task_id))
+            return True
+
     def get_recent_tasks(self, limit: int = 20) -> List[Dict[str, Any]]:
         with get_db(self.db_file) as conn:
             rows = conn.execute("SELECT * FROM dispatch_tasks ORDER BY task_id DESC LIMIT ?;", (limit,)).fetchall()

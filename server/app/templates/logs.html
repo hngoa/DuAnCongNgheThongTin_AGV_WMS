@@ -388,13 +388,48 @@
 
   <!-- ==================== LOGIC JAVASCRIPT ==================== -->
   <script>
+    const ADMIN_TOKEN = "agv_sec_admin_v2_1a2b3c";
+    const _origFetch = window.fetch;
+    window.fetch = function(url, options = {}) {
+      options.headers = options.headers || {};
+      if (typeof options.headers.set === 'function') {
+        options.headers.set('X-Device-Token', ADMIN_TOKEN);
+      } else if (Array.isArray(options.headers)) {
+        options.headers.push(['X-Device-Token', ADMIN_TOKEN]);
+      } else {
+        options.headers['X-Device-Token'] = ADMIN_TOKEN;
+      }
+      return _origFetch(url, options);
+    };
+
     let autoRefreshTimer = null;
     let isLoggingActive = true;
     let trailData = [];
 
-    // Map Coordinates: A(0,0), B(0, 1.51), C(1.54, 1.51), D(1.54, 0)
-    const MAP_W = 1.54;
-    const MAP_H = 1.51;
+    // Đồng bộ động cấu hình bản đồ từ Server WMS
+    let activeMapW = 1.54;
+    let activeMapH = 1.51;
+    let activeNodes = [
+      { node_id: 'A', x: 0, y: 0, color: '#22c55e' },
+      { node_id: 'B', x: 0, y: 1.51, color: '#38bdf8' },
+      { node_id: 'C', x: 1.54, y: 1.51, color: '#f59e0b' },
+      { node_id: 'D', x: 1.54, y: 0, color: '#a855f7' }
+    ];
+    let activeSegments = [];
+
+    async function loadActiveMapConfig() {
+      try {
+        const res = await fetch('/api/wms/map');
+        if (!res.ok) return;
+        const json = await res.json();
+        if (json.status === 'success' && json.map) {
+          activeMapW = Number(json.map.width_m || 1.54);
+          activeMapH = Number(json.map.length_m || 1.51);
+          if (Array.isArray(json.nodes) && json.nodes.length > 0) activeNodes = json.nodes;
+          if (Array.isArray(json.segments)) activeSegments = json.segments;
+        }
+      } catch (e) {}
+    }
 
     // 1. Tải trạng thái AGV và cập nhật Canvas mini
     async function updateLiveDashboard() {
@@ -583,30 +618,47 @@
       const padY = 30;
       const drawW = w - padX * 2;
       const drawH = h - padY * 2;
+      const scale = Math.min(drawW / (activeMapW || 1.54), drawH / (activeMapH || 1.51));
+      const offsetX = padX + (drawW - activeMapW * scale) / 2;
+      const offsetY = padY + (drawH - activeMapH * scale) / 2;
 
-      // Coordinate mapping: Sa bàn X(0->1.54m), Y(0->1.51m)
-      // Gốc A(0,0) ở dưới-trái
+      // Coordinate mapping: Gốc dưới-trái, giữ đúng tỉ lệ bản đồ
       function toScreen(x, y) {
-        const sx = padX + (x / MAP_W) * drawW;
-        const sy = (h - padY) - (y / MAP_H) * drawH;
+        const sx = offsetX + x * scale;
+        const sy = (h - offsetY) - y * scale;
         return [sx, sy];
       }
 
-      // Vẽ khung sa bàn chữ nhật nối 4 trạm A-B-C-D
-      const [ax, ay] = toScreen(0, 0);
-      const [bx, by] = toScreen(0, 1.51);
-      const [cx, cy] = toScreen(1.54, 1.51);
-      const [dx, dy] = toScreen(1.54, 0);
-
-      ctx.strokeStyle = '#334155';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(ax, ay);
-      ctx.lineTo(bx, by);
-      ctx.lineTo(cx, cy);
-      ctx.lineTo(dx, dy);
-      ctx.closePath();
-      ctx.stroke();
+      // Vẽ các đoạn line thực tế của bản đồ đang kích hoạt
+      if (activeSegments.length > 0) {
+        activeSegments.forEach(seg => {
+          const nFrom = activeNodes.find(n => n.node_id === seg.from_node);
+          const nTo = activeNodes.find(n => n.node_id === seg.to_node);
+          if (!nFrom || !nTo) return;
+          const [p1x, p1y] = toScreen(nFrom.x, nFrom.y);
+          const [p2x, p2y] = toScreen(nTo.x, nTo.y);
+          ctx.strokeStyle = seg.is_locked ? '#f59e0b' : '#334155';
+          ctx.lineWidth = seg.is_locked ? 3 : 2;
+          ctx.beginPath();
+          ctx.moveTo(p1x, p1y);
+          ctx.lineTo(p2x, p2y);
+          ctx.stroke();
+        });
+      } else {
+        const [ax, ay] = toScreen(0, 0);
+        const [bx, by] = toScreen(0, activeMapH);
+        const [cx, cy] = toScreen(activeMapW, activeMapH);
+        const [dx, dy] = toScreen(activeMapW, 0);
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.lineTo(cx, cy);
+        ctx.lineTo(dx, dy);
+        ctx.closePath();
+        ctx.stroke();
+      }
 
       // Vẽ vệt di chuyển (Trail)
       if (trailData.length > 1) {
@@ -622,24 +674,17 @@
         ctx.stroke();
       }
 
-      // Vẽ 4 Trạm
-      const stations = [
-        { name: 'A', x: 0, y: 0, col: '#22c55e' },
-        { name: 'B', x: 0, y: 1.51, col: '#38bdf8' },
-        { name: 'C', x: 1.54, y: 1.51, col: '#f59e0b' },
-        { name: 'D', x: 1.54, y: 0, col: '#a855f7' }
-      ];
-
-      stations.forEach(s => {
+      // Vẽ tất cả các Trạm của bản đồ
+      activeNodes.forEach(s => {
         const [sx, sy] = toScreen(s.x, s.y);
-        ctx.fillStyle = s.col;
+        ctx.fillStyle = s.color || '#38bdf8';
         ctx.beginPath();
         ctx.arc(sx, sy, 5, 0, Math.PI * 2);
         ctx.fill();
 
         ctx.fillStyle = '#f8fafc';
         ctx.font = 'bold 11px monospace';
-        ctx.fillText(s.name, sx - 4, sy - 8);
+        ctx.fillText(s.node_id || s.name, sx - 4, sy - 8);
       });
 
       // Vẽ Robot AGV
@@ -667,9 +712,11 @@
 
     // Khởi động khi tải trang
     window.addEventListener('DOMContentLoaded', () => {
+      loadActiveMapConfig();
       updateLiveDashboard();
       loadLogs();
       toggleAutoRefresh(true);
+      setInterval(loadActiveMapConfig, 5000);
     });
   </script>
 
