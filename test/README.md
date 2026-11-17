@@ -19,15 +19,16 @@ Sau khi từng phần được kiểm thử ổn định, code sẽ được tí
 | **06** | `test_06_encoder_1m_calibration.cpp` | **Hiệu chuẩn Encoder 1 Mét Chuyên Dụng (Zero-Slip - Port 5001):**<br>- Động cơ thả trôi tự do, đo số xung thực tế khi đẩy xe 1m có tải.<br>- Server Port 5001 tự động tính Ticks/m, Ticks/cm, đường kính lốp.<br>- Lưu lịch sử nhiều lần đo và tính trung bình vàng để nạp code. | 🟢 **ĐANG KIỂM THỬ** |
 | **07** | `test_07_ina226_current_sensor.cpp` | **Kiểm thử cảm biến INA226 & Server Quản Lý Năng Lượng (Port 5002):**<br>- Chẩn đoán điện áp tĩnh HIGH/LOW trên chân SDA=GPIO 8, SCL=GPIO 9.<br>- Nhận diện Chip ID TI (0x5449 & 0x2260), Stress test 100 gói dữ liệu.<br>- Tích phân dung lượng tiêu thụ (mAh) và điện năng (Wh) thời gian thực.<br>- Web Dashboard riêng (Port 5002): Đồng hồ % Pin, Đồ thị sóng V/A/W, Xuất CSV.<br>- Hỗ trợ phím `swap`, `s`, `t`, `r`, `zero`, `cal` trên Serial Monitor. | 🟢 **ĐÃ SẴN SÀNG** |
 | **08** | `test_08_gap_crossing_robust_line.cpp` | **Bám line Robust & Vượt vạch đứt đoạn / mờ / nhiễu sáng:**<br>- Cầu nối quán tính Dead-Reckoning Virtual Line Bridge.<br>- Bộ lọc độ tin cậy kháng vạch mờ chập chờn (30ms debounce).<br>- Lọc không gian loại bỏ nhiễu lóa sáng quang học (mẫu 10001).<br>- Tính năng giả lập đứt vạch 25cm bằng phím 'g' để thử nghiệm tức thì.<br>- Kế thừa trọn vẹn Odometry tâm bánh, tiếp cận trạm và khóa vạch góc xoay. | 🟢 **ĐÃ HOÀN THÀNH** |
-| **09** | `test_09_bidirectional_flexible_routing.cpp` | **Điều hướng Đồ thị 2 Chiều & Điểm - Điểm linh hoạt:**<br>- Mô hình đồ thị 8 chặng 2 chiều đầy đủ (AB, BC, CD, DA & BA, CB, DC, AD).<br>- Thuật toán khóa vạch tiệm cận (|err| <= 35°) chống bắt nhầm nhánh khi quay 180°.<br>- Bộ định tuyến Điểm - Điểm (GO_TO:A, B, C, D) tự động lập lộ trình ngắn nhất.<br>- Ma trận 3 cụm nút điều khiển trên Web: Điều hướng nhanh, Điểm-Điểm, 8 Chặng 2 chiều.<br>- Tích hợp toàn diện Cầu nối quán tính vượt đứt vạch và khử trôi đa tầng. | 🟢 **MỚI TẠO** |
-| **10** | `../src/main.cpp` | **TÍCH HỢP TOÀN DIỆN HỆ THỐNG AGV_VER2** | ⏳ *Giai đoạn cuối* |
+| **09** | `test_09_bidirectional_flexible_routing.cpp` | **Điều hướng Đồ thị 2 Chiều & Điểm - Điểm linh hoạt:**<br>- Mô hình đồ thị 8 chặng 2 chiều đầy đủ (AB, BC, CD, DA & BA, CB, DC, AD).<br>- Thuật toán khóa vạch tiệm cận (|err| <= 35°) chống bắt nhầm nhánh khi quay 180°.<br>- Bộ định tuyến Điểm - Điểm (GO_TO:A, B, C, D) tự động lập lộ trình ngắn nhất.<br>- Ma trận 3 cụm nút điều khiển trên Web: Điều hướng nhanh, Điểm-Điểm, 8 Chặng 2 chiều.<br>- Tích hợp toàn diện Cầu nối quán tính vượt đứt vạch và khử trôi đa tầng. | 🟢 **ĐÃ HOÀN THÀNH** |
+| **10** | `test_10_line_centric_hybrid_recovery.cpp` | **Kiến Trúc Lai Cân Bằng MPU Anchor + Dual-State Line Catch:**<br>- Hợp nhất MPU-6050 (`pureMpuYawDeg` + cổng nhất quán động học `<= 7°`, giới hạn lệch EKF `±2.5°`): giữ ổn định trạm Test 09 nhưng không bao giờ để 5-IR bẻ sai góc MPU trên nhánh chéo `<`.<br>- Nâng cấp bám line: lọc đa số 5 lần chống chói gạch bóng, tăng trọng số mẫu góc gập (`7/28/15/30 -> ±1.75`), mở khóa bánh trong `0.02 m/s`, pivot `±1.40`.<br>- Tách mất vạch thẳng (`Bridge` quét sin `0.72m`) vs mất tại đỉnh góc gập/< (`SUB_CORNER_BEND_CATCH` dùng MPU quét hẹp trong nón đích `±88°`). | 🟢 **MỚI TẠO** |
+| **11** | `../src/main.cpp` | **TÍCH HỢP TOÀN DIỆN HỆ THỐNG AGV_VER2** | ⏳ *Giai đoạn cuối* |
 
 ---
 
 ## 🛠 HƯỚNG DẪN CÁCH CHỌN VÀ NẠP BÀI TEST TRÊN VS CODE (PLATFORMIO)
 
 1. Mở thư mục `AGV_Ver2` trên VS Code.
-2. Nhìn xuống thanh trạng thái màu xanh tím ở mép dưới cửa sổ VS Code, click vào tên môi trường hiện tại (ví dụ: `env:test_09_bidirectional_flexible_routing`).
+2. Nhìn xuống thanh trạng thái màu xanh tím ở mép dưới cửa sổ VS Code, click vào tên môi trường hiện tại (ví dụ: `env:test_10_line_centric_hybrid_recovery`).
 3. Chọn môi trường bạn muốn kiểm thử:
    - `env:test_00_basic_motor_control`: Kiểm tra động cơ quay tới/lùi, rẽ, quay từng bánh.
    - `env:test_01_ir_calibration`: Cân chỉnh độ nhạy thanh dò line 5 mắt.
@@ -39,5 +40,6 @@ Sau khi từng phần được kiểm thử ổn định, code sẽ được tí
    - `env:test_07_ina226_current_sensor`: Chẩn đoán 2 chân GPIO 8, 9 và đo dòng/áp INA226.
    - `env:test_08_gap_crossing_robust_line`: Bám line Robust & Vượt vạch đứt đoạn / mờ / nhiễu sáng.
    - `env:test_09_bidirectional_flexible_routing`: Điều hướng đồ thị 2 chiều & Điểm-Điểm linh hoạt.
+   - `env:test_10_line_centric_hybrid_recovery`: Bám line tự do (cong/zigzag) kết hợp cứu hộ đứt đoạn & khóa ZUPT MPU-6050.
 4. Nhấn nút **PlatformIO: Upload** (biểu tượng mũi tên sang phải `->`) để nạp vào ESP32-S3.
 5. Mở **Serial Monitor** (tốc độ Baud **115200**) để quan sát telemetry hoặc cho xe chạy Pin độc lập trên sàn.
