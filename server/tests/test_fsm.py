@@ -16,10 +16,8 @@ for p in (SERVER_DIR, DB_DIR, FSM_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from db_connection import DB_PATH
 from seed_data import seed_database
 from fsm_definitions import TaskState, AGVState
-from router import TopologicalRouter
 from fsm_manager import WMSWorkflowManager
 
 def run_tests():

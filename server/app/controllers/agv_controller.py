@@ -5,7 +5,6 @@ XỬ LÝ TELEMETRY CHU KỲ (100ms), PHÁT LỆNH ĐIỀU KHIỂN & LƯU VẾT D
 ===================================================================================
 """
 
-import json
 import time
 from typing import Dict, Any, Tuple
 from app.config import DEFAULT_AGV_ID, DEFAULT_MAP_ID, AGV_WATCHDOG_TIMEOUT_SEC

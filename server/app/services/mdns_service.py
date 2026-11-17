@@ -10,7 +10,6 @@ import socket
 import struct
 import threading
 import time
-from typing import List
 from app.config import get_local_ips, MDNS_HOSTNAME, PORT
 
 MDNS_GROUP = "224.0.0.251"

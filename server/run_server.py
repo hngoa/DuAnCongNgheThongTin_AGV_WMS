@@ -28,7 +28,7 @@ if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
 # Import các tầng kiến trúc
-from app.config import HOST, PORT, DB_PATH, get_local_ips, MDNS_HOSTNAME, SECURITY_ENABLED
+from app.config import HOST, PORT, DB_PATH, MDNS_HOSTNAME, SECURITY_ENABLED
 from database.seed_data import seed_database
 from fsm.fsm_manager import WMSWorkflowManager
 from app.services.ai_service import AIProductClassifierService
@@ -74,19 +74,14 @@ def main():
 
     # 5. Khởi chạy HTTP Server đa luồng chịu lỗi cao (Graceful Multi-threaded Server)
     server = GracefulThreadingHTTPServer((HOST, PORT), MainHTTPHandler)
-    ips = get_local_ips()
 
     print("\n" + "=" * 75)
     print(f"🚀 SERVER CHUẨN CÔNG NGHIỆP ĐÃ SẴN SÀNG TẠI CỔNG {PORT}!")
-    print(f"   [Phương thức kết nối] : TÊN MIỀN CỤC BỘ mDNS (RFC 6762) + TOKEN RBAC")
-    print(f"   [Địa chỉ Server duy nhất] : http://{MDNS_HOSTNAME}.local:{PORT}")
-    print(f"   [Cục bộ máy chủ]      : http://localhost:{PORT}")
-    for ip in ips:
-        print(f"   [IP Wi-Fi LAN nội bộ] : http://{ip}:{PORT}")
-    print(f"   [Bảo Mật Xác Thực]    : {'BẬT (Token Guard RBAC)' if SECURITY_ENABLED else 'TẮT'}")
+    print(f"   [Phương thức kết nối]     : TÊN MIỀN CỤC BỘ mDNS (RFC 6762) + TOKEN RBAC")
+    print(f"   [Địa chỉ kết nối duy nhất]: http://{MDNS_HOSTNAME}.local:{PORT}")
+    print(f"   [Bảo Mật Xác Thực]        : {'BẬT (Token Guard RBAC + HMAC-SHA256)' if SECURITY_ENABLED else 'TẮT'}")
     print("=" * 75)
-    print(f"👉 ESP32 và Android kết nối trực tiếp qua: http://{MDNS_HOSTNAME}.local:{PORT}")
-    print("👉 Mở trình duyệt Web tại link trên để điều khiển Digital Twin.")
+    print(f"👉 ESP32, Android và Web kết nối trực tiếp qua: http://{MDNS_HOSTNAME}.local:{PORT}")
     print("👉 Nhấn Ctrl + C để dừng máy chủ an toàn.\n")
 
     try:

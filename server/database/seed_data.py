@@ -5,10 +5,12 @@ SCRIPT NẠP DỮ LIỆU BAN ĐẦU (SEED DATA) CHO BẢN ĐỒ & TỒN KHO ĐA 
 """
 
 from pathlib import Path
-try:
-    from .db_connection import get_db, init_db, DB_PATH
-except ImportError:
-    from db_connection import get_db, init_db, DB_PATH
+import sys
+SERVER_DIR = Path(__file__).resolve().parent.parent
+if str(SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(SERVER_DIR))
+
+from database.db_connection import get_db, init_db, DB_PATH
 
 def seed_database(db_file: Path = DB_PATH):
     """Nạp dữ liệu cấu hình bản đồ động và quy tắc phân bổ kho thông minh"""

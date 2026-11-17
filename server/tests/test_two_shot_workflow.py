@@ -12,7 +12,6 @@ KIỂM THỬ QUY TRÌNH 2-SHOT AI & TỰ ĐỘNG CHỌN KHO GẦN NHẤT (AGV_VE
 """
 
 import sys
-import time
 from pathlib import Path
 
 SERVER_DIR = Path(__file__).resolve().parent.parent
@@ -22,7 +21,7 @@ for p in (SERVER_DIR, DB_DIR):
         sys.path.insert(0, str(p))
 
 from seed_data import seed_database
-from repositories import MapRepository, InventoryRepository, AllocationEngineRepository, ProductRepository, TaskRepository
+from app.config import UPLOAD_DIR
 from fsm.fsm_manager import WMSWorkflowManager
 from fsm.fsm_definitions import TaskState
 from app.services.ai_service import AIProductClassifierService
@@ -36,6 +35,7 @@ def run_tests():
     print("  BẮT ĐẦU TEST TOÀN DIỆN: 2-SHOT AI & TỰ ĐỘNG CHỌN KHO GẦN NHẤT")
     print("=" * 75)
 
+    existing_uploads = set(UPLOAD_DIR.glob("*.jpg")) if UPLOAD_DIR.is_dir() else set()
     if TEST_DB.exists():
         try:
             TEST_DB.unlink()
@@ -409,6 +409,18 @@ def run_tests():
     assert wf_manager.active_mission is None
     assert wf_manager.agv_fsm.current_state.value == "IDLE"
     print("   ✅ [HOÀN TẤT VỀ TRẠM A]: Xe AGV đã về Trạm Tiếp Nhận A sau khi hết hàng sớm thành công!")
+
+    if TEST_DB.exists():
+        try:
+            TEST_DB.unlink()
+        except Exception:
+            pass
+    if UPLOAD_DIR.is_dir():
+        for f in set(UPLOAD_DIR.glob("*.jpg")) - existing_uploads:
+            try:
+                f.unlink()
+            except Exception:
+                pass
 
     print("\n" + "=" * 75)
     print("🎉 TOÀN BỘ CÁC BÀI TEST 2-SHOT & CHỌN KHO GẦN NHẤT ĐÃ ĐẠT 100% PASS!")

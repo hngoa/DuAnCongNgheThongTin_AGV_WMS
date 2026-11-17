@@ -9,11 +9,12 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+import sys
+SERVER_DIR = Path(__file__).resolve().parent.parent
+if str(SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(SERVER_DIR))
 
-try:
-    from .db_connection import get_db, DB_PATH
-except ImportError:
-    from db_connection import get_db, DB_PATH
+from database.db_connection import get_db, DB_PATH
 
 class MapRepository:
     """Quản lý các bản đồ mạng lưới line (Topological Maps), Nodes và Segments"""
@@ -438,11 +439,6 @@ class ProductRepository:
         with get_db(self.db_file) as conn:
             rows = conn.execute("SELECT * FROM products ORDER BY yolo_class_id ASC;").fetchall()
             return [dict(r) for r in rows]
-
-    def get_by_yolo_class(self, class_id: int) -> Optional[Dict[str, Any]]:
-        with get_db(self.db_file) as conn:
-            row = conn.execute("SELECT * FROM products WHERE yolo_class_id = ?;", (class_id,)).fetchone()
-            return dict(row) if row else None
 
     def get_by_code(self, product_code: str) -> Optional[Dict[str, Any]]:
         with get_db(self.db_file) as conn:

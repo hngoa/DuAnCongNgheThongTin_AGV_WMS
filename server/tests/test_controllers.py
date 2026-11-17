@@ -6,7 +6,6 @@ KIỂM TRA MULTIPART PARSER, JSON TELEMETRY, ĐIỀU KHIỂN & CSV EXPORT
 """
 
 import sys
-import json
 import time
 from pathlib import Path
 
@@ -14,7 +13,7 @@ SERVER_DIR = Path(__file__).resolve().parent.parent
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from app.config import DB_PATH, DEFAULT_MAP_ID
+from app.config import DEFAULT_MAP_ID, UPLOAD_DIR
 from database.seed_data import seed_database
 from fsm.fsm_manager import WMSWorkflowManager
 from app.services.ai_service import AIProductClassifierService
@@ -30,6 +29,7 @@ def run_controller_tests():
     test_db = SERVER_DIR / "database" / "test_ctrl_wms.db"
     if test_db.exists():
         test_db.unlink()
+    existing_uploads = set(UPLOAD_DIR.glob("*.jpg")) if UPLOAD_DIR.is_dir() else set()
 
     # 1. Khởi tạo Database & Services
     print(">> [BƯỚC 1]: Nạp Database & Services...")
@@ -186,12 +186,18 @@ def run_controller_tests():
     assert code == 200 and len(csv_bytes) > 0
     print(f"   ✅ [CSV EXPORT] Tạo thành công file CSV: '{filename}' ({len(csv_bytes)} bytes)")
 
-    # Dọn dẹp Database kiểm thử để không lưu data ảo
+    # Dọn dẹp Database và ảnh kiểm thử để không lưu data ảo
     if test_db.exists():
         try:
             test_db.unlink()
         except Exception:
             pass
+    if UPLOAD_DIR.is_dir():
+        for f in set(UPLOAD_DIR.glob("*.jpg")) - existing_uploads:
+            try:
+                f.unlink()
+            except Exception:
+                pass
 
     print("\n" + "=" * 75)
     print("🎉 TẤT CẢ 7 BÀI TEST CONTROLLERS ĐÃ THÀNH CÔNG VƯỢT TRỘI (100% PASS)!")

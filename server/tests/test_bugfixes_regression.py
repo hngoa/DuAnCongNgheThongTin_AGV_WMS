@@ -25,7 +25,7 @@ from app.services.ai_service import AIProductClassifierService
 from app.controllers.agv_controller import AGVController
 from app.controllers.camera_controller import CameraController
 from app.router import MainHTTPHandler
-from app.config import AGV_WATCHDOG_TIMEOUT_SEC, CAMERA_DEVICE_TOKEN
+from app.config import AGV_WATCHDOG_TIMEOUT_SEC, CAMERA_DEVICE_TOKEN, UPLOAD_DIR
 
 
 def run_tests():
@@ -33,6 +33,7 @@ def run_tests():
     print("🧪 BẮT ĐẦU KIỂM THỬ HỒI QUY (BUGFIX REGRESSION SUITE)")
     print("=" * 75)
 
+    existing_uploads = set(UPLOAD_DIR.glob("*.jpg")) if UPLOAD_DIR.is_dir() else set()
     test_db = DB_DIR / "test_regression_wms.db"
     if test_db.exists():
         test_db.unlink()
@@ -477,15 +478,142 @@ def run_tests():
         assert ObjectDetector._is_nested_duplicate((52, 807, 1728, 2303), [(139, 752, 1467, 1506)]) is True
         # Two disjoint objects on tray
         assert ObjectDetector._is_nested_duplicate((339, 1543, 1192, 2304), [(679, 780, 1646, 1510)]) is False
-        print("   ✅ [14/14] ObjectDetector._is_nested_duplicate lọc chính xác box khổng lồ bao trùm")
+        print("   ✅ [14/15] ObjectDetector._is_nested_duplicate lọc chính xác box khổng lồ bao trùm")
     except Exception:
-        print("   ℹ️ [14/14] Bỏ qua import roi_extraction trong môi trường không có cv2/torch")
+        print("   ℹ️ [14/15] Bỏ qua import roi_extraction trong môi trường không có cv2/torch")
+
+    # 15. Kiểm thử toàn diện các cơ chế Bảo mật IoT (Anti-Spoofing, HMAC-SHA256, Least-Privilege RBAC, Anti-DoS, Path Traversal, Rate Limit)
+    import json
+    from app.config import AGV_DEVICE_TOKEN, ADMIN_API_TOKEN, MAX_JSON_BODY_BYTES, AUTH_MAX_FAILURES
+    from app.services.security_service import SecurityService, WEB_SESSION_COOKIE_NAME
+
+    SecurityService.reset_rate_limits()
+
+    def _sim_http(method: str, path_str: str, headers_dict: dict, body_bytes: bytes = b"", client_ip: str = "192.168.1.99"):
+        h = object.__new__(MainHTTPHandler)
+        h.path = path_str
+        hdrs = dict(headers_dict)
+        if body_bytes and "Content-Length" not in hdrs:
+            hdrs["Content-Length"] = str(len(body_bytes))
+        h.headers = hdrs
+        h.rfile = io.BytesIO(body_bytes)
+        h.wfile = io.BytesIO()
+        h.client_address = (client_ip, 54321)
+        h.close_connection = False
+        h.agv_controller = agv_ctrl
+        h.camera_controller = cam_router
+        h.wms_controller = None
+        resp_meta = {"code": 200, "headers": {}}
+        h.send_response = lambda code: resp_meta.__setitem__("code", code)
+        h.send_header = lambda k, v: resp_meta["headers"].__setitem__(k, v)
+        h.end_headers = lambda: None
+        if method == "GET":
+            h.do_GET()
+        else:
+            h.do_POST()
+        raw_out = h.wfile.getvalue()
+        try:
+            json_out = json.loads(raw_out.decode("utf-8")) if raw_out else {}
+        except Exception:
+            json_out = {}
+        return resp_meta["code"], resp_meta["headers"], json_out
+
+    # (a) Chặn giả mạo Header Referer / Sec-Fetch-Site từ IP mạng LAN
+    code_spoof, _, _ = _sim_http("GET", "/api/state", {
+        "Referer": "http://localhost:5000/",
+        "Sec-Fetch-Site": "same-origin"
+    }, client_ip="192.168.1.150")
+    assert code_spoof == 401, f"Phải chặn giả mạo Referer từ LAN IP! Got {code_spoof}"
+
+    # (b) Cho phép Web Session Cookie đã ký số HMAC-SHA256 khi mở trang chủ '/'
+    code_idx, hdrs_idx, _ = _sim_http("GET", "/", {}, client_ip="192.168.1.150")
+    assert code_idx == 200 and WEB_SESSION_COOKIE_NAME in hdrs_idx.get("Set-Cookie", "")
+    cookie_val = hdrs_idx["Set-Cookie"].split(";")[0]
+    code_sess, _, _ = _sim_http("GET", "/api/state", {"Cookie": cookie_val}, client_ip="192.168.1.150")
+    assert code_sess == 200, "Session Cookie ký số HMAC phải được xác thực hợp lệ!"
+
+    # (c) Bảo vệ API /api/logs và /api/logs/clear trước truy cập trái phép
+    code_log_unauth, _, _ = _sim_http("GET", "/api/logs", {}, client_ip="192.168.1.151")
+    assert code_log_unauth == 401
+    code_log_clear_unauth, _, _ = _sim_http("POST", "/api/logs/clear", {}, client_ip="192.168.1.151")
+    assert code_log_clear_unauth == 401
+    code_log_admin, _, _ = _sim_http("GET", "/api/logs", {"X-Device-Token": ADMIN_API_TOKEN}, client_ip="192.168.1.151")
+    assert code_log_admin == 200
+
+    # (d) Chặn Path Traversal trên /static/ và /images/
+    code_trav, _, _ = _sim_http("GET", "/static/../../app/config.py", {}, client_ip="192.168.1.152")
+    assert code_trav == 403, f"Path traversal phải trả 403! Got {code_trav}"
+
+    # (e) Chặn gói tin vượt ngưỡng kích thước (413 Payload Too Large) trước khi đọc RAM
+    code_big, _, _ = _sim_http("POST", "/api/telemetry", {
+        "X-Device-Token": AGV_DEVICE_TOKEN,
+        "Content-Length": str(MAX_JSON_BODY_BYTES + 1024)
+    }, body_bytes=b"{}", client_ip="192.168.1.153")
+    assert code_big == 413, f"Payload quá lớn phải trả 413! Got {code_big}"
+
+    # (f) Phân quyền tối thiểu (Least-Privilege RBAC) trên POST /api/command
+    # - Robot AGV không được phép tự gọi /api/command
+    code_agv_cmd, _, _ = _sim_http(
+        "POST", "/api/command", {"X-Device-Token": AGV_DEVICE_TOKEN},
+        body_bytes=b'{"action":"stop"}', client_ip="192.168.1.154"
+    )
+    assert code_agv_cmd == 401
+    # - Camera chỉ được gọi capture_now / go_to, CẤM gọi abort_missions / stop / reset_odom
+    code_cam_forbid, _, _ = _sim_http(
+        "POST", "/api/command", {"X-Device-Token": CAMERA_DEVICE_TOKEN},
+        body_bytes=b'{"action":"abort_missions"}', client_ip="192.168.1.154"
+    )
+    assert code_cam_forbid == 403
+    code_cam_allow, _, _ = _sim_http(
+        "POST", "/api/command", {"X-Device-Token": CAMERA_DEVICE_TOKEN},
+        body_bytes=b'{"action":"capture_now","station":"A"}', client_ip="192.168.1.154"
+    )
+    assert code_cam_allow == 200
+
+    # (g) Ký số HMAC-SHA256 lệnh điều khiển (cmd_sig) và xác minh chữ ký gói tin (X-Payload-Signature)
+    agv_ctrl.handle_command({"action": "go_to", "station": "B"})
+    t_payload = b'{"x":0.0,"y":0.0,"yaw":90.0,"speed":0.0,"voltage":12.2,"state":"IDLE","station":"A","ack_id":0}'
+    # Chữ ký sai -> bị chặn 401
+    code_bad_sig, _, _ = _sim_http(
+        "POST", "/api/telemetry",
+        {"X-Device-Token": AGV_DEVICE_TOKEN, "X-Payload-Signature": "00000000000000000000000000000000"},
+        body_bytes=t_payload, client_ip="192.168.1.155"
+    )
+    assert code_bad_sig == 401
+    # Chữ ký đúng -> trả 200 kèm cmd_sig hợp lệ cho ESP32
+    valid_sig = SecurityService.sign_payload(t_payload)
+    code_good_sig, _, t_out = _sim_http(
+        "POST", "/api/telemetry",
+        {"X-Device-Token": AGV_DEVICE_TOKEN, "X-Payload-Signature": valid_sig},
+        body_bytes=t_payload, client_ip="192.168.1.155"
+    )
+    assert code_good_sig == 200 and t_out.get("cmd") == "GO_TO:B"
+    assert SecurityService.verify_command_signature(
+        t_out["cmd_id"], t_out["cmd"], t_out.get("route", ""), t_out.get("cmd_sig", "")
+    ) is True
+
+    # (h) Chống tấn công vét cạn (Brute-Force Rate Limit) khóa tạm thời IP gửi sai Token liên tiếp
+    brute_ip = "192.168.1.250"
+    for _ in range(AUTH_MAX_FAILURES):
+        c_fail, _, _ = _sim_http("GET", "/api/state", {"X-Device-Token": "wrong_token"}, client_ip=brute_ip)
+        assert c_fail == 401
+    # Lần thứ AUTH_MAX_FAILURES + 1 ngay cả khi gửi đúng token vẫn bị chặn 429 trong thời gian khóa
+    c_locked, _, _ = _sim_http("GET", "/api/state", {"X-Device-Token": ADMIN_API_TOKEN}, client_ip=brute_ip)
+    assert c_locked == 429, f"IP vượt ngưỡng brute-force phải trả 429! Got {c_locked}"
+    SecurityService.reset_rate_limits()
+    print("   ✅ [15/15] Bảo mật IoT đa tầng (Anti-Spoofing, HMAC-SHA256, Least-Privilege RBAC, 413 DoS, 403 PathTraversal, 429 RateLimit)")
 
     if test_db.exists():
         try:
             test_db.unlink()
         except Exception:
             pass
+    if UPLOAD_DIR.is_dir():
+        for f in set(UPLOAD_DIR.glob("*.jpg")) - existing_uploads:
+            try:
+                f.unlink()
+            except Exception:
+                pass
 
     print("=" * 75)
     print("🎉 TẤT CẢ CÁC CA KIỂM THỬ HỒI QUY ĐÃ PASS 100%!")

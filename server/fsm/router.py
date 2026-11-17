@@ -5,7 +5,7 @@ SỬ DỤNG THUẬT TOÁN DIJKSTRA TỐI ƯU KHOẢNG CÁCH & TRÁNH CUNG ĐƯ�
 ===================================================================================
 """
 
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 import heapq
 
 class TopologicalRouter:

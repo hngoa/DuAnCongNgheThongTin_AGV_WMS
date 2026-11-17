@@ -1,13 +1,14 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include <math.h>
 #include <esp_arduino_version.h>
 #include "soc/usb_serial_jtag_reg.h"
 #include "driver/gpio.h"
+#include "mbedtls/md.h"
+#include "secrets.h"
 
 /*
  * ===================================================================================
@@ -31,15 +32,13 @@
  * ===================================================================================
  */
 
-// --- 1. CẤU HÌNH KẾT NỐI WI-FI, TÊN MIỀN mDNS & BẢO MẬT TOKEN ---
-const char* wifi_ssid        = "LAU 3";
-const char* wifi_pass        = "777777777";
-const char* mdns_hostname    = "agv-wms";                         // Tên miền mDNS duy nhất: agv-wms.local
-const char* agv_device_token = "agv_sec_robot_v2_7f8a9b";         // Mã khóa bảo mật RBAC của Robot AGV
-String      serverUrl        = "http://192.168.1.8:5000/api/telemetry"; // URL khởi đầu, tự cập nhật qua mDNS/UDP
-String      lastKnownServerUrl = "http://192.168.1.8:5000/api/telemetry";
-WiFiUDP     udpDiscovery;
-#define     UDP_DISCOVERY_PORT 5005
+// --- 1. CẤU HÌNH KẾT NỐI WI-FI, TÊN MIỀN mDNS & BẢO MẬT TOKEN + HMAC-SHA256 (NẠP TỪ include/secrets.h) ---
+const char* wifi_ssid        = WIFI_SSID_CFG;
+const char* wifi_pass        = WIFI_PASS_CFG;
+const char* mdns_hostname    = MDNS_HOSTNAME_CFG;                 // Tên miền mDNS duy nhất: agv-wms.local
+const char* agv_device_token = AGV_DEVICE_TOKEN_CFG;              // Mã khóa bảo mật RBAC của Robot AGV
+const char* agv_hmac_secret  = AGV_HMAC_SECRET_CFG;               // Khóa ký số HMAC-SHA256 chống giả mạo lệnh
+String      serverUrl        = "http://agv-wms.local:5000/api/telemetry"; // Kết nối qua tên miền mDNS chuẩn
 
 // --- 2. SƠ ĐỒ CHÂN PHẦN CỨNG ---
 #define I2C_SDA_PIN          4
@@ -2710,14 +2709,10 @@ bool resolveServerMdns(int maxAttempts = 2, int timeoutMs = 900) {
     IPAddress mdnsIp = MDNS.queryHost(mdns_hostname, timeoutMs);
     if (mdnsIp != INADDR_NONE && mdnsIp.toString() != "0.0.0.0") {
       serverUrl = "http://" + mdnsIp.toString() + ":5000/api/telemetry";
-      lastKnownServerUrl = serverUrl;
       Serial.printf("🎯 [mDNS THÀNH CÔNG - Lần %d]: Server IP = %s -> URL: %s\n", attempt, mdnsIp.toString().c_str(), serverUrl.c_str());
       return true;
     }
     delay(150);
-  }
-  if (lastKnownServerUrl.length() > 0 && serverUrl.length() == 0) {
-    serverUrl = lastKnownServerUrl;
   }
   Serial.printf("⚠️ [mDNS]: Không nhận được gói Multicast '%s.local' -> Duy trì kết nối qua URL: %s\n",
                 mdns_hostname, serverUrl.c_str());
@@ -2750,6 +2745,37 @@ bool extractJsonFloatField(const String &obj, const char* key, float &outVal) {
   if (c != '-' && c != '+' && !isDigit(c)) return false;
   outVal = obj.substring(pos).toFloat();
   return true;
+}
+
+// Tính chữ ký số HMAC-SHA256 (128-bit / 32 ký tự hex) bằng phần cứng mbedTLS trên ESP32-S3
+String computeHmacSha256Hex32(const String &message) {
+  uint8_t hmacResult[32];
+  const mbedtls_md_info_t *mdInfo = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!mdInfo) return "";
+  int rc = mbedtls_md_hmac(
+      mdInfo,
+      (const unsigned char *)agv_hmac_secret,
+      strlen(agv_hmac_secret),
+      (const unsigned char *)message.c_str(),
+      message.length(),
+      hmacResult);
+  if (rc != 0) return "";
+  char hexBuf[33];
+  for (int i = 0; i < 16; i++) {
+    snprintf(&hexBuf[i * 2], 3, "%02x", hmacResult[i]);
+  }
+  hexBuf[32] = '\0';
+  return String(hexBuf);
+}
+
+// So sánh chuỗi thời gian hằng (Constant-Time) chống tấn công Timing Side-Channel
+bool constantTimeEquals(const String &a, const String &b) {
+  if (a.length() != b.length() || a.length() == 0) return false;
+  uint8_t diff = 0;
+  for (unsigned int i = 0; i < a.length(); i++) {
+    diff |= (uint8_t)(tolower(a.charAt(i)) ^ tolower(b.charAt(i)));
+  }
+  return diff == 0;
 }
 
 int parseRouteLegsFromResponse(const String &resp, DynamicLeg outLegs[], int maxLegs) {
@@ -2808,32 +2834,10 @@ void telemetryTask(void *pvParameters) {
     WiFi.setSleep(false);
     Serial.printf("\n✅ [WI-FI]: Đã kết nối! IP = %s\n", WiFi.localIP().toString().c_str());
 
-    // 1. Phân giải mDNS agv-wms.local
+    // Phân giải tên miền mDNS chuẩn agv-wms.local
     if (MDNS.begin("agv-esp32")) {
       delay(200);
       resolveServerMdns(3, 1000);
-    }
-
-    // 2. Dự phòng UDP Discovery (Port 5005)
-    udpDiscovery.begin(UDP_DISCOVERY_PORT);
-    Serial.printf(">> [DÒ TÌM UDP]: Quét beacon UDP tại cổng %d...\n", UDP_DISCOVERY_PORT);
-    unsigned long waitStart = millis();
-    while (millis() - waitStart < 1200) {
-      int packetSize = udpDiscovery.parsePacket();
-      if (packetSize) {
-        char packetBuffer[255];
-        int len = udpDiscovery.read(packetBuffer, 254);
-        if (len > 0) packetBuffer[len] = 0;
-        String s = String(packetBuffer);
-        if (s.indexOf("AGV_SERVER") >= 0) {
-          IPAddress srvIp = udpDiscovery.remoteIP();
-          serverUrl = "http://" + srvIp.toString() + ":5000/api/telemetry";
-          lastKnownServerUrl = serverUrl;
-          Serial.printf("🎯 [TỰ ĐỘNG TÌM THẤY SERVER QUA UDP]: %s\n", serverUrl.c_str());
-          break;
-        }
-      }
-      delay(30);
     }
   } else {
     Serial.println("\n⚠️ [WI-FI]: Không kết nối được Wi-Fi -> Chạy nội bộ.");
@@ -2843,34 +2847,12 @@ void telemetryTask(void *pvParameters) {
   http.setTimeout(1500);
   http.setReuse(true); // Giữ kết nối TCP Keep-Alive tránh cạn kiệt socket lwIP
   unsigned long lastMdnsRetryMs = 0;
-  unsigned long lastUdpCheckMs = 0;
   unsigned long lastHttpErrMs = 0;
   unsigned long lastWifiRetryMs = 0;
   int consecutiveHttpErrors = 0;
 
   while (true) {
     if (WiFi.status() == WL_CONNECTED) {
-      // Quét kiểm tra beacon UDP định kỳ
-      if (millis() - lastUdpCheckMs > 4000) {
-        lastUdpCheckMs = millis();
-        int packetSize = udpDiscovery.parsePacket();
-        if (packetSize) {
-          char packetBuffer[255];
-          int len = udpDiscovery.read(packetBuffer, 254);
-          if (len > 0) packetBuffer[len] = 0;
-          String s = String(packetBuffer);
-          if (s.indexOf("AGV_SERVER") >= 0) {
-            IPAddress srvIp = udpDiscovery.remoteIP();
-            String newUrl = "http://" + srvIp.toString() + ":5000/api/telemetry";
-            if (newUrl != serverUrl) {
-              serverUrl = newUrl;
-              lastKnownServerUrl = serverUrl;
-              Serial.printf("🎯 [CẬP NHẬT IP SERVER MỚI TỪ UDP]: %s\n", serverUrl.c_str());
-            }
-          }
-        }
-      }
-
       // Snapshot dữ liệu an toàn đa nhân (Thread-safe Snapshot)
       portENTER_CRITICAL(&stateMux);
       float snapX = odomX;
@@ -2892,80 +2874,66 @@ void telemetryTask(void *pvParameters) {
       const char* snapStatePtr = robotStateStr ? robotStateStr : "STOPPED";
       portEXIT_CRITICAL(&stateMux);
 
-      String snapState = String(snapStatePtr);
-
-      String payload = "{";
-      payload += "\"x\":" + String(snapX, 3) + ",";
-      payload += "\"y\":" + String(snapY, 3) + ",";
-      payload += "\"yaw\":" + String(snapYaw, 1) + ",";
-      payload += "\"dist\":" + String(snapDist, 3) + ",";
-      payload += "\"speed\":" + String(snapSpeed, 1) + ",";
-      payload += "\"line_mask\":" + String(snapMask) + ",";
-      payload += "\"line_err\":" + String(snapLineErr, 2) + ",";
-      payload += "\"ticks_l\":" + String(snapTicksL) + ",";
-      payload += "\"ticks_r\":" + String(snapTicksR) + ",";
-      payload += "\"pwm_l\":" + String(snapPwmL) + ",";
-      payload += "\"pwm_r\":" + String(snapPwmR) + ",";
-      payload += "\"station\":\"" + String(snapStation) + "\",";
-      payload += "\"leg\":\"" + String(snapLeg) + "\",";
-      payload += "\"ack_id\":" + String(lastAckId) + ",";
-      payload += "\"auto_loop\":" + String(snapAutoLoop ? "true" : "false") + ",";
-      payload += "\"voltage\":" + String(liveBusV, 3) + ",";
-      payload += "\"current\":" + String(liveCurrentA, 3) + ",";
-      payload += "\"power\":" + String(livePowerW, 3) + ",";
-      payload += "\"energy_mah\":" + String(liveEnergyMah, 1) + ",";
-      payload += "\"ina_ok\":" + String(inaDetected ? "true" : "false") + ",";
-      payload += "\"state\":\"" + snapState + "\"";
-      payload += "}";
+      char payloadBuf[384];
+      snprintf(
+          payloadBuf, sizeof(payloadBuf),
+          "{\"x\":%.3f,\"y\":%.3f,\"yaw\":%.1f,\"dist\":%.3f,\"speed\":%.1f,"
+          "\"line_mask\":%d,\"line_err\":%.2f,\"ticks_l\":%ld,\"ticks_r\":%ld,"
+          "\"pwm_l\":%d,\"pwm_r\":%d,\"station\":\"%s\",\"leg\":\"%s\","
+          "\"ack_id\":%d,\"auto_loop\":%s,\"voltage\":%.3f,\"current\":%.3f,"
+          "\"power\":%.3f,\"energy_mah\":%.1f,\"ina_ok\":%s,\"state\":\"%s\"}",
+          snapX, snapY, snapYaw, snapDist, snapSpeed,
+          snapMask, snapLineErr, snapTicksL, snapTicksR,
+          snapPwmL, snapPwmR, snapStation, snapLeg,
+          lastAckId, snapAutoLoop ? "true" : "false", liveBusV, liveCurrentA,
+          livePowerW, liveEnergyMah, inaDetected ? "true" : "false", snapStatePtr);
+      String payload = String(payloadBuf);
 
       http.begin(serverUrl);
       http.addHeader("Content-Type", "application/json");
       http.addHeader("X-Device-Token", agv_device_token); // Xác thực bảo mật RBAC với Server WMS
+      http.addHeader("X-Payload-Signature", computeHmacSha256Hex32(payload)); // Chữ ký toàn vẹn gói tin HMAC-SHA256
       int httpCode = http.POST(payload);
 
       if (httpCode == 200) {
         consecutiveHttpErrors = 0;
-        lastKnownServerUrl = serverUrl;
         String resp = http.getString();
 
         // Đồng bộ kích thước Bản đồ động (map_w, map_h) thời gian thực từ Server
-        int mwIdx = resp.indexOf("\"map_w\":");
-        int mhIdx = resp.indexOf("\"map_h\":");
-        if (mwIdx >= 0 && mhIdx >= 0) {
-          int wStart = mwIdx + 8;
-          while (wStart < (int)resp.length() && resp.charAt(wStart) == ' ') wStart++;
-          int hStart = mhIdx + 8;
-          while (hStart < (int)resp.length() && resp.charAt(hStart) == ' ') hStart++;
-          float srvW = resp.substring(wStart).toFloat();
-          float srvH = resp.substring(hStart).toFloat();
+        float srvW = 0.0f, srvH = 0.0f;
+        if (extractJsonFloatField(resp, "map_w", srvW) && extractJsonFloatField(resp, "map_h", srvH)) {
           syncMapDimensionsFromServer(srvW, srvH);
         }
 
-        int idIdx = resp.indexOf("\"cmd_id\":");
-        int incomingId = 0;
-        if (idIdx >= 0) {
-          int numStart = idIdx + 9;
-          while (numStart < (int)resp.length() && resp.charAt(numStart) == ' ') numStart++;
-          incomingId = resp.substring(numStart).toInt();
-        }
+        float cmdIdFloat = 0.0f;
+        int incomingId = extractJsonFloatField(resp, "cmd_id", cmdIdFloat) ? (int)cmdIdFloat : 0;
 
-        // Trích xuất chính xác chuỗi cmd từ JSON (Tránh quét nhầm substring)
-        String cmdStr = "";
-        int cmdIdx = resp.indexOf("\"cmd\":");
-        if (cmdIdx >= 0) {
-          int valStart = cmdIdx + 6;
-          while (valStart < (int)resp.length() && resp.charAt(valStart) == ' ') valStart++;
-          if (valStart < (int)resp.length() && resp.charAt(valStart) == '\"') {
-            int valEnd = resp.indexOf('\"', valStart + 1);
-            if (valEnd > valStart) {
-              cmdStr = resp.substring(valStart + 1, valEnd);
-            }
+        // Trích xuất chuỗi cmd, route và chữ ký cmd_sig từ JSON bằng bộ hàm chung
+        char cmdBuf[48] = {0};
+        extractJsonStrField(resp, "cmd", cmdBuf, sizeof(cmdBuf));
+        char routeBuf[64] = {0};
+        extractJsonStrField(resp, "route", routeBuf, sizeof(routeBuf));
+        char sigBuf[40] = {0};
+        extractJsonStrField(resp, "cmd_sig", sigBuf, sizeof(sigBuf));
+        String cmdStr    = String(cmdBuf);
+        String routeStr  = String(routeBuf);
+        String cmdSigStr = String(sigBuf);
+
+        bool isNewCmd = (incomingId > lastAckId) || (lastAckId > 0 && incomingId == 1);
+        if (incomingId > 0 && isNewCmd && cmdStr.length() > 0) {
+          bool sigValid = true;
+          if (cmdSigStr.length() > 0) {
+            String canonical = String(incomingId) + ":" + cmdStr + ":" + routeStr;
+            String expectedSig = computeHmacSha256Hex32(canonical);
+            sigValid = constantTimeEquals(cmdSigStr, expectedSig);
           }
-        }
 
-        if (incomingId > 0 && incomingId != lastAckId && cmdStr.length() > 0) {
-          lastAckId = incomingId;
-          Serial.printf("\n>> [LỆNH MẠNG #%d]: cmd='%s'\n", incomingId, cmdStr.c_str());
+          if (!sigValid) {
+            Serial.printf("\n❌ [BẢO MẬT HMAC]: Từ chối lệnh #%d ('%s') do chữ ký cmd_sig không hợp lệ!\n",
+                          incomingId, cmdStr.c_str());
+          } else {
+            lastAckId = incomingId;
+            Serial.printf("\n>> [LỆNH MẠNG #%d]: cmd='%s' (HMAC Verified)\n", incomingId, cmdStr.c_str());
 
           // 1. Lệnh cơ bản
           if (cmdStr == "START") {
@@ -3114,6 +3082,7 @@ void telemetryTask(void *pvParameters) {
             liveEnergyWh = 0.0f;
             Serial.println(">> [LỆNH]: ĐÃ ĐẶT LẠI NĂNG LƯỢNG TIÊU THỤ VỀ 0.0 mAh!");
           }
+          } // end else (sigValid)
         }
       } else {
         consecutiveHttpErrors++;

@@ -5,7 +5,6 @@ QUẢN LÝ KẾT NỐI DATABASE SQLite THREAD-SAFE (AGV_VER2 WMS)
 """
 
 import sqlite3
-import os
 from pathlib import Path
 from contextlib import contextmanager
 

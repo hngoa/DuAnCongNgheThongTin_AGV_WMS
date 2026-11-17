@@ -770,7 +770,7 @@ async function triggerShot1() {
 }
 
 function exportCsv() {
-  window.location.href = `/api/export_csv?token=${ADMIN_TOKEN}`;
+  window.location.href = "/api/export_csv";
 }
 
 // ===================================================================================

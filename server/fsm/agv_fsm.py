@@ -7,10 +7,7 @@ THEO DÕI TRẠNG THÁI REAL-TIME, CẦU CHÌ AN TOÀN WATCHDOG & BẢO VỆ PIN
 
 from typing import Dict, Any, Optional
 import time
-try:
-    from .fsm_definitions import AGVState
-except ImportError:
-    from fsm_definitions import AGVState
+from fsm.fsm_definitions import AGVState
 
 class AGVStateMachine:
     """Quản lý trạng thái logic và an toàn của xe AGV trên Server"""

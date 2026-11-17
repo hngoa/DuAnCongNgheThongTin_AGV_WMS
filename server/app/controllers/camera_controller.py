@@ -5,10 +5,8 @@ NHẬN ẢNH TỪ APP ANDROID (CAMERAX), LƯU FILE & GỌI AI PHÂN LOẠI ĐI�
 ===================================================================================
 """
 
-from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
-import json
 import threading
 import time
 import re
@@ -174,7 +172,7 @@ class CameraController:
         return True
 
     def queue_command(self, cmd: str, metadata: Optional[Dict[str, Any]] = None) -> int:
-        """Phát lệnh điều khiển từ xa cho Camera điện thoại (CAPTURE_NOW, CAPTURE_AND_DISPATCH...)"""
+        """Phát lệnh điều khiển từ xa cho Camera điện thoại (CAPTURE_NOW, CAPTURE_AND_DISPATCH...) kèm chữ ký HMAC."""
         with self.lock:
             self.cam_cmd_id += 1
             self.pending_cam_cmd = cmd.strip().upper()
@@ -182,6 +180,13 @@ class CameraController:
             self.last_cmd_time = datetime.now().timestamp()
             self.latest_info["pending_cmd"] = self.pending_cam_cmd
             self.latest_info["pending_cmd_id"] = self.cam_cmd_id
+            try:
+                from app.services.security_service import SecurityService
+                self.latest_info["pending_cmd_sig"] = SecurityService.sign_command(
+                    self.cam_cmd_id, self.pending_cam_cmd, str(self.pending_cam_metadata.get("station", ""))
+                )
+            except Exception:
+                self.latest_info["pending_cmd_sig"] = ""
             print(f"📡 [Camera Controller] Phát lệnh #{self.cam_cmd_id} xuống điện thoại: {self.pending_cam_cmd} (Meta: {self.pending_cam_metadata})")
             return self.cam_cmd_id
 
@@ -435,11 +440,6 @@ class CameraController:
             "ai_result": ai_res,
             "image_url": img_url
         }
-
-    def verify_unload(self, img_bytes: bytes, station: str = "", task_id: Optional[int] = None) -> Tuple[int, Dict[str, Any]]:
-        """API tiện ích gọi trực tiếp để kiểm tra dỡ hàng Shot 2"""
-        awaiting_task = self.workflow_manager.task_repo.get_by_id(task_id) if task_id else None
-        return self._handle_shot_2_unload(img_bytes, station, awaiting_task)
 
     def get_latest_info(self) -> Dict[str, Any]:
         with self.lock:

@@ -15,7 +15,6 @@ for p in (SERVER_DIR, DB_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from db_connection import DB_PATH
 from seed_data import seed_database
 from repositories import (
     MapRepository,
@@ -131,6 +130,12 @@ def run_tests():
         state="AT_STATION_B", task_id=task_id
     )
     print("   ✅ Ghi thành công Log Telemetry có map_id")
+
+    if test_db.exists():
+        try:
+            test_db.unlink()
+        except Exception:
+            pass
 
     print("=" * 75)
     print("🎉 TẤT CẢ CÁC BÀI TEST V2.1 ĐÃ THÀNH CÔNG VƯỢT TRỘI (100% PASS)!")

@@ -11,44 +11,24 @@ import time
 from pathlib import Path
 
 import sys
-CURRENT_DIR = Path(__file__).resolve().parent
-DB_DIR = CURRENT_DIR.parent / "database"
-if str(DB_DIR) not in sys.path:
-    sys.path.insert(0, str(DB_DIR))
+SERVER_DIR = Path(__file__).resolve().parent.parent
+if str(SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(SERVER_DIR))
 
-try:
-    from database.db_connection import DB_PATH
-    from database.repositories import (
-        MapRepository,
-        InventoryRepository,
-        AllocationEngineRepository,
-        ProductRepository,
-        TaskRepository,
-        FleetRepository,
-        TelemetryRepository
-    )
-except ImportError:
-    from db_connection import DB_PATH
-    from repositories import (
-        MapRepository,
-        InventoryRepository,
-        AllocationEngineRepository,
-        ProductRepository,
-        TaskRepository,
-        FleetRepository,
-        TelemetryRepository
-    )
-
-try:
-    from .fsm_definitions import TaskState, AGVState
-    from .router import TopologicalRouter
-    from .task_fsm import TaskStateMachine
-    from .agv_fsm import AGVStateMachine
-except ImportError:
-    from fsm_definitions import TaskState, AGVState
-    from router import TopologicalRouter
-    from task_fsm import TaskStateMachine
-    from agv_fsm import AGVStateMachine
+from database.db_connection import DB_PATH
+from database.repositories import (
+    MapRepository,
+    InventoryRepository,
+    AllocationEngineRepository,
+    ProductRepository,
+    TaskRepository,
+    FleetRepository,
+    TelemetryRepository
+)
+from fsm.fsm_definitions import TaskState, AGVState
+from fsm.router import TopologicalRouter
+from fsm.task_fsm import TaskStateMachine
+from fsm.agv_fsm import AGVStateMachine
 
 class WMSWorkflowManager:
     """Bộ điều phối trung tâm quản lý luồng khép kín của hệ thống"""
@@ -730,21 +710,30 @@ class WMSWorkflowManager:
         ):
             self.map_repo.unlock_all_by_agv(self.agv_id, map_id)
 
-        # 4. Chuẩn bị gói lệnh phản hồi cho ESP32 (Kèm thông số Map và route_legs Dijkstra)
+        # 4. Chuẩn bị gói lệnh phản hồi cho ESP32 (Kèm thông số Map, route_legs Dijkstra và chữ ký số HMAC-SHA256)
         map_w = float(active_map_cfg.get("width_m", 1.54))
         map_h = float(active_map_cfg.get("length_m", 1.51))
         cmd_obj = self.agv_fsm.pending_command
         cmd_params = (cmd_obj.get("params") or {}) if cmd_obj else {}
+        cmd_str = cmd_obj["cmd"] if cmd_obj else None
+        cmd_id_val = cmd_obj["cmd_id"] if cmd_obj else 0
+        route_str = cmd_params.get("route", "")
+        try:
+            from app.services.security_service import SecurityService
+            cmd_sig = SecurityService.sign_command(cmd_id_val, cmd_str, route_str) if cmd_obj else ""
+        except Exception:
+            cmd_sig = ""
         return {
             "status": "ok",
             "map_id": map_id,
             "agv_state": agv_state.value,
             "map_w": map_w,
             "map_h": map_h,
-            "cmd": cmd_obj["cmd"] if cmd_obj else None,
-            "cmd_id": cmd_obj["cmd_id"] if cmd_obj else 0,
-            "route": cmd_params.get("route", ""),
-            "route_legs": cmd_params.get("route_legs", [])
+            "cmd": cmd_str,
+            "cmd_id": cmd_id_val,
+            "route": route_str,
+            "route_legs": cmd_params.get("route_legs", []),
+            "cmd_sig": cmd_sig
         }
 
     def confirm_unloading_with_vision(self, image_bytes: bytes, ai_service, 

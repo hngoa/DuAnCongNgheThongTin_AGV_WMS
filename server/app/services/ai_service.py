@@ -19,13 +19,11 @@ from pathlib import Path
 import sys
 import os
 import io
-import time
 import re
 import traceback
 
 # Vô hiệu hóa auto update của Ultralytics để tăng tốc suy luận và chống lỗi quyền ghi
 os.environ["YOLO_AUTO_INSTALL"] = "0"
-from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # Đường dẫn thư mục lưu weights trong server
@@ -486,52 +484,6 @@ class AIProductClassifierService:
                 by = max(0, y1 - th - 6)
                 draw.rectangle([bx, by, min(w, bx + tw + 8), y1], fill=color_rgb)
                 draw.text((bx + 4, max(0, by + 2)), banner_text, fill=(255, 255, 255), font=font)
-
-            buf = io.BytesIO()
-            img_out.save(buf, format="JPEG", quality=85)
-            return buf.getvalue()
-        except Exception:
-            return b""
-
-    def _generate_annotated_jpeg(
-        self,
-        pil_img: Image.Image,
-        bbox: list[int],
-        label_text: str,
-        confidence: float,
-        color_rgb: Tuple[int, int, int],
-    ) -> bytes:
-        """Vẽ khung Bounding Box và nhãn AI lên ảnh JPEG để phục vụ Web Dashboard."""
-        try:
-            img_out = pil_img.copy()
-            draw = ImageDraw.Draw(img_out)
-            w, h = img_out.size
-
-            x1, y1, x2, y2 = bbox
-            x1 = max(0, min(w - 1, x1))
-            y1 = max(0, min(h - 1, y1))
-            x2 = max(x1 + 1, min(w, x2))
-            y2 = max(y1 + 1, min(h, y2))
-
-            line_width = max(3, int(min(w, h) * 0.007))
-            for i in range(line_width):
-                draw.rectangle([x1 - i, y1 - i, x2 + i, y2 + i], outline=color_rgb)
-
-            font_size = max(14, int(min(w, h) * 0.026))
-            try:
-                font = ImageFont.truetype("arial.ttf", font_size)
-            except Exception:
-                font = ImageFont.load_default()
-
-            banner_text = f" {label_text} [{confidence * 100:.1f}%] "
-            try:
-                tb = draw.textbbox((x1, y1), banner_text, font=font)
-                tw, th = tb[2] - tb[0], tb[3] - tb[1]
-            except Exception:
-                tw, th = len(banner_text) * (font_size // 2), font_size + 4
-
-            draw.rectangle([x1, max(0, y1 - th - 6), x1 + tw + 8, y1], fill=color_rgb)
-            draw.text((x1 + 4, max(0, y1 - th - 4)), banner_text, fill=(255, 255, 255), font=font)
 
             buf = io.BytesIO()
             img_out.save(buf, format="JPEG", quality=85)

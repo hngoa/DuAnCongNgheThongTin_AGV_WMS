@@ -5,13 +5,8 @@ QUẢN LÝ QUÁ TRÌNH TỪ KHI CHỤP ẢNH, AI PHÂN LOẠI, ĐIỀU PHỐI Đ
 ===================================================================================
 """
 
-from typing import Optional, Dict, Any
-from datetime import datetime
-import time
-try:
-    from .fsm_definitions import TaskState
-except ImportError:
-    from fsm_definitions import TaskState
+from typing import Optional
+from fsm.fsm_definitions import TaskState
 
 class TaskStateMachine:
     """Quản lý các bước chuyển trạng thái và tính toàn vẹn của Task"""

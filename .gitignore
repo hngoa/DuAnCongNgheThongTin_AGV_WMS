@@ -6,4 +6,8 @@
 __pycache__/
 *.pyc
 server/database/test_*.db
+server/uploads/*.jpg
+.env
+include/secrets.h
+test/secrets.h
 
