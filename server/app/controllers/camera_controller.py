@@ -17,6 +17,8 @@ class CameraController:
     def __init__(self, workflow_manager, ai_service):
         self.workflow_manager = workflow_manager
         self.ai_service = ai_service
+        if ai_service is not None and getattr(ai_service, "workflow_manager", None) is None:
+            ai_service.workflow_manager = workflow_manager
         self.agv_controller = None
         self.latest_frame_bytes = None
         self.cam_cmd_id = 0
@@ -284,8 +286,11 @@ class CameraController:
         save_path.write_bytes(img_bytes)
         img_url = f"/images/{fname}"
 
-        # 2. Gọi AI phân loại sản phẩm
-        ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint)
+        # 2. Gọi AI phân loại sản phẩm (kèm tra cứu danh mục & trạm đích động từ DB)
+        try:
+            ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint, from_node=station)
+        except TypeError:
+            ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint)
         detected_code = ai_res.get("product_code", "PKG_ELEC")
         conf = float(ai_res.get("confidence", 0.95))
         dec_status = ai_res.get("decision_status", "CLASSIFIED")
@@ -394,7 +399,10 @@ class CameraController:
         save_path.write_bytes(img_bytes)
         img_url = f"/images/{fname}"
 
-        ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint)
+        try:
+            ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint, from_node=station)
+        except TypeError:
+            ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint)
         annotated_bytes = ai_res.get("annotated_bytes")
         if annotated_bytes:
             ann_fname = f"annotated_{fname}"
@@ -417,14 +425,23 @@ class CameraController:
             station=station,
             task_id=task_id,
             ai_res=ai_res,
-            product_hint=product_hint
+            product_hint=product_hint,
+            image_path=str(save_path)
         )
+
+        next_m = unload_res.get("next_mission") or {}
+        if unload_res.get("status") == "MISSION_ADVANCED" and next_m.get("product_code") not in (None, "", "NONE"):
+            display_prod_code = next_m["product_code"]
+        elif unload_res.get("unloaded"):
+            display_prod_code = "KHAY_TRỐNG (ĐÃ DỠ)"
+        else:
+            display_prod_code = ai_res.get("product_code")
 
         with self.lock:
             self.latest_info.update({
                 "online": True,
                 "received_at": datetime.now().strftime("%H:%M:%S"),
-                "product_code": "KHAY_TRỐNG (ĐÃ DỠ)" if unload_res.get("unloaded") else ai_res.get("product_code"),
+                "product_code": display_prod_code,
                 "confidence": float(ai_res.get("confidence", 0.0)),
                 "task_id": unload_res.get("task_id", 0),
                 "image_url": img_url,

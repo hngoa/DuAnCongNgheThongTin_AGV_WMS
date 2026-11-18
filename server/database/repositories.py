@@ -298,26 +298,117 @@ class AllocationEngineRepository:
             return [dict(r) for r in rows]
 
     def save_rule(self, map_id: str, product_category: str, target_node_id: str, 
-                  product_code: Optional[str] = None, priority: int = 1) -> bool:
+                  product_code: Optional[str] = None, priority: int = 1,
+                  replace_product_rules: bool = False) -> bool:
         """Thêm hoặc cập nhật luật phân bổ kho đích"""
+        m_id = map_id.strip()
+        cat = (product_category or "*").strip().upper()
+        target = target_node_id.strip().upper()
+        p_code = product_code.strip().upper() if product_code and str(product_code).strip() else None
+        prio = max(1, int(priority))
+
         with get_db(self.db_file) as conn:
-            # Xóa quy tắc trùng cũ nếu có
-            if product_code:
+            if p_code and replace_product_rules:
                 conn.execute("""
                     DELETE FROM allocation_rules 
                     WHERE map_id = ? AND product_code = ?;
-                """, (map_id.strip(), product_code.strip()))
+                """, (m_id, p_code))
+            elif p_code:
+                conn.execute("""
+                    DELETE FROM allocation_rules 
+                    WHERE map_id = ? AND product_code = ? AND target_node_id = ?;
+                """, (m_id, p_code, target))
             else:
                 conn.execute("""
                     DELETE FROM allocation_rules 
-                    WHERE map_id = ? AND product_category = ? AND target_node_id = ?;
-                """, (map_id.strip(), product_category.strip(), target_node_id.strip()))
+                    WHERE map_id = ? AND product_category = ? AND product_code IS NULL AND target_node_id = ?;
+                """, (m_id, cat, target))
 
             conn.execute("""
                 INSERT INTO allocation_rules (map_id, product_category, product_code, target_node_id, priority, is_active)
                 VALUES (?, ?, ?, ?, ?, 1);
-            """, (map_id.strip(), product_category.strip(), product_code.strip() if product_code else None, target_node_id.strip(), priority))
+            """, (m_id, cat, p_code, target, prio))
             return True
+
+    def replace_product_target_rule(self, map_id: str, product_code: str, category: str,
+                                    target_node_id: str, priority: int = 1) -> bool:
+        """Thay thế trực tiếp trạm đích cho một mã sản phẩm trên bản đồ.
+
+        Xóa mọi luật cũ gắn riêng cho product_code trên map_id (và nếu không có sản phẩm nào khác
+        dùng chung category, dọn luôn luật mặc định theo category cũ để tránh xung đột kho cũ),
+        rồi lưu quy tắc trạm đích mới.
+        """
+        m_id = map_id.strip()
+        p_code = product_code.strip().upper()
+        cat = (category or "GENERAL").strip().upper()
+        target = target_node_id.strip().upper()
+        prio = max(1, int(priority))
+
+        with get_db(self.db_file) as conn:
+            conn.execute(
+                "DELETE FROM allocation_rules WHERE map_id = ? AND product_code = ?;",
+                (m_id, p_code),
+            )
+            other_same_cat = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE category = ? AND product_code != ?;",
+                (cat, p_code),
+            ).fetchone()[0]
+            if other_same_cat == 0 and cat != "*":
+                conn.execute(
+                    "DELETE FROM allocation_rules WHERE map_id = ? AND product_category = ? AND (product_code IS NULL OR product_code = '');",
+                    (m_id, cat),
+                )
+            conn.execute("""
+                INSERT INTO allocation_rules (map_id, product_category, product_code, target_node_id, priority, is_active)
+                VALUES (?, ?, ?, ?, ?, 1);
+            """, (m_id, cat, p_code, target, prio))
+            return True
+
+    def delete_rules_for_product(self, product_code: str, map_id: Optional[str] = None) -> bool:
+        """Xóa toàn bộ quy tắc phân bổ gắn với một mã sản phẩm."""
+        p_code = product_code.strip().upper()
+        with get_db(self.db_file) as conn:
+            if map_id:
+                conn.execute(
+                    "DELETE FROM allocation_rules WHERE map_id = ? AND product_code = ?;",
+                    (map_id.strip(), p_code),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM allocation_rules WHERE product_code = ?;",
+                    (p_code,),
+                )
+            return True
+
+    def get_rules_for_product(self, map_id: str, product_code: str, category: str) -> List[Dict[str, Any]]:
+        """Lấy toàn bộ luật khớp trực tiếp hoặc theo nhóm cho một sản phẩm theo thứ tự ưu tiên."""
+        p_code = (product_code or "").strip().upper()
+        cat = (category or "").strip().upper()
+        with get_db(self.db_file) as conn:
+            rows = conn.execute("""
+                SELECT * FROM allocation_rules
+                WHERE map_id = ? AND is_active = 1
+                  AND (
+                    product_code = ?
+                    OR ((product_code IS NULL OR product_code = '') AND (product_category = ? OR product_category = '*'))
+                  )
+                ORDER BY priority ASC, rule_id ASC;
+            """, (map_id, p_code, cat)).fetchall()
+
+        ranked: List[Dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            if item.get("product_code") == p_code:
+                tier = 0
+            elif item.get("product_category") == "*":
+                tier = 2
+            else:
+                tier = 1
+            item["_tier"] = tier
+            ranked.append(item)
+
+        ranked.sort(key=lambda x: (x["_tier"], int(x.get("priority", 1)), int(x.get("rule_id", 0))))
+        return ranked
 
     def delete_rule(self, rule_id: int) -> bool:
         """Xóa một quy tắc phân bổ"""
@@ -328,110 +419,92 @@ class AllocationEngineRepository:
     def allocate_target_node(self, map_id: str, product_code: str, category: str) -> Optional[Dict[str, Any]]:
         """
         Xác định trạm kho đích tối ưu cho sản phẩm dựa trên:
-          1. Quy tắc cấu hình ưu tiên (Priority Rules)
-          2. Kiểm tra sức chứa còn lại của kho (Capacity Check)
-          3. Nếu kho ưu tiên bị đầy -> Tự động chuyển sang kho dự phòng tiếp theo
+          1. Mức độ đặc hiệu: Luật theo product_code > Luật theo product_category > Dự phòng '*'
+          2. Quy tắc cấu hình ưu tiên (Priority ASC)
+          3. Kiểm tra sức chứa còn lại của kho (Capacity Check)
         """
-        with get_db(self.db_file) as conn:
-            # Tìm các quy tắc phù hợp với sản phẩm hoặc nhóm hàng
-            rules = conn.execute("""
-                SELECT * FROM allocation_rules 
-                WHERE map_id = ? AND is_active = 1 
-                  AND (product_code = ? OR product_category = ? OR product_category = '*')
-                ORDER BY priority ASC;
-            """, (map_id, product_code, category)).fetchall()
+        rules = self.get_rules_for_product(map_id, product_code, category)
+        for r in rules:
+            target_node = r["target_node_id"]
+            cap = self.inv_repo.get_node_capacity(map_id, target_node)
+            if cap.get("has_space", False):
+                return {
+                    "target_node_id": target_node,
+                    "strategy": "RULE_MATCHED",
+                    "rule_id": r["rule_id"],
+                    "available_slots": cap["available_slots"]
+                }
 
-            for r in rules:
-                target_node = r["target_node_id"]
-                # Kiểm tra trạm này có còn sức chứa không
-                cap = self.inv_repo.get_node_capacity(map_id, target_node)
-                if cap.get("has_space", False):
-                    return {
-                        "target_node_id": target_node,
-                        "strategy": "RULE_MATCHED",
-                        "rule_id": r["rule_id"],
-                        "available_slots": cap["available_slots"]
-                    }
-
-            return None # Tất cả các kho đều đã đầy!
+        return None # Tất cả các kho đều đã đầy!
 
     def allocate_nearest_target_node(self, map_id: str, product_code: str, category: str, 
                                      from_node: str = "A", router: Optional[Any] = None,
                                      current_agv_id: str = "AGV_Ver2") -> Optional[Dict[str, Any]]:
         """
         Xác định trạm kho đích GẦN NHẤT cho sản phẩm dựa trên:
-          1. Lọc các kho hợp lệ theo loại hàng (product_code / category / '*')
-          2. Kiểm tra sức chứa còn lại của từng kho (Capacity check > 0)
-          3. Tính khoảng cách Dijkstra ngắn nhất từ vị trí xe hiện tại (from_node) đến từng kho khả dụng
-          4. Tự động chọn kho gần nhất (min Dijkstra distance). Nếu khoảng cách bằng nhau, ưu tiên rule priority cao hơn.
+          1. Mức độ đặc hiệu (Luật riêng product_code > Luật nhóm category > Dự phòng '*')
+          2. Độ ưu tiên (priority ASC) trong từng tầng
+          3. Nếu nhiều kho hợp lệ cùng độ ưu tiên: chọn kho có khoảng cách Dijkstra gần nhất từ vị trí xe hiện tại
         """
-        with get_db(self.db_file) as conn:
-            rules = conn.execute("""
-                SELECT * FROM allocation_rules 
-                WHERE map_id = ? AND is_active = 1 
-                  AND (product_code = ? OR product_category = ? OR product_category = '*')
-                ORDER BY priority ASC;
-            """, (map_id, product_code, category)).fetchall()
+        rules = self.get_rules_for_product(map_id, product_code, category)
+        if not rules:
+            return None
 
-            if not rules:
-                return None
+        candidates = []
+        seen_nodes = set()
+        for r in rules:
+            target_node = r["target_node_id"]
+            if target_node == from_node:
+                continue # Không giao hàng về chính trạm xuất phát
+            if target_node in seen_nodes:
+                continue
+            seen_nodes.add(target_node)
 
-            candidates = []
-            seen_nodes = set()
-            for r in rules:
-                target_node = r["target_node_id"]
-                if target_node == from_node:
-                    continue # Không giao hàng về chính trạm xuất phát
-                if target_node in seen_nodes:
-                    continue
-                seen_nodes.add(target_node)
+            # Kiểm tra trạm này có còn sức chứa không
+            cap = self.inv_repo.get_node_capacity(map_id, target_node)
+            if not cap.get("has_space", False):
+                continue
 
-                # Kiểm tra trạm này có còn sức chứa không
-                cap = self.inv_repo.get_node_capacity(map_id, target_node)
-                if not cap.get("has_space", False):
-                    continue
+            dist_m = 1.0
+            path_info = None
+            if router is not None:
+                path_info = router.find_shortest_path(from_node, target_node, current_agv_id=current_agv_id)
+                if not path_info:
+                    continue # Đường đi bị nghẽn do khóa đoạn line hoặc không thông đường
+                dist_m = float(path_info.get("total_distance_m", 1.0))
 
-                dist_m = 1.0
-                path_info = None
-                if router is not None:
-                    path_info = router.find_shortest_path(from_node, target_node, current_agv_id=current_agv_id)
-                    if not path_info:
-                        continue # Đường đi bị nghẽn do khóa đoạn line hoặc không thông đường
-                    dist_m = float(path_info.get("total_distance_m", 1.0))
+            candidates.append({
+                "target_node_id": target_node,
+                "distance_m": dist_m,
+                "priority": int(r.get("priority", 1)),
+                "tier": int(r.get("_tier", 1)),
+                "rule_id": r["rule_id"],
+                "available_slots": cap["available_slots"],
+                "path_info": path_info
+            })
 
-                is_fallback = (r["product_category"] == "*")
-                candidates.append({
-                    "target_node_id": target_node,
-                    "distance_m": dist_m,
-                    "priority": r["priority"],
-                    "is_fallback": is_fallback,
-                    "rule_id": r["rule_id"],
-                    "available_slots": cap["available_slots"],
-                    "path_info": path_info
-                })
+        if not candidates:
+            return None
 
-            if not candidates:
-                return None
+        # Sắp xếp ưu tiên:
+        # 1. Luật đích danh product_code (tier 0) > luật theo category (tier 1) > dự phòng '*' (tier 2)
+        # 2. Độ ưu tiên cấu hình (priority ASC)
+        # 3. Kho gần nhất theo Dijkstra (distance_m ASC)
+        candidates.sort(key=lambda c: (c["tier"], c["priority"], c["distance_m"]))
 
-            # Sắp xếp ưu tiên:
-            # 1. Ưu tiên rule chỉ định đích danh nhóm hàng (not is_fallback)
-            # 2. Ưu tiên kho có khoảng cách Dijkstra gần nhất (distance_m ASC)
-            # 3. Ưu tiên thứ tự priority nhỏ hơn
-            candidates.sort(key=lambda c: (1 if c["is_fallback"] else 0, c["distance_m"], c["priority"]))
-
-            best = candidates[0]
-            return {
-                "target_node_id": best["target_node_id"],
-                "strategy": "NEAREST_DISTANCE",
-                "distance_m": best["distance_m"],
-                "rule_id": best["rule_id"],
-                "available_slots": best["available_slots"],
-                "path_info": best.get("path_info")
-            }
+        best = candidates[0]
+        return {
+            "target_node_id": best["target_node_id"],
+            "strategy": "NEAREST_DISTANCE",
+            "distance_m": best["distance_m"],
+            "rule_id": best["rule_id"],
+            "available_slots": best["available_slots"],
+            "path_info": best.get("path_info")
+        }
 
 
 class ProductRepository:
-    """Quản lý danh mục sản phẩm và ánh xạ nhãn AI YOLOv11"""
+    """Quản lý danh mục sản phẩm và ánh xạ nhãn AI MobileNetV3"""
     def __init__(self, db_file: Path = DB_PATH):
         self.db_file = db_file
 
@@ -443,6 +516,11 @@ class ProductRepository:
     def get_by_code(self, product_code: str) -> Optional[Dict[str, Any]]:
         with get_db(self.db_file) as conn:
             row = conn.execute("SELECT * FROM products WHERE product_code = ?;", (product_code,)).fetchone()
+            return dict(row) if row else None
+
+    def get_by_class_id(self, yolo_class_id: int) -> Optional[Dict[str, Any]]:
+        with get_db(self.db_file) as conn:
+            row = conn.execute("SELECT * FROM products WHERE yolo_class_id = ?;", (int(yolo_class_id),)).fetchone()
             return dict(row) if row else None
 
     def save_product(self, product_code: str, product_name: str, yolo_class_id: int, 

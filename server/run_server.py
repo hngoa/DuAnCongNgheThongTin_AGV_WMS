@@ -43,14 +43,14 @@ def main():
     print("      AGV_VER2 - WMS DIGITAL TWIN & SMART DISPATCHING SERVER (V2.1)")
     print("=" * 75)
 
-    # 1. Khởi tạo Cơ sở dữ liệu và nạp cấu hình sa bàn
-    print(">> [1/4] Đang khởi tạo Cơ sở dữ liệu SQLite & Cấu hình Bản đồ...")
-    seed_database(DB_PATH)
+    # 1. Khởi tạo Cơ sở dữ liệu (giữ nguyên cấu hình sản phẩm, trạm & tồn kho nếu đã tồn tại)
+    print(">> [1/4] Đang kiểm tra & khởi tạo Cơ sở dữ liệu SQLite...")
+    seed_database(DB_PATH, reset=False)
 
     # 2. Khởi tạo Bộ điều phối Workflow FSM & Dịch vụ AI
     print(">> [2/4] Đang nạp Bộ điều phối Workflow & Dịch vụ Trí tuệ Nhân tạo AI...")
     workflow_manager = WMSWorkflowManager(DB_PATH, agv_id="AGV_Ver2")
-    ai_service = AIProductClassifierService()
+    ai_service = AIProductClassifierService(workflow_manager=workflow_manager)
 
     # 3. Khởi tạo các Controllers & Tiêm phụ thuộc (Dependency Injection)
     print(">> [3/4] Đang kết nối Controllers & Tầng điều phối HTTP Router...")

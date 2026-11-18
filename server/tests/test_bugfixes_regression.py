@@ -320,11 +320,12 @@ def run_tests():
     assert cam_router.get_latest_info()["online"] is True
     print("   ✅ [12/12] Router phân biệt chính xác Web Dashboard vs Android Camera trên GET /api/state")
 
-    # 13. AIProductClassifierService._fuse_box_prediction + Safety Gate NEEDS_REVIEW trên Shot 1 & Shot 2
+    # 13. Đánh giá kết quả MobileNetV3 (best.pth) + OpenCV Geometry & Safety Gate NEEDS_REVIEW trên Shot 1 & Shot 2
     from types import SimpleNamespace
     from PIL import Image
+    import tempfile
 
-    # (a) Không cho YOLO (0.836) ghi đè kết luận đã có OpenCV xác nhận (GEOMETRY_CONFIRM_PRISM)
+    # (a) Giữ nguyên kết luận GEOMETRY_CONFIRM_PRISM từ HybridClassifier (không có YOLO ghi đè)
     pred_prism_confirmed = SimpleNamespace(
         decision_status="CLASSIFIED",
         predicted_class="triangular_prism",
@@ -336,33 +337,35 @@ def run_tests():
         geometry_candidate="triangular_prism",
         geometry_quality="HIGH",
     )
-    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._fuse_box_prediction(
-        pred_prism_confirmed, y_cls="rectangular_box", y_conf=0.836
-    )
-    assert f_st == "CLASSIFIED" and f_cls == "triangular_prism" and f_rule == "GEOMETRY_CONFIRM_PRISM", (
-        f"YOLO không được đè GEOMETRY_CONFIRM_PRISM: {(f_cls, f_conf, f_st, f_rule)}"
+    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._evaluate_mobilenet_prediction(pred_prism_confirmed)
+    assert f_st == "CLASSIFIED" and f_cls == "triangular_prism" and f_conf == 0.621 and f_rule == "GEOMETRY_CONFIRM_PRISM", (
+        f"Sai đánh giá GEOMETRY_CONFIRM_PRISM: {(f_cls, f_conf, f_st, f_rule)}"
     )
 
-    # (b) Đồng thuận 2/3 YOLO + OpenCV cứu MobileNet yếu/mờ chưa có Geo xác nhận
-    pred_box_rescued = SimpleNamespace(
+    # (b) Bảo toàn kết luận GEOMETRY_OVERRIDE_BOX / MOBILENET_DIRECT từ MobileNetV3 + OpenCV Geometry
+    pred_box_override = SimpleNamespace(
         decision_status="CLASSIFIED",
-        predicted_class="triangular_prism",
-        confidence=0.617,
-        decision_type="MOBILENET_DIRECT",
-        mobilenet_class_name="triangular_prism",
-        mobilenet_confidence=0.617,
-        mobilenet_probabilities={"cylinder": 0.371, "rectangular_box": 0.012, "triangular_prism": 0.617},
-        geometry_candidate="rectangular_box",
-        geometry_quality="HIGH",
+        predicted_class="rectangular_box",
+        confidence=0.812,
+        decision_type="GEOMETRY_OVERRIDE_BOX",
     )
-    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._fuse_box_prediction(
-        pred_box_rescued, y_cls="rectangular_box", y_conf=0.610
-    )
-    assert f_st == "CLASSIFIED" and f_cls == "rectangular_box" and f_rule == "YOLO_GEOMETRY_CONSENSUS", (
-        f"Phải chọn đồng thuận 2/3 YOLO+OpenCV: {(f_cls, f_conf, f_st, f_rule)}"
+    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._evaluate_mobilenet_prediction(pred_box_override)
+    assert f_st == "CLASSIFIED" and f_cls == "rectangular_box" and f_conf == 0.812 and f_rule == "GEOMETRY_OVERRIDE_BOX", (
+        f"Sai đánh giá GEOMETRY_OVERRIDE_BOX: {(f_cls, f_conf, f_st, f_rule)}"
     )
 
-    # (c) Bảo toàn NEEDS_REVIEW thay vì ép mặc định rectangular_box khi cả 3 nguồn bất đồng
+    pred_direct_empty_type = SimpleNamespace(
+        decision_status="CLASSIFIED",
+        predicted_class="cylinder",
+        confidence=0.9534,
+        decision_type="",
+    )
+    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._evaluate_mobilenet_prediction(pred_direct_empty_type)
+    assert f_st == "CLASSIFIED" and f_cls == "cylinder" and f_conf == 0.953 and f_rule == "MOBILENET_HYBRID_CLASSIFIED", (
+        f"Sai đánh giá fallback decision_type: {(f_cls, f_conf, f_st, f_rule)}"
+    )
+
+    # (c) Bảo toàn NEEDS_REVIEW khi MobileNet và OpenCV bất đồng / thiếu tự tin
     pred_ambig = SimpleNamespace(
         decision_status="NEEDS_REVIEW",
         predicted_class=None,
@@ -374,71 +377,34 @@ def run_tests():
         geometry_candidate="triangular_prism",
         geometry_quality="HIGH",
     )
-    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._fuse_box_prediction(
-        pred_ambig, y_cls="rectangular_box", y_conf=0.562
-    )
-    assert f_st == "NEEDS_REVIEW" and f_cls is None and f_conf == 0.0, (
-        f"Phải giữ NEEDS_REVIEW thay vì ép rectangular_box: {(f_cls, f_conf, f_st, f_rule)}"
+    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._evaluate_mobilenet_prediction(pred_ambig)
+    assert f_st == "NEEDS_REVIEW" and f_cls is None and f_conf == 0.0 and f_rule == "NEEDS_REVIEW", (
+        f"Phải giữ NEEDS_REVIEW: {(f_cls, f_conf, f_st, f_rule)}"
     )
 
-    # (d) Giải tỏa NEEDS_REVIEW nếu YOLO >= 0.45 đồng thuận với MobileNet
-    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._fuse_box_prediction(
-        pred_ambig, y_cls="cylinder", y_conf=0.726
-    )
-    assert f_st == "CLASSIFIED" and f_cls == "cylinder" and f_rule == "YOLO_TIEBREAK_REVIEW", (
-        f"YOLO+MobileNet đồng thuận phải giải tỏa NEEDS_REVIEW: {(f_cls, f_conf, f_st, f_rule)}"
-    )
-
-    # (d2) Phủ quyết GEOMETRY_OVERRIDE lỗi [0%] khi YOLO + MobileNet cùng chắc chắn cylinder
-    pred_bad_override = SimpleNamespace(
+    # (d) Từ chối nhãn lạ ngoài CLASS_TO_WMS_MAPPING
+    pred_unknown = SimpleNamespace(
         decision_status="CLASSIFIED",
-        predicted_class="triangular_prism",
-        confidence=0.0001,
-        decision_type="GEOMETRY_OVERRIDE_PRISM",
-        mobilenet_class_name="cylinder",
-        mobilenet_confidence=0.9999,
-        mobilenet_probabilities={"cylinder": 0.9999, "rectangular_box": 0.0, "triangular_prism": 0.0001},
-        geometry_candidate="triangular_prism",
-        geometry_quality="HIGH",
+        predicted_class="unknown_shape",
+        confidence=0.99,
+        decision_type="MOBILENET_DIRECT",
     )
-    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._fuse_box_prediction(
-        pred_bad_override, y_cls="cylinder", y_conf=0.850
-    )
-    assert f_st == "CLASSIFIED" and f_cls == "cylinder" and f_conf >= 0.99 and f_rule == "YOLO_MOBILENET_MAJORITY", (
-        f"YOLO+MobileNet 2/3 phải thắng GEOMETRY_OVERRIDE 0%: {(f_cls, f_conf, f_st, f_rule)}"
-    )
-
-    # (d3) Giải tỏa NEEDS_REVIEW cho hộp chữ nhật khi YOLO >= 0.75 + OpenCV thấy đường vuông góc & extent >= 0.85
-    pred_ortho_review = SimpleNamespace(
-        decision_status="NEEDS_REVIEW",
-        predicted_class=None,
-        confidence=0.0,
-        decision_type="NEEDS_REVIEW",
-        mobilenet_class_name="cylinder",
-        mobilenet_confidence=0.740,
-        mobilenet_probabilities={"cylinder": 0.740, "rectangular_box": 0.106, "triangular_prism": 0.155},
-        geometry_candidate="triangular_prism",
-        geometry_quality="HIGH",
-        geometry_evidence={"extent": 0.93, "diagnostic_flags": {"has_strictly_orthogonal_lines": True}},
-    )
-    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._fuse_box_prediction(
-        pred_ortho_review, y_cls="rectangular_box", y_conf=0.838
-    )
-    assert f_st == "CLASSIFIED" and f_cls == "rectangular_box" and f_rule == "YOLO_TIEBREAK_REVIEW", (
-        f"YOLO+Ortho Box phải giải tỏa NEEDS_REVIEW: {(f_cls, f_conf, f_st, f_rule)}"
+    f_cls, f_conf, f_st, f_rule = AIProductClassifierService._evaluate_mobilenet_prediction(pred_unknown)
+    assert f_st == "NEEDS_REVIEW" and f_cls is None and f_conf == 0.0, (
+        f"Nhãn lạ không được phép CLASSIFIED: {(f_cls, f_conf, f_st, f_rule)}"
     )
 
     # (e) End-to-end Shot 1 (không tạo task) & Shot 2 (không báo unloaded=True) khi AI trả về NEEDS_REVIEW
     mock_ai = object.__new__(AIProductClassifierService)
+    mock_ai.yolo_path = None
     mock_ai.is_placeholder_mode = False
-    mock_ai.engine_name = "Mock_Hybrid"
+    mock_ai.engine_name = "MobileNetV3_OpenCV_Hybrid"
     mock_det = SimpleNamespace(
-        yolo_detections={(10, 10, 110, 110): {"class_name": "rectangular_box", "conf": 0.56}},
         detect=lambda im: ((10, 10, 110, 110), 1, [(10, 10, 110, 110)]),
     )
     mock_ai.predictor = SimpleNamespace(
         classifier=SimpleNamespace(detector=mock_det),
-        predict=lambda im, bbox=None, input_mode="pre_cropped_roi": pred_ambig,
+        predict=lambda im, bbox=None, input_mode="pre_cropped_roi", **kwargs: pred_ambig,
     )
     buf_jpg = io.BytesIO()
     Image.new("RGB", (128, 128), color=(80, 90, 100)).save(buf_jpg, format="JPEG")
@@ -469,7 +435,66 @@ def run_tests():
         image_bytes=real_jpg_bytes, ai_service=mock_ai, station="B", ai_res=ai_review_res
     )
     assert unload_nr["unloaded"] is False and unload_nr["status"] == "NEEDS_REVIEW", unload_nr
-    print("   ✅ [13/13] Fusion YOLO+Hybrid+OpenCV chuẩn xác & Safety Gate NEEDS_REVIEW chặn sai ở Shot 1/Shot 2")
+
+    # (f) OpenCV ROI báo khay trống (NO_OBJECT) khi không có foreground nào trên khay
+    mock_ai.predictor = SimpleNamespace(
+        classifier=SimpleNamespace(detector=SimpleNamespace(detect=lambda im: (None, 0, []))),
+        predict=lambda *args, **kwargs: pred_ambig,
+    )
+    res_empty = mock_ai.classify_image(real_jpg_bytes)
+    assert res_empty["product_code"] == "NONE" and res_empty["decision_status"] == "NO_OBJECT"
+    assert res_empty["detected_items"] == [] and res_empty["total_detected"] == 0 and res_empty["success"] is False
+
+    # (g) Multi-object (3 boxes từ OpenCV ROI) truyền pad_ratio=0.06 và phân loại đủ cả 3 sản phẩm bằng MobileNet
+    multi_boxes = [(8, 8, 40, 60), (45, 8, 80, 60), (85, 8, 120, 60)]
+    multi_preds = iter([
+        SimpleNamespace(decision_status="CLASSIFIED", predicted_class="rectangular_box", confidence=0.91, decision_type="MOBILENET_DIRECT"),
+        SimpleNamespace(decision_status="CLASSIFIED", predicted_class="cylinder", confidence=0.94, decision_type="MOBILENET_DIRECT"),
+        SimpleNamespace(decision_status="CLASSIFIED", predicted_class="triangular_prism", confidence=0.88, decision_type="GEOMETRY_CONFIRM_PRISM"),
+    ])
+    recorded_calls = []
+
+    def _mock_multi_predict(im, bbox=None, input_mode="pre_cropped_roi", **kwargs):
+        recorded_calls.append((bbox, kwargs))
+        return next(multi_preds)
+
+    mock_ai.predictor = SimpleNamespace(
+        classifier=SimpleNamespace(detector=SimpleNamespace(detect=lambda im: (multi_boxes[0], 3, multi_boxes))),
+        predict=_mock_multi_predict,
+    )
+    res_multi = mock_ai.classify_image(real_jpg_bytes)
+    assert res_multi["decision_status"] == "CLASSIFIED" and res_multi["total_detected"] == 3, res_multi
+    assert [i["product_code"] for i in res_multi["detected_items"]] == ["PKG_ELEC", "PKG_MECH", "PKG_TOOL"]
+    assert len(recorded_calls) == 3 and all(kw.get("pad_ratio") == 0.06 for _, kw in recorded_calls), recorded_calls
+
+    # (h) _init_engine nạp thành công chỉ với best.pth (không cần file YOLO yolo11n_v5b_best.pt)
+    captured_init = {}
+
+    class _DummyHybridPredictor:
+        def __init__(self, **kwargs):
+            captured_init.update(kwargs)
+
+    prev_predict_mod = sys.modules.get("predict")
+    try:
+        sys.modules["predict"] = SimpleNamespace(HybridPredictor=_DummyHybridPredictor)
+        with tempfile.TemporaryDirectory() as tmp_wdir:
+            tmp_best = Path(tmp_wdir) / "best.pth"
+            tmp_best.write_bytes(b"stub_checkpoint")
+            svc_only_mobilenet = AIProductClassifierService(model_path=tmp_best)
+            assert svc_only_mobilenet.yolo_path is None
+            assert svc_only_mobilenet.is_placeholder_mode is False
+            assert svc_only_mobilenet.engine_name == "MobileNetV3_OpenCV_Hybrid"
+            assert captured_init.get("checkpoint_path") == tmp_best
+            assert captured_init.get("require_yolo") is False
+            assert captured_init.get("allow_opencv_fallback") is True
+            assert "yolo_path" not in captured_init
+    finally:
+        if prev_predict_mod is None:
+            sys.modules.pop("predict", None)
+        else:
+            sys.modules["predict"] = prev_predict_mod
+
+    print("   ✅ [13/15] MobileNetV3-only (best.pth + OpenCV) & Safety Gate NEEDS_REVIEW/NO_OBJECT/Multi-box chuẩn xác")
 
     # 14. Lọc khung lồng nhau (nested duplicate) ở ObjectDetector nếu có OpenCV/weights
     try:
@@ -601,7 +626,148 @@ def run_tests():
     c_locked, _, _ = _sim_http("GET", "/api/state", {"X-Device-Token": ADMIN_API_TOKEN}, client_ip=brute_ip)
     assert c_locked == 429, f"IP vượt ngưỡng brute-force phải trả 429! Got {c_locked}"
     SecurityService.reset_rate_limits()
-    print("   ✅ [15/15] Bảo mật IoT đa tầng (Anti-Spoofing, HMAC-SHA256, Least-Privilege RBAC, 413 DoS, 403 PathTraversal, 429 RateLimit)")
+    print("   ✅ [15/16] Bảo mật IoT đa tầng (Anti-Spoofing, HMAC-SHA256, Least-Privilege RBAC, 413 DoS, 403 PathTraversal, 429 RateLimit)")
+
+    # 16. Điều phối trực tiếp đường ngắn nhất từ trạm kho (B -> C) khi Shot 2 phát hiện hàng tiếp theo thay vì quay về A
+    agv_ctrl.handle_command({"action": "abort_missions"})
+    agv_ctrl.handle_telemetry({
+        "x": 0.0, "y": 0.0, "yaw": 90.0, "speed": 0.0,
+        "voltage": 12.4, "ina_ok": True, "state": "STOPPED", "station": "A", "map_id": active_map_id
+    })
+    d_ab = manager.handle_inbound_package(active_map_id, "PKG_ELEC", ai_confidence=0.95, from_node="A")
+    assert d_ab["success"] is True and d_ab["route_path"] == "A->B"
+    tid_ab = d_ab["task_id"]
+    cmd_ab = d_ab["command"]["cmd_id"]
+    agv_ctrl.handle_telemetry({
+        "x": 0.0, "y": 1.51, "yaw": 90.0, "speed": 0.0,
+        "voltage": 12.4, "ina_ok": True, "state": "AT_STATION", "station": "B",
+        "ack_id": cmd_ab, "map_id": active_map_id
+    })
+    # Tại trạm B, Shot 2 thấy PKG_ELEC đã được lấy xuống và có PKG_MECH (đi trạm C) trên khay
+    ai_shot2_at_b = {
+        "success": True,
+        "decision_status": "CLASSIFIED",
+        "product_code": "PKG_MECH",
+        "product_name": "Chi Tiết Bánh Răng & Khớp Nối",
+        "category": "MECHANICAL",
+        "target_station": "C",
+        "confidence": 0.99,
+        "detected_items": [{
+            "product_code": "PKG_MECH",
+            "product_name": "Chi Tiết Bánh Răng & Khớp Nối",
+            "category": "MECHANICAL",
+            "target_station": "C",
+            "confidence": 0.99,
+        }],
+    }
+    u_bc = manager.confirm_unloading_with_vision(
+        image_bytes=b"", ai_service=ai_svc, station="B", task_id=tid_ab, ai_res=ai_shot2_at_b
+    )
+    assert u_bc["success"] is True and u_bc["unloaded"] is True
+    assert u_bc["status"] == "MISSION_ADVANCED", f"Phải đi tiếp MISSION_ADVANCED thay vì về A: {u_bc}"
+    assert u_bc["next_station"] == "C" and u_bc["command"]["cmd"] == "GO_TO:C"
+    assert u_bc["next_mission"]["route_str"] == "B->C", f"Phải lập lộ trình ngắn nhất trực tiếp B->C: {u_bc['next_mission']}"
+    # Kiểm tra chặng RETURN cuối hàng đợi vẫn quay về Trạm Tiếp Nhận A (không phải về B)
+    ret_missions = [m for m in manager.mission_queue if m.get("category") == "RETURN"]
+    assert len(ret_missions) == 1 and ret_missions[0]["to_node"] == "A", f"RETURN phải về A: {ret_missions}"
+    print("   ✅ [16/16] Shot 2 tại trạm kho (B) tự động lập đường ngắn nhất trực tiếp tới đích mới (B->C) và giữ RETURN về A")
+
+    # 17. Đổi danh mục sản phẩm & bố trí trạm đích động qua DB + WMSController + AI + FSM + Giữ cấu hình khi restart
+    from app.controllers.wms_controller import WMSController
+    wms_ctrl = WMSController(manager)
+    agv_ctrl.handle_command({"action": "abort_missions"})
+    agv_ctrl.handle_telemetry({
+        "x": 0.0, "y": 0.0, "yaw": 90.0, "speed": 0.0,
+        "voltage": 12.4, "ina_ok": True, "state": "IDLE", "station": "A", "map_id": active_map_id
+    })
+
+    # (a) Kiểm tra class_id khớp best.pth (0=PKG_MECH, 1=PKG_ELEC, 2=PKG_TOOL) và get_products trả về target_node_id hiện tại
+    code_gp, res_gp = wms_ctrl.get_products()
+    assert code_gp == 200 and res_gp["map_id"] == active_map_id
+    gp_map = {p["product_code"]: p for p in res_gp["products"]}
+    assert gp_map["PKG_MECH"]["yolo_class_id"] == 0 and gp_map["PKG_MECH"]["target_node_id"] == "C"
+    assert gp_map["PKG_ELEC"]["yolo_class_id"] == 1 and gp_map["PKG_ELEC"]["target_node_id"] == "B"
+    assert gp_map["PKG_TOOL"]["yolo_class_id"] == 2 and gp_map["PKG_TOOL"]["target_node_id"] == "D"
+
+    # (b) Đổi PKG_ELEC (Class 1) sang Kho D và đổi tên hiển thị -> thay thế trạm B cũ ngay lập tức (dù B gần hơn D: 1.51m < 1.54m)
+    code_sp, res_sp = wms_ctrl.save_product({
+        "product_code": "PKG_ELEC",
+        "product_name": "Bo Mạch Nguồn Tùy Biến",
+        "yolo_class_id": 1,
+        "category": "ELECTRONIC",
+        "target_node_id": "D",
+    })
+    assert code_sp == 200 and res_sp["status"] == "success", res_sp
+
+    code_gp2, res_gp2 = wms_ctrl.get_products()
+    gp2_map = {p["product_code"]: p for p in res_gp2["products"]}
+    assert gp2_map["PKG_ELEC"]["target_node_id"] == "D", f"Phải đổi sang Kho D: {gp2_map['PKG_ELEC']}"
+    assert gp2_map["PKG_ELEC"]["target_nodes"] == ["D"], f"Không được giữ luật B cũ: {gp2_map['PKG_ELEC']}"
+
+    # (c) AI MobileNetV3 (Class 1 = rectangular_box) & Camera Shot 1 phải tra DB ra tên mới + đi thẳng tới Kho D
+    mock_box_ai = object.__new__(AIProductClassifierService)
+    mock_box_ai.yolo_path = None
+    mock_box_ai.workflow_manager = manager
+    mock_box_ai.is_placeholder_mode = False
+    mock_box_ai.engine_name = "MobileNetV3_OpenCV_Hybrid"
+    mock_box_ai.predictor = SimpleNamespace(
+        classifier=SimpleNamespace(detector=SimpleNamespace(detect=lambda im: ((10, 10, 110, 110), 1, [(10, 10, 110, 110)]))),
+        predict=lambda im, bbox=None, input_mode="pre_cropped_roi", **kwargs: SimpleNamespace(
+            decision_status="CLASSIFIED", predicted_class="rectangular_box", confidence=0.96, decision_type="MOBILENET_DIRECT"
+        ),
+    )
+    cam_dyn = CameraController(manager, mock_box_ai)
+    boundary_dyn = "----BoundaryDynAlloc"
+    body_dyn = (
+        f"--{boundary_dyn}\r\nContent-Disposition: form-data; name=\"station\"\r\n\r\nA\r\n"
+        f"--{boundary_dyn}\r\nContent-Disposition: form-data; name=\"mode\"\r\n\r\nCAPTURE\r\n"
+        f"--{boundary_dyn}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"box.jpg\"\r\n"
+        f"Content-Type: image/jpeg\r\n\r\n"
+    ).encode("utf-8") + real_jpg_bytes + f"\r\n--{boundary_dyn}--\r\n".encode("utf-8")
+    code_dyn, resp_dyn = cam_dyn.handle_upload(f"multipart/form-data; boundary={boundary_dyn}", body_dyn)
+    assert code_dyn == 200 and resp_dyn["status"] == "success"
+    assert resp_dyn["ai_result"]["product_name"] == "Bo Mạch Nguồn Tùy Biến"
+    assert resp_dyn["ai_result"]["target_station"] == "D"
+    assert resp_dyn["dispatch"]["target_node"] == "D"
+    assert resp_dyn["dispatch"]["command"]["cmd"] == "GO_TO:D", resp_dyn["dispatch"]
+    agv_ctrl.handle_command({"action": "abort_missions"})
+
+    # (d) Luật đa trạm / dự phòng qua save_rule: thêm Kho B làm kho phụ cho PKG_ELEC với priority=2 (khi D chưa đầy vẫn ưu tiên D prio=1)
+    code_sr, _ = wms_ctrl.save_rule({
+        "product_code": "PKG_ELEC",
+        "product_category": "ELECTRONIC",
+        "target_node_id": "B",
+        "priority": 2,
+    })
+    assert code_sr == 200
+    router_dyn = manager.get_router(active_map_id)
+    alloc_prio1 = manager.alloc_repo.allocate_nearest_target_node(
+        active_map_id, "PKG_ELEC", "ELECTRONIC", from_node="A", router=router_dyn
+    )
+    assert alloc_prio1["target_node_id"] == "D", f"Priority 1 (D) phải thắng Priority 2 (B) dù B gần hơn: {alloc_prio1}"
+
+    # Khi Kho D đầy (30/30), tự động chuyển sang kho phụ B (priority=2)
+    manager.inv_repo.update_stock(active_map_id, "D", "PKG_ELEC", delta=30)
+    alloc_prio2 = manager.alloc_repo.allocate_nearest_target_node(
+        active_map_id, "PKG_ELEC", "ELECTRONIC", from_node="A", router=router_dyn
+    )
+    assert alloc_prio2["target_node_id"] == "B", f"Khi D đầy phải chuyển sang kho phụ B: {alloc_prio2}"
+    manager.inv_repo.update_stock(active_map_id, "D", "PKG_ELEC", delta=-30)
+
+    # (e) Chặn trùng Model Class ID (400) và chặn xóa mặt hàng đang có lịch sử nhiệm vụ (400)
+    code_dup_cls, _ = wms_ctrl.save_product({
+        "product_code": "PKG_FOOD", "product_name": "Thực phẩm", "yolo_class_id": 1, "category": "FOOD", "target_node_id": "C"
+    })
+    assert code_dup_cls == 400, "Phải báo lỗi 400 khi trùng Model Class ID với PKG_ELEC"
+    code_del_fk, _ = wms_ctrl.delete_product({"product_code": "PKG_ELEC"})
+    assert code_del_fk == 400, "Phải báo lỗi 400 thân thiện thay vì crash FK khi xóa sản phẩm đã có task"
+
+    # (f) seed_database(test_db, reset=False) khi khởi động lại server phải giữ nguyên sản phẩm & bố trí trạm D vừa sửa
+    seed_database(test_db, reset=False)
+    reloaded_gp = {p["product_code"]: p for p in WMSController(WMSWorkflowManager(test_db)).get_products()[1]["products"]}
+    assert reloaded_gp["PKG_ELEC"]["product_name"] == "Bo Mạch Nguồn Tùy Biến"
+    assert reloaded_gp["PKG_ELEC"]["target_node_id"] == "D"
+    print("   ✅ [17/17] Danh mục sản phẩm & bố trí trạm động hoạt động end-to-end và bền vững qua restart")
 
     if test_db.exists():
         try:

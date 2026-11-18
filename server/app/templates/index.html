@@ -249,7 +249,7 @@
                 <div class="absolute inset-0 pointer-events-none p-2 flex flex-col justify-between">
                   <div class="flex justify-between items-start">
                     <span class="font-mono text-[9px] text-sky-300 bg-black/60 px-1.5 py-0.5 rounded">SOURCE: /api/camera</span>
-                    <span class="font-mono text-[9px] text-slate-200 bg-black/60 px-1.5 py-0.5 rounded">YOLOv11 Nano</span>
+                    <span class="font-mono text-[9px] text-slate-200 bg-black/60 px-1.5 py-0.5 rounded">MobileNetV3-Small</span>
                   </div>
                   <div class="flex justify-between items-end">
                     <span class="font-mono text-[9px] text-slate-300 bg-black/60 px-1 rounded">ROI: WMS Inbound</span>
@@ -704,33 +704,41 @@
 
         <!-- TAB 2: DANH MỤC HÀNG & PHÂN BỔ KHO -->
         <div id="modalTabProduct" class="hidden flex flex-col gap-3">
-          <p class="text-[12px] text-slate-600 leading-relaxed">
-            Quản lý danh mục sản phẩm AI và cấu hình quy tắc phân bổ kho đích tự động:
-          </p>
+          <div class="flex items-center justify-between gap-2">
+            <p class="text-[12px] text-slate-600 leading-relaxed">
+              Quản lý danh mục sản phẩm AI và cấu hình trạm kho đích trên bản đồ <span id="lblProdActiveMap" class="font-mono font-semibold text-primary">--</span>:
+            </p>
+          </div>
 
           <!-- Bảng danh mục sản phẩm hiện có -->
-          <div class="border border-slate-200 rounded-lg overflow-hidden bg-white max-h-[180px] overflow-y-auto">
+          <div class="border border-slate-200 rounded-lg overflow-hidden bg-white max-h-[190px] overflow-y-auto">
             <table class="w-full text-left text-[11px]">
               <thead class="bg-slate-50 text-slate-600 font-mono border-b border-slate-200 sticky top-0">
                 <tr>
-                  <th class="p-2.5 font-semibold">MÃ HÀNG</th>
-                  <th class="p-2.5 font-semibold">TÊN SẢN PHẨM</th>
-                  <th class="p-2.5 font-semibold">YOLO CLASS</th>
-                  <th class="p-2.5 font-semibold">NHÓM</th>
-                  <th class="p-2.5 text-right font-semibold">THAO TÁC</th>
+                  <th class="p-2 font-semibold">MÃ HÀNG</th>
+                  <th class="p-2 font-semibold">TÊN SẢN PHẨM</th>
+                  <th class="p-2 font-semibold">CLASS ID</th>
+                  <th class="p-2 font-semibold">NHÓM</th>
+                  <th class="p-2 font-semibold">KHO ĐÍCH</th>
+                  <th class="p-2 text-right font-semibold">THAO TÁC</th>
                 </tr>
               </thead>
               <tbody id="tblProductList" class="divide-y divide-slate-100 text-slate-800">
-                <tr><td colspan="5" class="p-3 text-center text-slate-400">Đang tải danh mục...</td></tr>
+                <tr><td colspan="6" class="p-3 text-center text-slate-400">Đang tải danh mục...</td></tr>
               </tbody>
             </table>
           </div>
 
-          <!-- Form thêm mặt hàng mới -->
+          <!-- Form thêm / cập nhật mặt hàng & trạm đích -->
           <div class="bg-slate-50 border border-slate-200 rounded-lg p-3.5 flex flex-col gap-2.5">
-            <div class="flex items-center gap-1.5 pb-1.5 border-b border-slate-200">
-              <span class="material-symbols-outlined text-primary text-[17px]">add_circle</span>
-              <span class="text-[12px] text-slate-900 font-bold">Thêm Mặt Hàng &amp; Gán Luật Phân Bổ Mới</span>
+            <div class="flex items-center justify-between pb-1.5 border-b border-slate-200">
+              <div class="flex items-center gap-1.5">
+                <span class="material-symbols-outlined text-primary text-[17px]">edit_note</span>
+                <span id="lblProdFormTitle" class="text-[12px] text-slate-900 font-bold">Thêm Mặt Hàng &amp; Gán Trạm Đích</span>
+              </div>
+              <button id="btnCancelEditProduct" onclick="resetProductForm()" class="hidden text-[11px] font-medium text-slate-500 hover:text-slate-800 px-2 py-0.5 rounded border border-slate-300 bg-white" type="button">
+                Hủy sửa
+              </button>
             </div>
 
             <div class="grid grid-cols-2 gap-2 text-[11px]">
@@ -743,8 +751,8 @@
                 <input id="inpProdName" placeholder="vd: Đồ Hộp Thực Phẩm" class="bg-white text-slate-800 px-2.5 py-1.5 rounded border border-slate-300 focus:border-primary outline-none"/>
               </div>
               <div class="flex flex-col gap-0.5">
-                <label class="text-[10px] text-slate-500 font-mono font-semibold">YOLO CLASS ID</label>
-                <input id="inpProdYoloId" type="number" value="3" class="bg-white text-slate-800 font-mono px-2.5 py-1.5 rounded border border-slate-300 focus:border-primary outline-none"/>
+                <label class="text-[10px] text-slate-500 font-mono font-semibold">MODEL CLASS ID</label>
+                <input id="inpProdYoloId" type="number" min="0" value="3" class="bg-white text-slate-800 font-mono px-2.5 py-1.5 rounded border border-slate-300 focus:border-primary outline-none"/>
               </div>
               <div class="flex flex-col gap-0.5">
                 <label class="text-[10px] text-slate-500 font-semibold">NHÓM NGÀNH</label>
@@ -757,8 +765,11 @@
                   <option value="GENERAL">GENERAL</option>
                 </select>
               </div>
+              <div class="col-span-2 text-[10px] text-slate-500 font-mono bg-white border border-slate-200/80 rounded px-2 py-1">
+                MobileNetV3 (best.pth): <span class="text-slate-700 font-semibold">0</span> = Hình trụ (cylinder) • <span class="text-slate-700 font-semibold">1</span> = Hộp chữ nhật (rectangular_box) • <span class="text-slate-700 font-semibold">2</span> = Lăng trụ (triangular_prism)
+              </div>
               <div class="col-span-2 flex flex-col gap-0.5">
-                <label class="text-[10px] text-slate-500 font-semibold">KHO ĐÍCH ƯU TIÊN</label>
+                <label class="text-[10px] text-slate-500 font-semibold">KHO ĐÍCH ƯU TIÊN (Thay thế trạm cũ khi lưu)</label>
                 <select id="selProdTargetNode" class="bg-white text-primary px-2.5 py-1.5 rounded border border-slate-300 focus:border-primary outline-none font-medium">
                   <option value="B">Kho B (Kệ 1) - Tự động định tuyến Trạm B</option>
                   <option value="C">Kho C (Kệ 2) - Tự động định tuyến Trạm C</option>
@@ -768,10 +779,68 @@
               </div>
             </div>
 
-            <button onclick="submitNewProduct()" class="w-full py-2.5 rounded-lg font-bold text-white bg-primary hover:bg-primary-hover text-[12px] flex items-center justify-center gap-1.5 shadow-sm transition-colors mt-1" type="button">
+            <button id="btnSaveProduct" onclick="submitNewProduct()" class="w-full py-2 rounded-lg font-bold text-white bg-primary hover:bg-primary-hover text-[12px] flex items-center justify-center gap-1.5 shadow-sm transition-colors mt-1" type="button">
               <span class="material-symbols-outlined text-[17px]">save</span>
-              <span>Lưu Mặt Hàng &amp; Luật Phân Bổ</span>
+              <span id="lblSaveProductBtn">Lưu Mặt Hàng &amp; Trạm Đích</span>
             </button>
+          </div>
+
+          <!-- Bảng & Form Luật Phân Bổ Kho Đa Trạm / Dự Phòng -->
+          <div class="bg-slate-50 border border-slate-200 rounded-lg p-3.5 flex flex-col gap-2.5">
+            <div class="flex items-center justify-between pb-1.5 border-b border-slate-200">
+              <div class="flex items-center gap-1.5">
+                <span class="material-symbols-outlined text-primary text-[17px]">alt_route</span>
+                <span class="text-[12px] text-slate-900 font-bold">Luật Phân Bổ Kho Đa Trạm &amp; Dự Phòng (Nâng cao)</span>
+              </div>
+              <span class="text-[10px] font-mono text-slate-500">Ưu tiên: Mã hàng &gt; Nhóm &gt; (*)</span>
+            </div>
+
+            <div class="border border-slate-200 rounded-lg overflow-hidden bg-white max-h-[150px] overflow-y-auto">
+              <table class="w-full text-left text-[11px]">
+                <thead class="bg-slate-50 text-slate-600 font-mono border-b border-slate-200 sticky top-0">
+                  <tr>
+                    <th class="p-2 font-semibold">ĐỐI TƯỢNG ÁP DỤNG</th>
+                    <th class="p-2 font-semibold">KHO ĐÍCH</th>
+                    <th class="p-2 font-semibold">ƯU TIÊN</th>
+                    <th class="p-2 text-right font-semibold">XÓA</th>
+                  </tr>
+                </thead>
+                <tbody id="tblRulesList" class="divide-y divide-slate-100 text-slate-800">
+                  <tr><td colspan="4" class="p-3 text-center text-slate-400">Đang tải quy tắc...</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="grid grid-cols-12 gap-1.5 items-end text-[11px]">
+              <div class="col-span-3 flex flex-col gap-0.5">
+                <label class="text-[10px] text-slate-500 font-semibold">ÁP DỤNG THEO</label>
+                <select id="selRuleScope" onchange="onRuleScopeChange()" class="bg-white text-slate-800 px-2 py-1.5 rounded border border-slate-300 focus:border-primary outline-none">
+                  <option value="PRODUCT">Mã hàng</option>
+                  <option value="CATEGORY">Nhóm ngành</option>
+                  <option value="FALLBACK">Dự phòng (*)</option>
+                </select>
+              </div>
+              <div class="col-span-4 flex flex-col gap-0.5">
+                <label class="text-[10px] text-slate-500 font-semibold">MÃ / NHÓM</label>
+                <select id="selRuleTargetVal" class="bg-white text-slate-800 font-mono px-2 py-1.5 rounded border border-slate-300 focus:border-primary outline-none">
+                </select>
+              </div>
+              <div class="col-span-3 flex flex-col gap-0.5">
+                <label class="text-[10px] text-slate-500 font-semibold">KHO ĐÍCH</label>
+                <select id="selRuleTargetNode" class="bg-white text-primary font-medium px-2 py-1.5 rounded border border-slate-300 focus:border-primary outline-none">
+                </select>
+              </div>
+              <div class="col-span-2 flex flex-col gap-0.5">
+                <label class="text-[10px] text-slate-500 font-semibold">ƯU TIÊN</label>
+                <input id="inpRulePriority" type="number" min="1" value="1" class="bg-white text-slate-800 font-mono px-2 py-1.5 rounded border border-slate-300 focus:border-primary outline-none"/>
+              </div>
+              <div class="col-span-12">
+                <button onclick="submitNewRule()" class="w-full py-1.5 rounded font-semibold text-primary bg-blue-50 hover:bg-blue-100 border border-blue-200 text-[11px] flex items-center justify-center gap-1 transition-colors" type="button">
+                  <span class="material-symbols-outlined text-[15px]">add_circle</span>
+                  <span>Thêm / Cập Nhật Quy Tắc Kho Phụ</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 

@@ -7,15 +7,14 @@
 
 ```
 server/weights/
-├── yolo11n_v5b_best.pt    # Trọng số YOLO11n định vị Bounding Box ROI khay hàng Trạm A
 ├── best.pth               # Trọng số MobileNetV3-Small phân loại 3 lớp hình học
-├── predict.py             # Giao diện suy luận HybridPredictor
-├── hybrid_classifier.py    # Động cơ hợp nhất YOLO11n + MobileNetV3 + OpenCV Geometry
-├── geometry_analyzer.py    # Trích xuất đặc trưng hình học (Độ tròn, góc nhọn, sống lưng)
-├── preprocessing.py        # Tiền xử lý đệm và rà soát bề mặt trống
-├── roi_extraction.py       # Định vị vùng quan tâm ROI
-├── model_config.json       # Siêu tham số và cấu hình ngưỡng quyết định
-├── class_names.json        # Danh mục 3 lớp: cylinder (0), rectangular_box (1), triangular_prism (2)
+├── predict.py             # Giao diện suy luận HybridPredictor (không dùng YOLO)
+├── hybrid_classifier.py   # Động cơ hợp nhất MobileNetV3-Small + OpenCV Geometry
+├── geometry_analyzer.py   # Trích xuất đặc trưng hình học (Độ tròn, góc nhọn, rect_extent, sống lưng)
+├── preprocessing.py       # Tiền xử lý đệm và rà soát bề mặt trống
+├── roi_extraction.py      # Định vị vùng quan tâm ROI đa/đơn vật thể và phát hiện khay trống bằng OpenCV
+├── model_config.json      # Siêu tham số và cấu hình ngưỡng quyết định
+├── class_names.json       # Danh mục 3 lớp: cylinder (0), rectangular_box (1), triangular_prism (2)
 └── README.md
 ```
 

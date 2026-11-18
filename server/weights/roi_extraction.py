@@ -1,13 +1,11 @@
-"""SLAM_KLTN — Standalone ROI Extraction Module for Tray Objects.
+"""SLAM_KLTN — Standalone OpenCV ROI Extraction Module for Tray Objects.
 
 Capabilities:
-1. Autonomous object localization on full Android images using YOLO11n detector (default).
-2. Explicit failure when YOLO is required in production but unavailable (no silent fallback).
-3. Fallback adaptive OpenCV thresholding only when explicitly permitted by configuration.
-4. Multiple object detection detection: flags when multiple candidates exist on tray.
-5. Strict EXIF orientation consistency between YOLO detector and downstream classifiers.
-6. Empty tray detection (dark, gray, or bright empty trays with no cargo object).
-7. Aspect-ratio preserving letterbox padding to 224x224.
+1. Autonomous single & multi-object localization on Station A / Shot 2 images using OpenCV (no YOLO).
+2. Chromatic foreground segmentation (HSV Saturation + RGB Chroma) immune to white-paper tray shadows.
+3. Hue-bucket splitting so adjacent multi-color cargo blocks separate cleanly into individual ROIs.
+4. Monochrome / dark-tray Otsu fallback for achromatic objects on dark or uniform bright backgrounds.
+5. Strict EXIF orientation consistency and empty tray rejection (dark, gray, or bright paper trays).
 """
 
 from __future__ import annotations
@@ -43,43 +41,21 @@ EMPTY_TRAY_MAX_CONTOUR_AREA = 500
 
 
 class ObjectDetector:
-    """YOLO-based object detector for autonomous Station A tray localization."""
+    """OpenCV-based foreground & hue object detector for Station A tray localization (no YOLO)."""
 
     def __init__(
         self,
         weights_path: Optional[Union[str, Path]] = None,
         conf_threshold: float = 0.25,
-        require_yolo: bool = True,
-        allow_opencv_fallback: bool = False,
+        require_yolo: bool = False,
+        allow_opencv_fallback: bool = True,
     ):
         self.conf_threshold = conf_threshold
-        self.require_yolo = require_yolo
-        self.allow_opencv_fallback = allow_opencv_fallback
+        self.require_yolo = False
+        self.allow_opencv_fallback = True
+        self.weights_path = Path(weights_path) if weights_path is not None else None
         self.model = None
-
-        if weights_path is None:
-            self.weights_path = Path(__file__).resolve().parent / "yolo11n_v5b_best.pt"
-        else:
-            self.weights_path = Path(weights_path)
-
-        try:
-            import os
-            os.environ["YOLO_AUTO_INSTALL"] = "0"
-            from ultralytics import YOLO
-            if not self.weights_path.is_file():
-                raise FileNotFoundError(f"YOLO detector checkpoint not found at: {self.weights_path}")
-            self.model = YOLO(str(self.weights_path))
-            logger.info(f"Loaded YOLO detector from {self.weights_path}")
-        except Exception as e:
-            if self.require_yolo and not self.allow_opencv_fallback:
-                raise RuntimeError(
-                    f"Production error: YOLO detector is required but failed to initialize from '{self.weights_path}': {e}. "
-                    f"Set allow_opencv_fallback=True only if OpenCV heuristic fallback is explicitly intended."
-                ) from e
-            logger.warning(
-                f"YOLO detector unavailable ({e}). Falling back to OpenCV heuristic localization as allowed by configuration."
-            )
-            self.model = None
+        logger.info("Initialized OpenCV ROI ObjectDetector (YOLO disabled; MobileNetV3-Small only mode).")
 
     @staticmethod
     def _is_nested_duplicate(
@@ -111,83 +87,210 @@ class ObjectDetector:
 
         Returns:
             Tuple of:
-            - primary_bbox: (x1, y1, x2, y2) of most confident object, or None
+            - primary_bbox: (x1, y1, x2, y2) of largest detected object, or None
             - num_detections: Total count of detected objects
             - all_boxes: List of all detected bounding boxes
         """
-        self.yolo_detections = {}
-        # Always apply EXIF orientation transpose first to ensure identical coordinate space
         pil_img = load_image_rgb(image_input)
-        w_img, h_img = pil_img.size
-
-        # Check for completely blank / textureless image (e.g. empty bright or dark tray)
         if is_blank_or_textureless(pil_img):
             return None, 0, []
 
-        if self.model is not None:
-            try:
-                # Convert PIL RGB to OpenCV BGR for native YOLO format
-                bgr_arr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-                results = self.model(bgr_arr, conf=self.conf_threshold, agnostic_nms=True, iou=0.45, verbose=False)
-                if len(results) > 0 and len(results[0].boxes) > 0:
-                    boxes = results[0].boxes
-                    sorted_indices = sorted(range(len(boxes)), key=lambda i: float(boxes.conf[i]), reverse=True)
+        boxes = detect_tray_foregrounds(pil_img)
+        if not boxes:
+            return None, 0, []
+        return boxes[0], len(boxes), boxes
 
-                    primary_raw = boxes.xyxy[sorted_indices[0]].cpu().numpy().astype(int)
-                    try:
-                        primary_box = validate_bbox(tuple(primary_raw), w_img, h_img)
-                    except ValueError:
-                        return None, 0, []
 
-                    w_pri = primary_box[2] - primary_box[0]
-                    h_pri = primary_box[3] - primary_box[1]
-                    area_pri = max(1, w_pri * h_pri)
+def _scale_and_filter_contours(
+    contours: List[np.ndarray],
+    scale_x: float,
+    scale_y: float,
+    w_img: int,
+    h_img: int,
+    min_area_small: float,
+    max_area_small: float,
+    check_tray_margins: bool = False,
+    small_w: int = 320,
+    small_h: int = 320,
+) -> List[Tuple[int, Tuple[int, int, int, int]]]:
+    """Convert valid contours into (area_full, validated_bbox) entries."""
+    entries: List[Tuple[int, Tuple[int, int, int, int]]] = []
+    for c in contours:
+        area = float(cv2.contourArea(c))
+        if area < min_area_small or area >= max_area_small:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(c)
+        if check_tray_margins:
+            cx_norm = (bx + 0.5 * bw) / float(small_w)
+            cy_norm = (by + 0.5 * bh) / float(small_h)
+            if cx_norm > 0.93 or cx_norm < 0.04 or cy_norm < 0.14:
+                continue
+        x1 = int(round(bx * scale_x))
+        y1 = int(round(by * scale_y))
+        x2 = int(round((bx + bw) * scale_x))
+        y2 = int(round((by + bh) * scale_y))
+        try:
+            vb = validate_bbox((x1, y1, x2, y2), w_img, h_img)
+            entries.append((int(round((vb[2] - vb[0]) * (vb[3] - vb[1]))), vb))
+        except ValueError:
+            continue
+    return entries
 
-                    valid_boxes = [primary_box]
-                    self.yolo_detections = {
-                        primary_box: {
-                            "class_id": int(boxes.cls[sorted_indices[0]]),
-                            "class_name": self.model.names.get(int(boxes.cls[sorted_indices[0]]), "unknown") if hasattr(self.model, "names") else "unknown",
-                            "conf": float(boxes.conf[sorted_indices[0]])
-                        }
-                    }
-                    min_sec_conf = max(self.conf_threshold, 0.30)
-                    for idx in sorted_indices[1:]:
-                        b_raw = boxes.xyxy[idx].cpu().numpy().astype(int)
-                        try:
-                            vb = validate_bbox(tuple(b_raw), w_img, h_img)
-                        except ValueError:
-                            continue
-                        w_b = vb[2] - vb[0]
-                        h_b = vb[3] - vb[1]
-                        area_b = w_b * h_b
-                        conf_b = float(boxes.conf[idx])
 
-                        # Suppress tiny edge noise/reflections or nested enclosing duplicate boxes
-                        if (area_b / area_pri < 0.12) or (conf_b < min_sec_conf):
-                            continue
-                        if self._is_nested_duplicate(vb, valid_boxes, containment_thresh=0.65):
-                            continue
-                        valid_boxes.append(vb)
-                        self.yolo_detections[vb] = {
-                            "class_id": int(boxes.cls[idx]),
-                            "class_name": self.model.names.get(int(boxes.cls[idx]), "unknown") if hasattr(self.model, "names") else "unknown",
-                            "conf": conf_b
-                        }
+def _suppress_duplicates(
+    area_boxes: List[Tuple[int, Tuple[int, int, int, int]]]
+) -> List[Tuple[int, int, int, int]]:
+    """Sort largest-first and suppress overlapping nested duplicate boxes."""
+    area_boxes.sort(key=lambda item: item[0], reverse=True)
+    kept: List[Tuple[int, int, int, int]] = []
+    for _, box in area_boxes:
+        if not ObjectDetector._is_nested_duplicate(box, kept, containment_thresh=0.65):
+            kept.append(box)
+    return kept
 
-                    if valid_boxes:
-                        return valid_boxes[0], len(valid_boxes), valid_boxes
-                return None, 0, []
-            except Exception as e:
-                if self.require_yolo and not self.allow_opencv_fallback:
-                    raise RuntimeError(f"YOLO inference error during detection: {e}") from e
-                logger.warning(f"YOLO inference error ({e}). Attempting OpenCV fallback.")
 
-        # Fallback to OpenCV tray foreground detection if permitted
-        fg_box = detect_tray_foreground(pil_img)
-        if fg_box is not None:
-            return fg_box, 1, [fg_box]
-        return None, 0, []
+def detect_tray_foregrounds(
+    image_input: Union[str, Path, Image.Image, np.ndarray],
+    min_contour_area: int = EMPTY_TRAY_MAX_CONTOUR_AREA,
+    is_bgr: bool = False,
+) -> List[Tuple[int, int, int, int]]:
+    """Detect one or more cargo bounding boxes on the tray using pure OpenCV (no YOLO)."""
+    pil_img = load_image_rgb(image_input, is_bgr=is_bgr)
+    if is_blank_or_textureless(pil_img):
+        return []
+
+    rgb = np.array(pil_img)
+    h_img, w_img = rgb.shape[:2]
+
+    gray_full = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    if float(np.mean(gray_full)) < 15.0 and float(np.max(gray_full)) < 40.0:
+        return []
+
+    # ------------------------------------------------------------------
+    # Pass 1: Chromatic foreground localization (HSV Saturation + Chroma)
+    # Immune to gray cardboard borders, A4 paper creases, and tray shadows.
+    # ------------------------------------------------------------------
+    color_dim = 320
+    small_rgb = cv2.resize(rgb, (color_dim, color_dim), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2HSV)
+    h_chan, s_chan, _ = cv2.split(hsv)
+    chroma = np.ptp(small_rgb, axis=2)
+
+    fg_color = ((chroma >= 28) & (s_chan >= 42)).astype(np.uint8) * 255
+    k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    k5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    fg_color = cv2.morphologyEx(fg_color, cv2.MORPH_OPEN, k3)
+    fg_color = cv2.morphologyEx(fg_color, cv2.MORPH_CLOSE, k5)
+
+    contours_c, _ = cv2.findContours(fg_color, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area_c = 0.015 * color_dim * color_dim
+    max_area_c = 0.85 * color_dim * color_dim
+    sx_c = float(w_img) / float(color_dim)
+    sy_c = float(h_img) / float(color_dim)
+
+    hue_masks_defs = (
+        ((h_chan < 14) | (h_chan >= 170)),
+        ((h_chan >= 14) & (h_chan < 45)),
+        ((h_chan >= 45) & (h_chan < 125)),
+        ((h_chan >= 125) & (h_chan < 170)),
+    )
+
+    color_entries: List[Tuple[int, Tuple[int, int, int, int]]] = []
+    for cnt in contours_c:
+        c_area = float(cv2.contourArea(cnt))
+        if c_area < min_area_c or c_area >= max_area_c:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        cx_norm = (bx + 0.5 * bw) / float(color_dim)
+        cy_norm = (by + 0.5 * bh) / float(color_dim)
+        if cx_norm > 0.93 or cx_norm < 0.04 or cy_norm < 0.14:
+            continue
+
+        comp_mask = np.zeros((color_dim, color_dim), dtype=np.uint8)
+        cv2.drawContours(comp_mask, [cnt], -1, 255, -1)
+        comp_fg = (comp_mask > 0) & (fg_color > 0)
+        fg_pixels = max(1, int(np.count_nonzero(comp_fg)))
+
+        # Split adjacent/touching colored objects if >=2 distinct hue buckets exist
+        active_buckets = []
+        for h_rule in hue_masks_defs:
+            bucket = (comp_fg & h_rule).astype(np.uint8) * 255
+            bucket = cv2.morphologyEx(bucket, cv2.MORPH_OPEN, k3)
+            if np.count_nonzero(bucket) >= max(min_area_c, 0.15 * fg_pixels):
+                active_buckets.append(bucket)
+
+        if len(active_buckets) >= 2:
+            for bucket in active_buckets:
+                sub_cnts, _ = cv2.findContours(bucket, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                color_entries.extend(
+                    _scale_and_filter_contours(
+                        sub_cnts, sx_c, sy_c, w_img, h_img,
+                        min_area_small=min_area_c,
+                        max_area_small=max_area_c,
+                        check_tray_margins=False,
+                    )
+                )
+        else:
+            color_entries.extend(
+                _scale_and_filter_contours(
+                    [cnt], sx_c, sy_c, w_img, h_img,
+                    min_area_small=min_area_c,
+                    max_area_small=max_area_c,
+                    check_tray_margins=False,
+                )
+            )
+
+    if color_entries:
+        return _suppress_duplicates(color_entries)
+
+    # ------------------------------------------------------------------
+    # Pass 2: Achromatic / Dark-tray fallback (e.g. matte dark tray or synthetic tests)
+    # ------------------------------------------------------------------
+    mono_dim = 640
+    small_mono = cv2.resize(rgb, (mono_dim, mono_dim), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small_mono, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    border_strip = np.concatenate([gray[:6, :].ravel(), gray[-6:, :].ravel(), gray[:, :6].ravel(), gray[:, -6:].ravel()])
+    border_med = float(np.median(border_strip))
+    border_std = float(np.std(border_strip))
+
+    if border_med < 85.0:
+        thresh_mode = cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        min_contrast = 30.0
+    elif border_std < 12.0:
+        thresh_mode = cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        min_contrast = 45.0
+    else:
+        # Uneven cardboard/white paper tray with zero chromatic cargo -> empty tray (NO_OBJECT)
+        return []
+
+    _, thresh = cv2.threshold(blurred, 0, 255, thresh_mode)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+    fg_vals = gray[closed > 0]
+    bg_vals = gray[closed == 0]
+    if fg_vals.size == 0 or bg_vals.size == 0:
+        return []
+    if abs(float(np.mean(fg_vals)) - float(np.mean(bg_vals))) < min_contrast:
+        return []
+
+    contours_m, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours_m:
+        return []
+
+    mono_entries = _scale_and_filter_contours(
+        contours_m,
+        scale_x=float(w_img) / float(mono_dim),
+        scale_y=float(h_img) / float(mono_dim),
+        w_img=w_img,
+        h_img=h_img,
+        min_area_small=float(min_contour_area),
+        max_area_small=0.85 * mono_dim * mono_dim,
+        check_tray_margins=False,
+    )
+    return _suppress_duplicates(mono_entries)
 
 
 def detect_tray_foreground(
@@ -195,58 +298,9 @@ def detect_tray_foreground(
     min_contour_area: int = EMPTY_TRAY_MAX_CONTOUR_AREA,
     is_bgr: bool = False,
 ) -> Optional[Tuple[int, int, int, int]]:
-    """Adaptive OpenCV thresholding on downscaled image for tray object localization."""
-    pil_img = load_image_rgb(image_input, is_bgr=is_bgr)
-    if is_blank_or_textureless(pil_img):
-        return None
-
-    rgb = np.array(pil_img)
-    h, w = rgb.shape[:2]
-
-    # Quick check for pure dark image
-    gray_full = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    if float(np.mean(gray_full)) < 15.0 and float(np.max(gray_full)) < 40.0:
-        return None
-
-    # Downscale for robust thresholding
-    small = cv2.resize(rgb, (640, 640), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-
-    # Otsu thresholding against dark tray
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Morphological closing
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    valid = []
-    for c in contours:
-        a = cv2.contourArea(c)
-        if 500 < a < 0.85 * 640 * 640:
-            bx, by, bw, bh = cv2.boundingRect(c)
-            valid.append((a, bx, by, bw, bh))
-
-    if not valid:
-        return None
-
-    valid.sort(key=lambda x: x[0], reverse=True)
-    best = valid[0]
-    sx = float(w) / 640.0
-    sy = float(h) / 640.0
-    x1 = int(round(best[1] * sx))
-    y1 = int(round(best[2] * sy))
-    x2 = int(round((best[1] + best[3]) * sx))
-    y2 = int(round((best[2] + best[4]) * sy))
-
-    try:
-        return validate_bbox((x1, y1, x2, y2), w, h)
-    except ValueError:
-        return None
+    """Return the primary foreground bounding box on the tray, or None when empty."""
+    boxes = detect_tray_foregrounds(image_input, min_contour_area=min_contour_area, is_bgr=is_bgr)
+    return boxes[0] if boxes else None
 
 
 def is_empty_tray(

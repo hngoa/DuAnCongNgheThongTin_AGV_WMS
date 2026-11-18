@@ -40,9 +40,8 @@ except (ImportError, ValueError):
 
 
 class HybridPredictor:
-    """Production-ready inference wrapper combining YOLO11n object localization,
-
-    MobileNetV3-Small classification, and OpenCV geometric verification.
+    """Production-ready inference wrapper combining OpenCV ROI localization,
+    MobileNetV3-Small classification (best.pth), and OpenCV geometric verification (no YOLO).
     """
 
     def __init__(
@@ -52,23 +51,21 @@ class HybridPredictor:
         device: Optional[str] = None,
         confidence_threshold_high: float = 0.85,
         uncertainty_margin: float = 0.20,
-        require_yolo: bool = True,
-        allow_opencv_fallback: bool = False,
+        require_yolo: bool = False,
+        allow_opencv_fallback: bool = True,
     ):
         pkg_dir = Path(__file__).resolve().parent
         if checkpoint_path is None:
             checkpoint_path = pkg_dir / "best.pth"
-        if yolo_path is None:
-            yolo_path = pkg_dir / "yolo11n_v5b_best.pt"
 
         self.classifier = HybridClassifier(
             checkpoint_path=checkpoint_path,
-            yolo_path=yolo_path,
+            yolo_path=None,
             device=device,
             confidence_threshold_high=confidence_threshold_high,
             uncertainty_margin=uncertainty_margin,
-            require_yolo=require_yolo,
-            allow_opencv_fallback=allow_opencv_fallback,
+            require_yolo=False,
+            allow_opencv_fallback=True,
         )
 
     def predict(

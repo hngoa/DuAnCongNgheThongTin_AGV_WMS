@@ -330,7 +330,10 @@ class GeometricAnalyzer:
 
         non_ortho_ratio = float(slanted_len / total_len) if total_len > 0 else 0.0
 
-        # 8. Diagnostic Flags
+        # 8. Diagnostic Flags (rotation-invariant rectangular fill complements axis-aligned extent)
+        rect_w, rect_h = float(rect[1][0]), float(rect[1][1])
+        rect_area = max(1.0, rect_w * rect_h)
+        rect_extent = min(1.0, float(area / rect_area))
         flags: Dict[str, bool] = {
             "is_highly_circular": (circularity >= 0.83 and extent >= 0.65),
             "has_acute_angle_junction": (acute_angles_count >= 1 and min_angle < 68.0),
@@ -340,6 +343,12 @@ class GeometricAnalyzer:
             "has_central_ridge_lines": (native_ridge_lines_count >= 2),
             "high_solidity": (solidity >= 0.95),
             "elongated_extent": (extent <= 0.72 and aspect_ratio <= 0.75),
+            "is_rectangular_fill": (
+                rect_extent >= 0.82
+                and circularity < 0.74
+                and acute_angles_count == 0
+                and right_angles_count >= 2
+            ),
         }
 
         # 9. Evidence Quality Scoring
@@ -381,7 +390,7 @@ class GeometricAnalyzer:
         if flags["has_strictly_orthogonal_lines"] and right_angles_count >= 2:
             score_box += 0.30
             score_prism -= 0.20
-        if extent >= 0.80 and not flags["has_acute_angle_junction"] and not flags["has_slanted_lines"]:
+        if (extent >= 0.80 or rect_extent >= 0.84) and not flags["has_acute_angle_junction"] and not flags["has_slanted_lines"]:
             score_box += 0.20
             score_prism -= 0.15
 

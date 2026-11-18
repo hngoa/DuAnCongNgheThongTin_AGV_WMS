@@ -1,9 +1,8 @@
 {
   "system_name": "SLAM_KLTN_Hybrid_CV_Module",
   "version": "1.0.0-final",
-  "description": "Standalone Hybrid Computer Vision for Station A tray object sorting: YOLO11n object localization + MobileNetV3-Small classification + OpenCV geometric verification.",
+  "description": "MobileNetV3-Small + OpenCV ROI & Geometric Verification for Station A & Shot 2 tray object sorting (no YOLO).",
   "checkpoint_sha256": "31efdf26a79220994c6a42dc014b036a78e1fe4bb97c2e5eaf17fc894f4e2620",
-  "detector_sha256": "0f434fd6af532213a60f1daadee48354af85127c93e68f7b8a6f304109baf62c",
   "architecture": "mobilenet_v3_small",
   "num_classes": 3,
   "classes": [
@@ -42,12 +41,9 @@
       "roi_pad_ratio": 0.14
     },
     "detector": {
-      "name": "YOLO11n-StationA-Detector",
-      "weights_file": "yolo11n_v5b_best.pt",
-      "sha256": "0f434fd6af532213a60f1daadee48354af85127c93e68f7b8a6f304109baf62c",
-      "framework": "ultralytics",
-      "confidence_threshold": 0.25,
-      "purpose": "Autonomous bounding box localization on full-resolution Station A Android images"
+      "name": "OpenCV-HSV-Contour-Foreground",
+      "framework": "opencv",
+      "purpose": "Autonomous single & multi-object bounding box localization and empty tray detection without YOLO"
     }
   },
   "fusion_thresholds": {

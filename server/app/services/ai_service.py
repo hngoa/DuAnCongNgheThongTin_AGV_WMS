@@ -1,8 +1,8 @@
 """
 ===================================================================================
 DỊCH VỤ NHẬN DIỆN SẢN PHẨM (AI / COMPUTER VISION SERVICE ADAPTER - V2.1)
-TÍCH HỢP TOÀN DIỆN MÔ HÌNH HYBRID CV (YOLO11n + MobileNetV3-Small + OpenCV Geometry):
-  - Vị trí mô hình: server/weights/ (yolo11n_v5b_best.pt + best.pth + model_config.json)
+CHỈ SỬ DỤNG MÔ HÌNH MOBILENETV3-SMALL (best.pth) + OPENCV ROI/GEOMETRY (KHÔNG DÙNG YOLO):
+  - Vị trí mô hình: server/weights/ (best.pth + model_config.json)
   - Ánh xạ 3 lớp:
       * cylinder         -> PKG_MECH (Chi Tiết Bánh Răng & Khớp Nối, Kho Kệ 2 C)
       * rectangular_box  -> PKG_ELEC (Bo Mạch Vi Điều Khiển, Kho Kệ 1 B)
@@ -17,13 +17,10 @@ TÍCH HỢP TOÀN DIỆN MÔ HÌNH HYBRID CV (YOLO11n + MobileNetV3-Small + Open
 from typing import Dict, Any, Optional, Tuple, List
 from pathlib import Path
 import sys
-import os
 import io
 import re
 import traceback
 
-# Vô hiệu hóa auto update của Ultralytics để tăng tốc suy luận và chống lỗi quyền ghi
-os.environ["YOLO_AUTO_INSTALL"] = "0"
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # Đường dẫn thư mục lưu weights trong server
@@ -35,9 +32,11 @@ WEIGHTS_DIR = SERVER_DIR / "weights"
 if str(WEIGHTS_DIR) not in sys.path and WEIGHTS_DIR.is_dir():
     sys.path.insert(0, str(WEIGHTS_DIR))
 
-# Ánh xạ từ nhãn Computer Vision (CV_DuAn) sang Mã hàng và Phân khu Kho WMS
+# Ánh xạ mặc định từ nhãn Computer Vision (class_names.json của best.pth) sang Mã hàng và Phân khu Kho WMS
+# Khi AIProductClassifierService gắn với workflow_manager, metadata & target_node được tra động từ SQLite (products + allocation_rules).
 CLASS_TO_WMS_MAPPING = {
     "cylinder": {
+        "class_id": 0,
         "product_code": "PKG_MECH",
         "product_name": "Chi Tiết Bánh Răng & Khớp Nối",
         "category": "MECHANICAL",
@@ -46,6 +45,7 @@ CLASS_TO_WMS_MAPPING = {
         "bbox_color": (56, 189, 248),  # Xanh lam
     },
     "rectangular_box": {
+        "class_id": 1,
         "product_code": "PKG_ELEC",
         "product_name": "Bo Mạch Vi Điều Khiển",
         "category": "ELECTRONIC",
@@ -54,6 +54,7 @@ CLASS_TO_WMS_MAPPING = {
         "bbox_color": (16, 185, 129),  # Xanh lá
     },
     "triangular_prism": {
+        "class_id": 2,
         "product_code": "PKG_TOOL",
         "product_name": "Bộ Dụng Cụ Đo & Kiểm Thử",
         "category": "TOOL",
@@ -65,29 +66,26 @@ CLASS_TO_WMS_MAPPING = {
 
 
 class AIProductClassifierService:
-    def __init__(self, model_path: Optional[Path] = None):
+    def __init__(self, model_path: Optional[Path] = None, workflow_manager: Any = None):
         self.weights_dir = WEIGHTS_DIR
-        self.yolo_path = self.weights_dir / "yolo11n_v5b_best.pt"
+        self.yolo_path = None
         self.checkpoint_path = model_path or (self.weights_dir / "best.pth")
+        self.workflow_manager = workflow_manager
         self.predictor = None
         self.is_placeholder_mode = True
         self.engine_name = "Placeholder_Mode"
         self._init_engine()
 
     def _init_engine(self):
-        """Khởi tạo engine: Tự động nạp HybridPredictor từ thư mục weights"""
+        """Khởi tạo engine: Chỉ nạp MobileNetV3-Small (best.pth) + OpenCV ROI/Geometry (không dùng YOLO)."""
         if str(self.weights_dir) not in sys.path:
             sys.path.insert(0, str(self.weights_dir))
 
-        has_yolo = self.yolo_path.is_file()
-        has_cls = self.checkpoint_path.is_file()
-
-        if has_yolo and has_cls:
+        if self.checkpoint_path.is_file():
             try:
                 from predict import HybridPredictor
                 self.predictor = HybridPredictor(
                     checkpoint_path=self.checkpoint_path,
-                    yolo_path=self.yolo_path,
                     device="cpu",
                     confidence_threshold_high=0.85,
                     uncertainty_margin=0.20,
@@ -95,90 +93,116 @@ class AIProductClassifierService:
                     allow_opencv_fallback=True,
                 )
                 self.is_placeholder_mode = False
-                self.engine_name = "Hybrid_YOLO11n_MobileNetV3_OpenCV"
-                print(f"🧠 [AI Service] ĐÃ NẠP MÔ HÌNH THẬT HYBRID CV: {self.checkpoint_path.name} & {self.yolo_path.name}")
+                self.engine_name = "MobileNetV3_OpenCV_Hybrid"
+                print(f"🧠 [AI Service] ĐÃ NẠP MÔ HÌNH MOBILENET: {self.checkpoint_path.name} (OpenCV ROI + Geometry, không dùng YOLO)")
                 print(f"   (Thư mục weights: {self.weights_dir})")
                 return
             except Exception as e:
-                print(f"⚠️ [AI Service] Không thể nạp native HybridPredictor ({e}).")
+                print(f"⚠️ [AI Service] Không thể nạp MobileNet HybridPredictor ({e}).")
                 print("   Kích hoạt chế độ Cổng chờ thông minh (Heuristic Fallback Mode).")
                 self.is_placeholder_mode = True
                 self.engine_name = "Heuristic_Fallback_Mode"
         else:
             self.is_placeholder_mode = True
             self.engine_name = "Placeholder_Mode"
-            print("ℹ️ [AI Service] Đang ở chế độ CỔNG CHỜ (Placeholder Mode) - Chờ tích hợp Model CV.")
-            print(f"   (Khi có mô hình, đặt file vào: server/weights/)")
+            print("ℹ️ [AI Service] Đang ở chế độ CỔNG CHỜ (Placeholder Mode) - Chờ tích hợp Model MobileNet best.pth.")
+            print(f"   (Khi có mô hình, đặt file best.pth vào: server/weights/)")
 
     @staticmethod
-    def _fuse_box_prediction(
-        pred: Any,
-        y_cls: Optional[str],
-        y_conf: float,
-    ) -> Tuple[Optional[str], float, str, str]:
-        """Hợp nhất có kiểm soát giữa Hybrid (MobileNetV3 + OpenCV) và YOLO11n."""
-        nn_cls = getattr(pred, "mobilenet_class_name", None)
-        nn_probs = (
-            getattr(pred, "mobilenet_probabilities", None)
-            or getattr(pred, "neural_network_probabilities", {})
-            or {}
-        )
-        geo_cand = getattr(pred, "geometry_candidate", "UNKNOWN")
-        geo_qual = getattr(pred, "geometry_quality", "NO_SIGNAL")
-        geom_ev = getattr(pred, "geometry_evidence", {}) or {}
+    def _evaluate_mobilenet_prediction(pred: Any) -> Tuple[Optional[str], float, str, str]:
+        """Đánh giá kết quả MobileNetV3 (best.pth) + OpenCV Geometry theo Safety Gates (không dùng YOLO)."""
         dec_type = getattr(pred, "decision_type", "") or ""
         h_status = getattr(pred, "decision_status", "NEEDS_REVIEW")
         h_cls = getattr(pred, "predicted_class", None)
         h_conf = round(float(getattr(pred, "confidence", 0.0) or 0.0), 3)
-        has_yolo = (y_cls in CLASS_TO_WMS_MAPPING) and (y_conf > 0.0)
 
         if h_status == "CLASSIFIED" and h_cls in CLASS_TO_WMS_MAPPING:
-            if has_yolo and y_cls == h_cls:
-                return h_cls, round(max(h_conf, y_conf), 3), "CLASSIFIED", "YOLO_HYBRID_CONSENSUS"
+            return h_cls, h_conf, "CLASSIFIED", dec_type or "MOBILENET_HYBRID_CLASSIFIED"
 
-            # Chỉ GEOMETRY_CONFIRM / MOBILENET_CONFIRM mới là đồng thuận 2 phiếu (MobileNet + OpenCV).
-            # Còn GEOMETRY_OVERRIDE là OpenCV đang phủ quyết MobileNet (1 chống 1).
-            is_geo_confirmed = dec_type.startswith(("GEOMETRY_CONFIRM", "MOBILENET_CONFIRM"))
-            is_geo_override = dec_type.startswith("GEOMETRY_OVERRIDE")
+        return None, 0.0, "NEEDS_REVIEW", dec_type or "NEEDS_REVIEW"
 
-            if has_yolo and y_cls != h_cls:
-                # Nếu OpenCV tự ý override MobileNet nhưng YOLO lại đồng thuận với MobileNet -> trả về đa số 2/3
-                if is_geo_override and y_cls == nn_cls and (y_conf >= 0.50 or h_conf < 0.30):
-                    nn_match_conf = float(nn_probs.get(nn_cls, 0.0))
-                    return y_cls, round(max(y_conf, nn_match_conf), 3), "CLASSIFIED", "YOLO_MOBILENET_MAJORITY"
+    def _resolve_wms_metadata(self, cls_key: str, from_node: str = "A") -> Dict[str, Any]:
+        """Tra cứu danh mục sản phẩm (products) & trạm kho đích (allocation_rules) động từ DB."""
+        default_info = CLASS_TO_WMS_MAPPING[cls_key]
+        info = dict(default_info)
+        wf = getattr(self, "workflow_manager", None)
+        if wf is None:
+            return info
 
-                yolo_geo_agree = geo_qual in ("HIGH", "MEDIUM") and geo_cand == y_cls
-                if yolo_geo_agree and (not is_geo_confirmed) and h_conf < 0.75:
-                    return y_cls, round(max(y_conf, 0.50), 3), "CLASSIFIED", "YOLO_GEOMETRY_CONSENSUS"
-                if (
-                    (not is_geo_confirmed)
-                    and h_conf < 0.55
-                    and y_conf >= 0.65
-                    and float(nn_probs.get(y_cls, 0.0)) >= 0.15
-                ):
-                    return y_cls, round(y_conf, 3), "CLASSIFIED", "YOLO_HIGH_CONF_OVERRIDE"
+        try:
+            prod_repo = getattr(wf, "prod_repo", None)
+            if prod_repo is not None:
+                db_prod = None
+                if hasattr(prod_repo, "get_by_class_id"):
+                    db_prod = prod_repo.get_by_class_id(default_info["class_id"])
+                if db_prod is None:
+                    db_prod = prod_repo.get_by_code(default_info["product_code"])
+                if db_prod:
+                    info["product_code"] = db_prod["product_code"]
+                    info["product_name"] = db_prod["product_name"]
+                    info["category"] = db_prod["category"]
+                    if db_prod["product_name"] != default_info["product_name"]:
+                        info["short_vi"] = db_prod["product_name"]
 
-            return h_cls, h_conf, "CLASSIFIED", dec_type or "HYBRID_CLASSIFIED"
+            alloc_repo = getattr(wf, "alloc_repo", None)
+            if alloc_repo is not None:
+                active_map = wf.map_repo.get_active_map() if getattr(wf, "map_repo", None) else None
+                map_id = active_map["map_id"] if active_map else "SABAN_154_151"
+                router = wf.get_router(map_id) if hasattr(wf, "get_router") else None
+                agv_id = getattr(wf, "agv_id", "AGV_Ver2")
+                alloc = alloc_repo.allocate_nearest_target_node(
+                    map_id,
+                    info["product_code"],
+                    info["category"],
+                    from_node=from_node,
+                    router=router,
+                    current_agv_id=agv_id,
+                )
+                if alloc is None:
+                    alloc = alloc_repo.allocate_target_node(map_id, info["product_code"], info["category"])
+                if alloc and alloc.get("target_node_id"):
+                    info["target_node"] = alloc["target_node_id"]
+        except Exception:
+            pass
+        return info
 
-        # Hybrid trả về NEEDS_REVIEW: giải tỏa nếu YOLO >= 0.45 đồng thuận với MobileNet hoặc tín hiệu hình học rõ ràng
-        if has_yolo and y_conf >= 0.45:
-            nn_agree = y_cls == nn_cls
-            geo_agree = geo_qual in ("HIGH", "MEDIUM") and geo_cand == y_cls
-            flags = geom_ev.get("diagnostic_flags", {}) or {}
-            extent_val = float(geom_ev.get("extent", 0.0) or 0.0)
-            ortho_box_agree = (
-                y_cls == "rectangular_box"
-                and y_conf >= 0.75
-                and bool(flags.get("has_strictly_orthogonal_lines"))
-                and extent_val >= 0.85
-            )
-            if nn_agree or geo_agree or ortho_box_agree:
-                nn_match_conf = float(nn_probs.get(y_cls, 0.0))
-                return y_cls, round(max(y_conf, nn_match_conf), 3), "CLASSIFIED", "YOLO_TIEBREAK_REVIEW"
+    def _resolve_fallback_token(self, tok: str, from_node: str = "A") -> Tuple[str, Dict[str, Any]]:
+        """Giải mã product_hint trong chế độ Heuristic/Placeholder, ưu tiên tra DB trước."""
+        wf = getattr(self, "workflow_manager", None)
+        class_id_to_shape = {0: "cylinder", 1: "rectangular_box", 2: "triangular_prism"}
+        if wf is not None and getattr(wf, "prod_repo", None) is not None:
+            try:
+                db_prod = wf.prod_repo.get_by_code(tok)
+                if db_prod:
+                    shape_key = class_id_to_shape.get(int(db_prod.get("yolo_class_id", 1)), "rectangular_box")
+                    info = dict(CLASS_TO_WMS_MAPPING[shape_key])
+                    info["product_code"] = db_prod["product_code"]
+                    info["product_name"] = db_prod["product_name"]
+                    info["category"] = db_prod["category"]
+                    info["short_vi"] = db_prod["product_name"]
+                    if getattr(wf, "alloc_repo", None) is not None:
+                        active_map = wf.map_repo.get_active_map() if getattr(wf, "map_repo", None) else None
+                        map_id = active_map["map_id"] if active_map else "SABAN_154_151"
+                        router = wf.get_router(map_id) if hasattr(wf, "get_router") else None
+                        alloc = wf.alloc_repo.allocate_nearest_target_node(
+                            map_id, info["product_code"], info["category"],
+                            from_node=from_node, router=router, current_agv_id=getattr(wf, "agv_id", "AGV_Ver2")
+                        ) or wf.alloc_repo.allocate_target_node(map_id, info["product_code"], info["category"])
+                        if alloc and alloc.get("target_node_id"):
+                            info["target_node"] = alloc["target_node_id"]
+                    return shape_key, info
+            except Exception:
+                pass
 
-        return None, 0.0, "NEEDS_REVIEW", "NEEDS_REVIEW"
+        if "MECH" in tok or "CO KHI" in tok or "SP02" in tok or "CYL" in tok:
+            cls_key = "cylinder"
+        elif "TOOL" in tok or "DUNG CU" in tok or "SP03" in tok or "PRISM" in tok:
+            cls_key = "triangular_prism"
+        else:
+            cls_key = "rectangular_box"
+        return cls_key, self._resolve_wms_metadata(cls_key, from_node=from_node)
 
-    def classify_image(self, image_bytes: bytes, product_hint: str = "") -> Dict[str, Any]:
+    def classify_image(self, image_bytes: bytes, product_hint: str = "", from_node: str = "A") -> Dict[str, Any]:
         """
         Giao diện phân loại chuẩn hóa:
           - Đầu vào: luồng byte ảnh JPEG từ điện thoại + mã hàng gợi ý từ App Android
@@ -222,11 +246,10 @@ class AIProductClassifierService:
                         "success": False,
                     }
 
-                # 2. Phân loại toàn bộ các sản phẩm phát hiện được
+                # 2. Phân loại toàn bộ các sản phẩm phát hiện được bằng MobileNetV3 (best.pth) + OpenCV
                 all_items: List[Dict[str, Any]] = []
                 classified_items: List[Dict[str, Any]] = []
                 review_items: List[Dict[str, Any]] = []
-                yolo_map = getattr(detector, "yolo_detections", {})
 
                 # Chuẩn hóa an toàn tuyệt đối tọa độ bounding box (tránh lỗi numpy.int32 unpack)
                 clean_boxes: List[Tuple[int, int, int, int]] = []
@@ -237,27 +260,17 @@ class AIProductClassifierService:
                         tl = b.tolist()
                         clean_boxes.append((int(tl[0]), int(tl[1]), int(tl[2]), int(tl[3])))
 
+                multi_box_mode = len(clean_boxes) > 1
                 for box in clean_boxes:
-                    pred = self.predictor.predict(pil_img, bbox=box, input_mode="pre_cropped_roi")
+                    if multi_box_mode:
+                        pred = self.predictor.predict(pil_img, bbox=box, input_mode="pre_cropped_roi", pad_ratio=0.06)
+                    else:
+                        pred = self.predictor.predict(pil_img, bbox=box, input_mode="pre_cropped_roi")
 
-                    # Tìm thông tin phát hiện từ YOLO (khớp chính xác hoặc sai số <= 8px)
-                    y_info = yolo_map.get(box, {})
-                    if not y_info:
-                        for y_k, y_v in yolo_map.items():
-                            if isinstance(y_k, (list, tuple)) and len(y_k) >= 4:
-                                if all(abs(int(y_k[i]) - box[i]) <= 8 for i in range(4)):
-                                    y_info = y_v
-                                    break
-
-                    y_cls = y_info.get("class_name")
-                    y_conf = round(float(y_info.get("conf", 0.0)), 3)
-
-                    final_cls, final_conf, item_status, fusion_rule = self._fuse_box_prediction(
-                        pred, y_cls, y_conf
-                    )
+                    final_cls, final_conf, item_status, fusion_rule = self._evaluate_mobilenet_prediction(pred)
 
                     if item_status == "CLASSIFIED" and final_cls in CLASS_TO_WMS_MAPPING:
-                        wms_info = CLASS_TO_WMS_MAPPING[final_cls]
+                        wms_info = self._resolve_wms_metadata(final_cls, from_node=from_node)
                         item_dict = {
                             "product_code": wms_info["product_code"],
                             "product_name": wms_info["product_name"],
@@ -366,13 +379,9 @@ class AIProductClassifierService:
         num_toks = len(tokens)
 
         for idx, tok in enumerate(tokens):
-            if "MECH" in tok or "CO KHI" in tok or "SP02" in tok or "CYL" in tok:
-                cls_key = "cylinder"
-            elif "TOOL" in tok or "DUNG CU" in tok or "SP03" in tok or "PRISM" in tok:
-                cls_key = "triangular_prism"
-            elif "ALL" in tok:
+            if "ALL" in tok:
                 for k in ("rectangular_box", "cylinder", "triangular_prism"):
-                    info = CLASS_TO_WMS_MAPPING[k]
+                    info = self._resolve_wms_metadata(k, from_node=from_node)
                     detected_items.append({
                         "product_code": info["product_code"],
                         "product_name": info["product_name"],
@@ -386,10 +395,8 @@ class AIProductClassifierService:
                         "short_vi": info["short_vi"],
                     })
                 break
-            else:
-                cls_key = "rectangular_box"
 
-            info = CLASS_TO_WMS_MAPPING[cls_key]
+            cls_key, info = self._resolve_fallback_token(tok, from_node=from_node)
             slot_w = w_img // max(1, num_toks)
             bx1 = int(idx * slot_w + slot_w * 0.1)
             by1 = int(h_img * 0.2)

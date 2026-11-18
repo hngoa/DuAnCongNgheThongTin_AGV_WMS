@@ -99,11 +99,12 @@ function renderDynamicMapNodesUI(nodes) {
     }).join("");
   }
 
-  const selTarget = document.getElementById("selProdTargetNode");
-  if (selTarget) {
+  const targetNodes = nodes.filter(n => n.node_type !== "INBOUND");
+  const listToShow = targetNodes.length ? targetNodes : nodes;
+  ["selProdTargetNode", "selRuleTargetNode"].forEach(selId => {
+    const selTarget = document.getElementById(selId);
+    if (!selTarget) return;
     const prevVal = selTarget.value;
-    const targetNodes = nodes.filter(n => n.node_type !== "INBOUND");
-    const listToShow = targetNodes.length ? targetNodes : nodes;
     selTarget.innerHTML = listToShow.map(n => {
       const nid = String(n.node_id || "").toUpperCase();
       return `<option value="${nid}">Kho ${nid} (${n.name || ("Trạm " + nid)})</option>`;
@@ -111,7 +112,7 @@ function renderDynamicMapNodesUI(nodes) {
     if ([...selTarget.options].some(o => o.value === prevVal)) {
       selTarget.value = prevVal;
     }
-  }
+  });
 }
 
 // ===================================================================================
@@ -780,14 +781,17 @@ function openConfigModal() {
   const modal = document.getElementById("configModal");
   if (modal) {
     modal.classList.remove("hidden");
+    renderDynamicMapNodesUI(mapNodes);
     loadMapsList();
     loadProductsList();
+    loadRulesList();
   }
 }
 
 function closeConfigModal() {
   const modal = document.getElementById("configModal");
   if (modal) modal.classList.add("hidden");
+  if (typeof resetProductForm === "function") resetProductForm();
 }
 
 function switchModalTab(tab) {
@@ -815,6 +819,9 @@ function switchModalTab(tab) {
     if (tabBtnMap) {
       tabBtnMap.className = "flex-1 py-2.5 px-3 border-b-2 border-transparent text-slate-500 hover:text-slate-800 hover:bg-white/60 flex items-center justify-center gap-1.5 transition-colors";
     }
+    renderDynamicMapNodesUI(mapNodes);
+    loadProductsList();
+    loadRulesList();
   }
 }
 
@@ -995,25 +1002,123 @@ async function sendImportMap(mapJson) {
 }
 
 // (D) Quản lý Danh mục Sản phẩm & Phân bổ Kho
+let cachedProductsList = [];
+let editingProductCode = null;
+
+function escHtml(v) {
+  return String(v ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function resetProductForm() {
+  editingProductCode = null;
+  const inpCode = document.getElementById("inpProdCode");
+  const inpName = document.getElementById("inpProdName");
+  const inpYolo = document.getElementById("inpProdYoloId");
+  const selCat = document.getElementById("selProdCategory");
+  const lblTitle = document.getElementById("lblProdFormTitle");
+  const lblBtn = document.getElementById("lblSaveProductBtn");
+  const btnCancel = document.getElementById("btnCancelEditProduct");
+
+  if (inpCode) {
+    inpCode.value = "";
+    inpCode.readOnly = false;
+    inpCode.classList.remove("bg-slate-100", "cursor-not-allowed");
+  }
+  if (inpName) inpName.value = "";
+  if (inpYolo) {
+    const usedIds = new Set(cachedProductsList.map(p => Number(p.yolo_class_id)));
+    let nextId = 3;
+    while (usedIds.has(nextId)) nextId++;
+    inpYolo.value = String(nextId);
+  }
+  if (selCat) selCat.value = "FOOD";
+  if (lblTitle) lblTitle.innerText = "Thêm Mặt Hàng & Gán Trạm Đích";
+  if (lblBtn) lblBtn.innerText = "Lưu Mặt Hàng & Trạm Đích";
+  if (btnCancel) btnCancel.classList.add("hidden");
+}
+
+function editProductByIndex(idx) {
+  const p = cachedProductsList[idx];
+  if (!p) return;
+  editingProductCode = p.product_code;
+
+  const inpCode = document.getElementById("inpProdCode");
+  const inpName = document.getElementById("inpProdName");
+  const inpYolo = document.getElementById("inpProdYoloId");
+  const selCat = document.getElementById("selProdCategory");
+  const selTarget = document.getElementById("selProdTargetNode");
+  const lblTitle = document.getElementById("lblProdFormTitle");
+  const lblBtn = document.getElementById("lblSaveProductBtn");
+  const btnCancel = document.getElementById("btnCancelEditProduct");
+
+  if (inpCode) {
+    inpCode.value = p.product_code;
+    inpCode.readOnly = true;
+    inpCode.classList.add("bg-slate-100", "cursor-not-allowed");
+  }
+  if (inpName) inpName.value = p.product_name || "";
+  if (inpYolo) inpYolo.value = String(p.yolo_class_id ?? 0);
+  if (selCat) {
+    const cat = String(p.category || "GENERAL").toUpperCase();
+    if (![...selCat.options].some(o => o.value === cat)) {
+      const opt = document.createElement("option");
+      opt.value = cat;
+      opt.innerText = cat;
+      selCat.appendChild(opt);
+    }
+    selCat.value = cat;
+  }
+  if (selTarget && p.target_node_id) {
+    if ([...selTarget.options].some(o => o.value === p.target_node_id)) {
+      selTarget.value = p.target_node_id;
+    }
+  }
+  if (lblTitle) lblTitle.innerText = `Chỉnh Sửa '${p.product_code}' & Đổi Trạm Đích`;
+  if (lblBtn) lblBtn.innerText = `Cập Nhật '${p.product_code}' & Kho Đích`;
+  if (btnCancel) btnCancel.classList.remove("hidden");
+}
+
 async function loadProductsList() {
   try {
     const res = await fetch("/api/wms/products");
     const data = await res.json();
     if (data.status === "success") {
+      cachedProductsList = data.products || [];
+      setText("lblProdActiveMap", data.map_id || (mapConfig && mapConfig.map_id) || "--");
+
       let html = "";
-      data.products.forEach(p => {
+      cachedProductsList.forEach((p, idx) => {
+        const nodes = Array.isArray(p.target_nodes) && p.target_nodes.length
+          ? p.target_nodes
+          : (p.target_node_id ? [p.target_node_id] : []);
+        let stationHtml = '<span class="text-slate-400 font-mono">--</span>';
+        if (nodes.length === 1) {
+          stationHtml = `<span class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold">Kho ${escHtml(nodes[0])}</span>`;
+        } else if (nodes.length > 1) {
+          stationHtml = `<span class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold">Kho ${escHtml(nodes[0])}</span> <span class="text-[10px] text-slate-500 font-mono">+${escHtml(nodes.slice(1).join(","))}</span>`;
+        }
+
         html += `
           <tr class="hover:bg-slate-50 transition-colors">
-            <td class="p-2.5 font-mono text-primary font-bold">${p.product_code}</td>
-            <td class="p-2.5 font-medium text-slate-800">${p.product_name}</td>
-            <td class="p-2.5 font-mono text-slate-500">Class: ${p.yolo_class_id}</td>
-            <td class="p-2.5">
+            <td class="p-2 font-mono text-primary font-bold">${escHtml(p.product_code)}</td>
+            <td class="p-2 font-medium text-slate-800">${escHtml(p.product_name)}</td>
+            <td class="p-2 font-mono text-slate-500">Class: ${escHtml(p.yolo_class_id)}</td>
+            <td class="p-2">
               <span class="bg-blue-50 text-primary border border-blue-200 px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold">
-                ${p.category}
+                ${escHtml(p.category)}
               </span>
             </td>
-            <td class="p-2.5 text-right">
-              <button onclick="deleteProduct('${p.product_code}')" class="text-error hover:underline text-[11px] font-medium" type="button">
+            <td class="p-2">${stationHtml}</td>
+            <td class="p-2 text-right whitespace-nowrap">
+              <button onclick="editProductByIndex(${idx})" class="text-primary hover:underline text-[11px] font-semibold mr-2" type="button">
+                Sửa
+              </button>
+              <button onclick="deleteProductByIndex(${idx})" class="text-error hover:underline text-[11px] font-medium" type="button">
                 Xóa
               </button>
             </td>
@@ -1021,8 +1126,9 @@ async function loadProductsList() {
       });
       const tbl = document.getElementById("tblProductList");
       if (tbl) {
-        tbl.innerHTML = html || '<tr><td colspan="5" class="p-3 text-center text-slate-400">Chưa có sản phẩm trong kho</td></tr>';
+        tbl.innerHTML = html || '<tr><td colspan="6" class="p-3 text-center text-slate-400">Chưa có sản phẩm trong kho</td></tr>';
       }
+      onRuleScopeChange();
     }
   } catch (e) {
     console.error("Lỗi nạp danh mục sản phẩm:", e);
@@ -1032,12 +1138,17 @@ async function loadProductsList() {
 async function submitNewProduct() {
   const code = document.getElementById("inpProdCode").value.trim().toUpperCase();
   const name = document.getElementById("inpProdName").value.trim();
-  const yoloId = parseInt(document.getElementById("inpProdYoloId").value) || 0;
+  const rawYolo = document.getElementById("inpProdYoloId").value.trim();
+  const yoloId = rawYolo === "" ? NaN : parseInt(rawYolo, 10);
   const category = document.getElementById("selProdCategory").value;
   const targetNode = document.getElementById("selProdTargetNode").value;
 
   if (!code || !name) {
     alert("⚠️ Vui lòng nhập đầy đủ Mã hàng và Tên sản phẩm!");
+    return;
+  }
+  if (isNaN(yoloId) || yoloId < 0) {
+    alert("⚠️ Model Class ID phải là số nguyên >= 0!");
     return;
   }
 
@@ -1056,15 +1167,21 @@ async function submitNewProduct() {
     const d = await res.json();
     if (d.status === "success") {
       alert("✅ " + d.message);
-      document.getElementById("inpProdCode").value = "";
-      document.getElementById("inpProdName").value = "";
-      loadProductsList();
+      resetProductForm();
+      await loadProductsList();
+      await loadRulesList();
+      updateWmsData();
     } else {
       alert("❌ " + d.message);
     }
   } catch (e) {
     alert("❌ Lỗi kết nối: " + e);
   }
+}
+
+function deleteProductByIndex(idx) {
+  const p = cachedProductsList[idx];
+  if (p) deleteProduct(p.product_code);
 }
 
 async function deleteProduct(pCode) {
@@ -1077,12 +1194,133 @@ async function deleteProduct(pCode) {
     });
     const d = await res.json();
     if (d.status === "success") {
-      loadProductsList();
+      if (editingProductCode === pCode) resetProductForm();
+      await loadProductsList();
+      await loadRulesList();
     } else {
       alert("❌ " + d.message);
     }
   } catch (e) {
     alert("❌ Lỗi kết nối: " + e);
+  }
+}
+
+function onRuleScopeChange() {
+  const selScope = document.getElementById("selRuleScope");
+  const selVal = document.getElementById("selRuleTargetVal");
+  if (!selScope || !selVal) return;
+
+  const scope = selScope.value;
+  if (scope === "PRODUCT") {
+    selVal.disabled = false;
+    selVal.innerHTML = cachedProductsList.map(p =>
+      `<option value="${escHtml(p.product_code)}">${escHtml(p.product_code)} (${escHtml(p.category)})</option>`
+    ).join("") || '<option value="PKG_ELEC">PKG_ELEC</option>';
+  } else if (scope === "CATEGORY") {
+    selVal.disabled = false;
+    const cats = [...new Set(["ELECTRONIC", "MECHANICAL", "TOOL", "FOOD", "MEDICAL", "GENERAL", ...cachedProductsList.map(p => p.category)])];
+    selVal.innerHTML = cats.map(c => `<option value="${escHtml(c)}">${escHtml(c)}</option>`).join("");
+  } else {
+    selVal.innerHTML = '<option value="*">* (Tất cả - Dự phòng)</option>';
+    selVal.disabled = true;
+  }
+}
+
+async function loadRulesList() {
+  try {
+    const res = await fetch("/api/wms/rules");
+    const data = await res.json();
+    if (data.status === "success") {
+      const rules = data.rules || [];
+      let html = "";
+      rules.forEach(r => {
+        const targetLabel = r.product_code
+          ? `<span class="font-mono font-bold text-primary">Mã: ${escHtml(r.product_code)}</span>`
+          : (r.product_category === "*"
+            ? `<span class="font-mono text-amber-700 font-semibold">* Dự phòng</span>`
+            : `<span class="font-mono text-slate-700 font-semibold">Nhóm: ${escHtml(r.product_category)}</span>`);
+        html += `
+          <tr class="hover:bg-slate-50 transition-colors">
+            <td class="p-2">${targetLabel}</td>
+            <td class="p-2"><span class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold">Kho ${escHtml(r.target_node_id)}</span></td>
+            <td class="p-2 font-mono text-slate-500">Prio ${escHtml(r.priority)}</td>
+            <td class="p-2 text-right">
+              <button onclick="deleteRule(${Number(r.rule_id)})" class="text-error hover:underline text-[11px] font-medium" type="button">
+                Xóa
+              </button>
+            </td>
+          </tr>`;
+      });
+      const tbl = document.getElementById("tblRulesList");
+      if (tbl) {
+        tbl.innerHTML = html || '<tr><td colspan="4" class="p-3 text-center text-slate-400">Chưa có quy tắc phân bổ cho bản đồ này</td></tr>';
+      }
+    }
+  } catch (e) {
+    console.error("Lỗi nạp quy tắc phân bổ kho:", e);
+  }
+}
+
+async function submitNewRule() {
+  const scope = document.getElementById("selRuleScope")?.value || "PRODUCT";
+  const val = document.getElementById("selRuleTargetVal")?.value || "*";
+  const targetNode = document.getElementById("selRuleTargetNode")?.value || "";
+  const prioRaw = parseInt(document.getElementById("inpRulePriority")?.value || "1", 10);
+  const priority = (!isNaN(prioRaw) && prioRaw >= 1) ? prioRaw : 1;
+
+  if (!targetNode) {
+    alert("⚠️ Vui lòng chọn Kho đích!");
+    return;
+  }
+
+  let payload = { target_node_id: targetNode, priority: priority };
+  if (scope === "PRODUCT") {
+    const prod = cachedProductsList.find(p => p.product_code === val);
+    payload.product_code = val;
+    payload.product_category = prod ? prod.category : "GENERAL";
+  } else if (scope === "CATEGORY") {
+    payload.product_code = null;
+    payload.product_category = val;
+  } else {
+    payload.product_code = null;
+    payload.product_category = "*";
+  }
+
+  try {
+    const res = await fetch("/api/wms/rules/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const d = await res.json();
+    if (d.status === "success") {
+      await loadProductsList();
+      await loadRulesList();
+    } else {
+      alert("❌ " + d.message);
+    }
+  } catch (e) {
+    alert("❌ Lỗi lưu quy tắc: " + e);
+  }
+}
+
+async function deleteRule(ruleId) {
+  if (!confirm(`Xóa quy tắc phân bổ #${ruleId}?`)) return;
+  try {
+    const res = await fetch("/api/wms/rules/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rule_id: ruleId })
+    });
+    const d = await res.json();
+    if (d.status === "success") {
+      await loadProductsList();
+      await loadRulesList();
+    } else {
+      alert("❌ " + d.message);
+    }
+  } catch (e) {
+    alert("❌ Lỗi xóa quy tắc: " + e);
   }
 }
 

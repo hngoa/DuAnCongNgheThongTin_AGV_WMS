@@ -8,6 +8,7 @@ CUNG CẤP API BẢN ĐỒ LINE, TỒN KHO ĐA SẢN PHẨM, DANH SÁCH TASK VÀ
 from typing import Dict, Any, Tuple, Optional
 import csv
 import io
+import sqlite3
 from datetime import datetime
 from app.config import DEFAULT_MAP_ID
 
@@ -124,44 +125,94 @@ class WMSController:
         return 200, {"status": "success", "data": data}
 
     def get_products(self) -> Tuple[int, Dict[str, Any]]:
-        """Lấy danh mục sản phẩm và ánh xạ YOLO"""
+        """Lấy danh mục sản phẩm, ánh xạ MobileNetV3 và trạm đích hiện tại trên bản đồ active"""
+        active_map = self.workflow_manager.map_repo.get_active_map() or {"map_id": DEFAULT_MAP_ID}
+        map_id = active_map.get("map_id", DEFAULT_MAP_ID)
         products = self.workflow_manager.prod_repo.get_all()
-        return 200, {"status": "success", "products": products}
+
+        enriched = []
+        for p in products:
+            item = dict(p)
+            rules = self.workflow_manager.alloc_repo.get_rules_for_product(
+                map_id, item["product_code"], item["category"]
+            )
+            non_fallback = [r for r in rules if r.get("product_category") != "*"]
+            display_rules = non_fallback or rules
+            target_nodes = []
+            for r in display_rules:
+                tn = r["target_node_id"]
+                if tn not in target_nodes:
+                    target_nodes.append(tn)
+            item["target_node_id"] = target_nodes[0] if target_nodes else ""
+            item["target_nodes"] = target_nodes
+            item["has_custom_rule"] = any(r.get("product_code") == item["product_code"] for r in rules)
+            enriched.append(item)
+
+        return 200, {"status": "success", "map_id": map_id, "products": enriched}
 
     def save_product(self, body_json: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-        """Thêm hoặc cập nhật mặt hàng mới và tự động gán luật phân bổ kho nếu có"""
+        """Thêm hoặc cập nhật mặt hàng mới và cập nhật trực tiếp trạm đích ưu tiên"""
         p_code = str(body_json.get("product_code", "")).strip().upper()
         p_name = str(body_json.get("product_name", "")).strip()
-        yolo_id = int(body_json.get("yolo_class_id", 0))
+        try:
+            yolo_id = int(body_json.get("yolo_class_id", 0))
+        except (TypeError, ValueError):
+            return 400, {"status": "error", "message": "Model Class ID phải là số nguyên hợp lệ"}
         cat = str(body_json.get("category", "GENERAL")).strip().upper()
         desc = str(body_json.get("description", "")).strip()
         target_station = str(body_json.get("target_node_id", "")).strip().upper()
 
         if not p_code or not p_name:
             return 400, {"status": "error", "message": "Vui lòng nhập đầy đủ Mã hàng và Tên sản phẩm"}
+        if yolo_id < 0:
+            return 400, {"status": "error", "message": "Model Class ID phải >= 0"}
+
+        existing_owner = self.workflow_manager.prod_repo.get_by_class_id(yolo_id)
+        if existing_owner and existing_owner.get("product_code") != p_code:
+            return 400, {
+                "status": "error",
+                "message": (
+                    f"Model Class ID {yolo_id} đang được gán cho '{existing_owner['product_code']}' "
+                    f"({existing_owner['product_name']}). Hãy sửa trực tiếp mặt hàng đó hoặc chọn Class ID khác!"
+                ),
+            }
+
+        active_map = self.workflow_manager.map_repo.get_active_map() or {"map_id": DEFAULT_MAP_ID}
+        map_id = active_map.get("map_id", DEFAULT_MAP_ID)
+        if target_station:
+            valid_nodes = {n["node_id"].upper() for n in self.workflow_manager.map_repo.get_nodes(map_id)}
+            if target_station not in valid_nodes:
+                return 400, {
+                    "status": "error",
+                    "message": f"Trạm kho '{target_station}' không tồn tại trên bản đồ {map_id}",
+                }
 
         self.workflow_manager.prod_repo.save_product(p_code, p_name, yolo_id, cat, desc)
 
-        # Nếu người dùng chọn sẵn kho đích phân bổ ưu tiên -> Lưu luôn vào allocation_rules
         if target_station:
-            active_map = self.workflow_manager.map_repo.get_active_map() or {"map_id": DEFAULT_MAP_ID}
-            map_id = active_map.get("map_id", DEFAULT_MAP_ID)
-            self.workflow_manager.alloc_repo.save_rule(
+            self.workflow_manager.alloc_repo.replace_product_target_rule(
                 map_id=map_id,
-                product_category=cat,
-                target_node_id=target_station,
                 product_code=p_code,
-                priority=1
+                category=cat,
+                target_node_id=target_station,
+                priority=1,
             )
 
-        return 200, {"status": "success", "message": f"Đã lưu mặt hàng {p_code} thành công!"}
+        return 200, {"status": "success", "message": f"Đã lưu mặt hàng {p_code} (Kho đích: {target_station or 'Theo nhóm'})!"}
 
     def delete_product(self, body_json: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-        """Xóa mặt hàng khỏi danh mục"""
+        """Xóa mặt hàng khỏi danh mục và dọn sạch quy tắc gắn riêng nếu không bị ràng buộc"""
         p_code = str(body_json.get("product_code", "")).strip().upper()
         if not p_code:
             return 400, {"status": "error", "message": "Thiếu mã sản phẩm"}
-        self.workflow_manager.prod_repo.delete_product(p_code)
+        try:
+            self.workflow_manager.prod_repo.delete_product(p_code)
+            self.workflow_manager.alloc_repo.delete_rules_for_product(p_code)
+        except sqlite3.IntegrityError:
+            return 400, {
+                "status": "error",
+                "message": f"Không thể xóa '{p_code}' vì đã có lịch sử nhiệm vụ hoặc tồn kho tham chiếu. Hãy dùng nút Sửa để đổi tên/nhóm/trạm đích!"
+            }
         return 200, {"status": "success", "message": f"Đã xóa mặt hàng {p_code}"}
 
     def get_rules(self) -> Tuple[int, Dict[str, Any]]:
@@ -172,16 +223,29 @@ class WMSController:
         return 200, {"status": "success", "map_id": map_id, "rules": rules}
 
     def save_rule(self, body_json: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-        """Thêm hoặc chỉnh sửa quy tắc phân bổ kho"""
+        """Thêm hoặc chỉnh sửa quy tắc phân bổ kho (hỗ trợ đa trạm & dự phòng)"""
         active_map = self.workflow_manager.map_repo.get_active_map() or {"map_id": DEFAULT_MAP_ID}
-        map_id = str(body_json.get("map_id", active_map.get("map_id", DEFAULT_MAP_ID)))
-        cat = str(body_json.get("product_category", "*")).strip().upper()
+        map_id = str(body_json.get("map_id", active_map.get("map_id", DEFAULT_MAP_ID))).strip()
+        cat = str(body_json.get("product_category", "*")).strip().upper() or "*"
         target = str(body_json.get("target_node_id", "B")).strip().upper()
-        p_code = body_json.get("product_code")
-        prio = int(body_json.get("priority", 1))
+        raw_code = body_json.get("product_code")
+        p_code = str(raw_code).strip().upper() if raw_code and str(raw_code).strip() else None
+        try:
+            prio = max(1, int(body_json.get("priority", 1)))
+        except (TypeError, ValueError):
+            prio = 1
 
-        self.workflow_manager.alloc_repo.save_rule(map_id, cat, target, p_code, prio)
-        return 200, {"status": "success", "message": "Đã lưu quy tắc phân bổ thành công"}
+        valid_nodes = {n["node_id"].upper() for n in self.workflow_manager.map_repo.get_nodes(map_id)}
+        if target not in valid_nodes:
+            return 400, {"status": "error", "message": f"Trạm kho '{target}' không tồn tại trên bản đồ {map_id}"}
+
+        if p_code:
+            prod = self.workflow_manager.prod_repo.get_by_code(p_code)
+            if prod and prod.get("category"):
+                cat = prod["category"]
+
+        self.workflow_manager.alloc_repo.save_rule(map_id, cat, target, p_code, prio, replace_product_rules=False)
+        return 200, {"status": "success", "message": f"Đã lưu quy tắc phân bổ -> Kho {target}"}
 
     def delete_rule(self, body_json: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         rule_id = int(body_json.get("rule_id", 0))

@@ -277,14 +277,21 @@ class WMSWorkflowManager:
             if conf < 0.50:
                 continue
 
-            target_st = item.get("target_station") or item.get("target_node")
-            if not target_st:
-                prod = self.prod_repo.get_by_code(p_code)
-                alloc = self.alloc_repo.allocate_nearest_target_node(
-                    map_id, p_code, prod["category"] if prod else "ELECTRONIC",
-                    from_node=from_node, router=router, current_agv_id=self.agv_id
-                )
-                target_st = alloc["target_node_id"] if alloc else "B"
+            prod = self.prod_repo.get_by_code(p_code)
+            category = (prod["category"] if prod else None) or item.get("category") or "ELECTRONIC"
+            if prod and prod.get("product_name"):
+                item = dict(item)
+                item["product_name"] = prod["product_name"]
+                item["category"] = category
+
+            alloc = self.alloc_repo.allocate_nearest_target_node(
+                map_id, p_code, category,
+                from_node=from_node, router=router, current_agv_id=self.agv_id
+            )
+            if alloc and alloc.get("target_node_id"):
+                target_st = alloc["target_node_id"]
+            else:
+                target_st = item.get("target_station") or item.get("target_node") or "B"
 
             if target_st not in station_to_items:
                 station_to_items[target_st] = []
@@ -310,6 +317,7 @@ class WMSWorkflowManager:
         target_stations = list(station_to_items.keys())
 
         # 3. Tìm đường đi tốt nhất (Dijkstra Permutation Optimization)
+        home_node = "A"
         best_perm = None
         min_total_dist = float('inf')
         best_legs = []
@@ -328,8 +336,8 @@ class WMSWorkflowManager:
                 legs.append({"from": curr, "to": next_st, "path": path})
                 curr = next_st
 
-            # Thêm chặng quay về trạm xuất phát
-            ret_path = router.find_shortest_path(curr, from_node, current_agv_id=self.agv_id)
+            # Thêm chặng quay về Trạm Tiếp Nhận A sau khi hoàn tất chuỗi giao hàng
+            ret_path = router.find_shortest_path(curr, home_node, current_agv_id=self.agv_id)
             if ret_path:
                 dist_sum += ret_path["total_distance_m"]
             else:
@@ -388,15 +396,15 @@ class WMSWorkflowManager:
             }
             self.mission_queue.append(mission)
 
-        # Thêm Mission Return về Trạm xuất phát sau khi dỡ xong hết
+        # Thêm Mission Return về Trạm Tiếp Nhận A sau khi dỡ xong hết
         last_st = best_perm[-1]
-        ret_path = router.find_shortest_path(last_st, from_node, current_agv_id=self.agv_id)
-        if ret_path and last_st != from_node:
+        ret_path = router.find_shortest_path(last_st, home_node, current_agv_id=self.agv_id)
+        if ret_path and last_st != home_node:
             self.mission_queue.append({
                 "mission_id": len(self.mission_queue) + 1,
                 "task_id": 0,
                 "from_node": last_st,
-                "to_node": from_node,
+                "to_node": home_node,
                 "product_code": "NONE",
                 "product_name": "Quay về Trạm Tiếp Nhận A",
                 "category": "RETURN",
@@ -430,9 +438,10 @@ class WMSWorkflowManager:
             "route": first_mission["route_str"],
             "route_legs": first_mission.get("route_legs", [])
         })
+        first_mission["cmd_id"] = cmd_obj["cmd_id"]
         self.cmd_to_task[cmd_obj["cmd_id"]] = first_mission["task_id"]
 
-        optimal_sequence = [from_node] + list(best_perm) + [from_node]
+        optimal_sequence = [from_node] + list(best_perm) + ([home_node] if last_st != home_node else [])
 
         return {
             "success": True,
@@ -739,10 +748,11 @@ class WMSWorkflowManager:
     def confirm_unloading_with_vision(self, image_bytes: bytes, ai_service, 
                                       station: str = "", task_id: Optional[int] = None,
                                       ai_res: Optional[Dict[str, Any]] = None,
-                                      product_hint: str = "") -> Dict[str, Any]:
+                                      product_hint: str = "",
+                                      image_path: str = "") -> Dict[str, Any]:
         """
         Quy trình xác nhận dỡ hàng bằng thị giác AI (Shot 2 Unload Verification):
-          1. AI kiểm tra ảnh khay hàng (YOLO + MobileNetV3)
+          1. AI kiểm tra ảnh khay hàng (MobileNetV3 best.pth + OpenCV)
           2. Kiểm tra xem mặt hàng chuyên biệt của trạm này đã được dỡ xuống chưa
           3. Nếu đã dỡ:
              - Chuyển Task sang COMPLETED
@@ -945,18 +955,69 @@ class WMSWorkflowManager:
 
         # =========================================================================
         # CƠ CHẾ 2: TRÊN XE VẪN CÒN HÀNG CHO CÁC TRẠM KẾ TIẾP
-        # Tiến tới Mission tiếp theo trong hàng đợi
+        # Tiến tới Mission giao hàng tiếp theo hoặc lập lộ trình ngắn nhất trực tiếp từ trạm hiện tại
         # =========================================================================
         next_mission = None
         for m in self.mission_queue:
-            if m["status"] == "QUEUED":
-                next_mission = m
-                break
+            if m["status"] == "QUEUED" and m.get("category") != "RETURN" and m.get("product_code") not in ("NONE", None, ""):
+                if not remaining_codes or m.get("product_code") in remaining_codes:
+                    next_mission = m
+                    break
+
+        if next_mission is None:
+            valid_remaining_items = [
+                it for it in detected_items
+                if it.get("product_code") not in (None, "", "NONE", "NO_OBJECT")
+                and float(it.get("confidence", 0.95)) >= 0.50
+            ]
+            if valid_remaining_items:
+                dispatch_res = self.plan_and_dispatch_mission_queue(
+                    map_id=map_id,
+                    detected_items=valid_remaining_items,
+                    from_node=dest_node or "A",
+                    image_path=image_path
+                )
+                if dispatch_res.get("success"):
+                    first_m = dispatch_res["first_mission"]
+                    next_to = first_m["to_node"]
+                    cmd_obj = dispatch_res["command"]
+                    return {
+                        "success": True,
+                        "unloaded": True,
+                        "status": "MISSION_ADVANCED",
+                        "message": (
+                            f"Xác nhận đã dỡ {expected_prod_name} tại Trạm {dest_node}! Tồn kho +1. "
+                            f"Phát hiện kiện hàng '{first_m['product_name']}' trên khay -> "
+                            f"Lập lộ trình ngắn nhất trực tiếp {first_m['route_str']} sang Trạm {next_to}."
+                        ),
+                        "station": dest_node,
+                        "next_station": next_to,
+                        "task_id": first_m["task_id"],
+                        "next_mission": first_m,
+                        "command": cmd_obj,
+                        "dispatch": dispatch_res,
+                        "ai_result": ai_res
+                    }
+
+            for m in self.mission_queue:
+                if m["status"] == "QUEUED":
+                    next_mission = m
+                    break
 
         if next_mission:
+            next_to = next_mission["to_node"]
+            if dest_node and next_mission.get("from_node") != dest_node:
+                router = self.get_router(map_id)
+                re_path = router.find_shortest_path(dest_node, next_to, current_agv_id=self.agv_id)
+                if re_path:
+                    next_mission["from_node"] = dest_node
+                    next_mission["route_str"] = re_path["route_str"]
+                    next_mission["distance_m"] = re_path["total_distance_m"]
+                    next_mission["segments"] = re_path["segments"]
+                    next_mission["route_legs"] = self._build_route_legs(map_id, re_path)
+
             next_mission["status"] = "ACTIVE"
             self.active_mission = next_mission
-            next_to = next_mission["to_node"]
             next_task_id = next_mission.get("task_id", 0)
 
             if next_task_id > 0:
@@ -993,6 +1054,7 @@ class WMSWorkflowManager:
                 "message": msg,
                 "station": dest_node,
                 "next_station": next_to,
+                "task_id": next_task_id,
                 "next_mission": next_mission,
                 "command": cmd_obj,
                 "ai_result": ai_res

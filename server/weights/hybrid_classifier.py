@@ -1,16 +1,16 @@
-"""SLAM_KLTN — Hybrid Classifier: MobileNetV3-Small + OpenCV Geometric Verification.
+"""SLAM_KLTN — Hybrid Classifier: MobileNetV3-Small + OpenCV ROI & Geometric Verification (No YOLO).
 
 Fusion Architecture:
-1. Autonomous ROI Localization via YOLO11n (or fallback adaptive thresholding when permitted).
-2. Base classification from MobileNetV3-Small Improved.
+1. Autonomous ROI Localization & Empty Tray Detection via OpenCV (no YOLO dependency).
+2. Base classification from MobileNetV3-Small Improved (best.pth).
 3. Geometric feature extraction from GeometricAnalyzer (contour, circularity, ridge lines, acute angles).
 4. Explainable rule-based fusion with strict safety gates & corroboration:
    - High MobileNet confidence (>=0.85) defaults to MobileNet unless severe contradiction.
    - Low geometry evidence quality (LOW, NO_SIGNAL) never overrides MobileNet.
-   - Corroborated Prism rescue: requires acute angle / ridge lines AND non-trivial NN Prism probability (>=0.20).
+   - Corroborated Prism / Box rescue: resolves Box <-> Prism tilt ambiguities cleanly.
    - Uncorroborated contradictions emit NEEDS_REVIEW rather than forced classification.
-   - Multiple objects detected emit NEEDS_REVIEW (Station A constraint: exactly 1 object).
-   - Empty trays (dark or bright) emit NO_OBJECT.
+   - Multiple objects detected emit NEEDS_REVIEW in single-item full_scene mode.
+   - Empty trays (dark, gray, or bright paper) emit NO_OBJECT.
    - Inverted or out-of-bounds bounding boxes emit INVALID_IMAGE.
    - Strictly calibrated probabilities (no hardcoded 0.80 confidence).
    - Clean separation of Neural Network Probabilities, Geometry Evidence, and Final Decision.
@@ -147,7 +147,7 @@ class HybridPrediction:
 
 
 class HybridClassifier:
-    """Combines YOLO11n object localization, MobileNetV3-Small, and OpenCV geometry."""
+    """Combines OpenCV object localization, MobileNetV3-Small (best.pth), and OpenCV geometry (no YOLO)."""
 
     def __init__(
         self,
@@ -156,8 +156,8 @@ class HybridClassifier:
         device: Optional[Union[str, torch.device]] = None,
         confidence_threshold_high: float = 0.85,
         uncertainty_margin: float = 0.20,
-        require_yolo: bool = True,
-        allow_opencv_fallback: bool = False,
+        require_yolo: bool = False,
+        allow_opencv_fallback: bool = True,
     ):
         self.device = torch.device(device) if device is not None else torch.device("cpu")
         pkg_dir = Path(__file__).resolve().parent
@@ -167,25 +167,21 @@ class HybridClassifier:
         else:
             self.checkpoint_path = Path(checkpoint_path)
 
-        if yolo_path is None:
-            self.yolo_path = pkg_dir / "yolo11n_v5b_best.pt"
-        else:
-            self.yolo_path = Path(yolo_path)
-
+        # YOLO is explicitly disabled; keep attributes for signature compatibility only
+        self.yolo_path = None
         self.confidence_threshold_high = confidence_threshold_high
         self.uncertainty_margin = uncertainty_margin
-        self.require_yolo = require_yolo
-        self.allow_opencv_fallback = allow_opencv_fallback
+        self.require_yolo = False
+        self.allow_opencv_fallback = True
 
-        # 1. Load MobileNetV3-Small once
+        # 1. Load MobileNetV3-Small (best.pth) once
         self.model = self._load_mobilenet(self.checkpoint_path, self.device)
         # 2. Initialize Geometric Analyzer
         self.geom_analyzer = GeometricAnalyzer()
-        # 3. Initialize YOLO Detector for autonomous full image ROI localization
+        # 3. Initialize OpenCV Detector for autonomous full-scene ROI localization
         self.detector = ObjectDetector(
-            weights_path=self.yolo_path,
-            require_yolo=self.require_yolo,
-            allow_opencv_fallback=self.allow_opencv_fallback,
+            require_yolo=False,
+            allow_opencv_fallback=True,
         )
 
     def _load_mobilenet(self, path: Path, device: torch.device) -> nn.Module:
@@ -477,6 +473,24 @@ class HybridClassifier:
                     f"Contradiction: MobileNet predicted box (conf={nn_conf:.3f}) but geometry "
                     f"found sharp acute angle ({geom_res.min_corner_angle:.1f} deg)."
                 )
+            elif (
+                nn_cls_name == "triangular_prism"
+                and nn_conf < 0.90
+                and geo_quality in ("HIGH", "MEDIUM")
+                and float(probs[1]) >= 0.05
+                and flags.get("has_strictly_orthogonal_lines", False)
+                and (flags.get("is_rectangular_fill", False) or geom_res.extent >= 0.88)
+                and geom_res.acute_angles_count == 0
+            ):
+                final_id = 1
+                final_name = "rectangular_box"
+                decision_type = "GEOMETRY_OVERRIDE_BOX"
+                decision_status = DECISION_STATUS_CLASSIFIED
+                is_override = True
+                explanation = (
+                    f"Override Prism -> Box: Orthogonal rectangular contour (extent={geom_res.extent:.2f}, "
+                    f"0 acute angles) overrides moderate Prism ({nn_conf:.3f})."
+                )
             else:
                 decision_type = "MOBILENET_DIRECT"
                 decision_status = DECISION_STATUS_CLASSIFIED
@@ -497,7 +511,7 @@ class HybridClassifier:
 
                 # Corroboration condition 1: Acute angle + NN corroboration
                 is_strictly_orthogonal = flags.get("has_strictly_orthogonal_lines", False)
-                high_box_extent = geom_res.extent >= 0.70
+                high_box_extent = (geom_res.extent >= 0.70) or flags.get("is_rectangular_fill", False)
                 if (has_acute or has_tri) and geo_quality in ("HIGH", "MEDIUM") and not is_strictly_orthogonal and not high_box_extent:
                     if p_prism_nn >= 0.35:
                         final_id = 2
@@ -642,11 +656,13 @@ class HybridClassifier:
 
             # Sub-case 3C: MobileNet predicted Triangular Prism
             elif nn_cls_name == "triangular_prism":
+                p_box_nn = float(probs[1])
+                rect_fill = flags.get("is_rectangular_fill", False)
                 if (
                     flags.get("has_strictly_orthogonal_lines", False)
-                    and geom_res.extent >= 0.88
                     and geom_res.acute_angles_count == 0
-                    and (nn_conf < 0.60 or (geom_res.extent >= 0.92 and nn_conf < 0.75))
+                    and (geom_res.extent >= 0.88 or rect_fill)
+                    and (nn_conf < 0.65 or ((geom_res.extent >= 0.92 or rect_fill) and nn_conf < 0.82 and p_box_nn >= 0.12))
                 ):
                     final_id = 1
                     final_name = "rectangular_box"

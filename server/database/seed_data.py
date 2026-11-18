@@ -12,13 +12,31 @@ if str(SERVER_DIR) not in sys.path:
 
 from database.db_connection import get_db, init_db, DB_PATH
 
-def seed_database(db_file: Path = DB_PATH):
-    """Nạp dữ liệu cấu hình bản đồ động và quy tắc phân bổ kho thông minh"""
+def seed_database(db_file: Path = DB_PATH, reset: bool = True):
+    """Nạp dữ liệu cấu hình bản đồ động và quy tắc phân bổ kho thông minh.
+
+    - Khi reset=False (mặc định khi server khởi động lại): giữ nguyên toàn bộ bản đồ,
+      danh mục sản phẩm, quy tắc phân bổ trạm, tồn kho và lịch sử nếu DB đã khởi tạo.
+    - Khi reset=True hoặc DB mới tinh: nạp dữ liệu mẫu ban đầu.
+    """
     # 1. Đảm bảo cấu trúc bảng đã tồn tại
     init_db(db_file)
 
     with get_db(db_file) as conn:
         cursor = conn.cursor()
+
+        if not reset:
+            maps_cnt = cursor.execute("SELECT COUNT(*) FROM maps;").fetchone()[0]
+            prods_cnt = cursor.execute("SELECT COUNT(*) FROM products;").fetchone()[0]
+            if maps_cnt > 0 and prods_cnt > 0:
+                # Chỉ mở khóa line treo (nếu server tắt đột ngột trước đó) và giữ nguyên dữ liệu WMS
+                cursor.execute("UPDATE line_segments SET is_locked = 0, locked_by_agv = NULL;")
+                cursor.execute(
+                    "UPDATE agv_fleet SET status = 'OFFLINE', speed_cm_s = 0.0, "
+                    "voltage_v = 0.0, current_a = 0.0, battery_pct = 0.0;"
+                )
+                print(f"💾 Đã phát hiện Database hiện có ({maps_cnt} bản đồ, {prods_cnt} mặt hàng) -> Giữ nguyên cấu hình & tồn kho: {db_file}")
+                return
 
         # 2. NẠP CÁC BẢN ĐỒ MẪU (BẢN ĐỒ 1: SA BÀN LAB 1.54m x 1.51m & BẢN ĐỒ 2: KHO MỞ RỘNG 6 TRẠM)
         cursor.execute("""
@@ -95,10 +113,15 @@ def seed_database(db_file: Path = DB_PATH):
                 is_locked=0, locked_by_agv=NULL;
         """, segments_data)
 
-        # 5. NẠP DANH MỤC SẢN PHẨM & MÔ HÌNH AI YOLO (PRODUCTS)
+        # 5. NẠP DANH MỤC SẢN PHẨM & MÔ HÌNH AI MOBILENETV3 (PRODUCTS)
+        # Khớp class_names.json của best.pth: 0 = cylinder (PKG_MECH), 1 = rectangular_box (PKG_ELEC), 2 = triangular_prism (PKG_TOOL)
+        cursor.execute(
+            "UPDATE products SET yolo_class_id = -(yolo_class_id + 1000) "
+            "WHERE product_code IN ('PKG_MECH', 'PKG_ELEC', 'PKG_TOOL') AND yolo_class_id >= 0;"
+        )
         products_data = [
-            ("PKG_ELEC", "Bo Mạch Vi Điều Khiển", 0, "ELECTRONIC", "Hàng linh kiện điện tử nhạy cảm ESD"),
-            ("PKG_MECH", "Chi Tiết Bánh Răng & Khớp Nối", 1, "MECHANICAL", "Hàng chi tiết cơ khí chính xác"),
+            ("PKG_MECH", "Chi Tiết Bánh Răng & Khớp Nối", 0, "MECHANICAL", "Hàng chi tiết cơ khí chính xác"),
+            ("PKG_ELEC", "Bo Mạch Vi Điều Khiển", 1, "ELECTRONIC", "Hàng linh kiện điện tử nhạy cảm ESD"),
             ("PKG_TOOL", "Bộ Dụng Cụ Đo & Kiểm Thử", 2, "TOOL", "Hàng thiết bị đo lường kiểm thử")
         ]
         cursor.executemany("""
