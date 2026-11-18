@@ -149,6 +149,10 @@ float bridgeRefHeadingDeg            = 90.0f;
 float finalAimUx                     = 0.0f;
 float finalAimUy                     = 1.0f;
 bool  stationCrossBarLatched         = false;
+bool  cornerSensorAnchored           = false;
+bool  crossBarEnteredFromLine        = false;
+uint8_t consecutiveCrossBarFrames    = 0;
+int   framesSinceTracked12Line       = 999;
 bool  curvedExcursionDetected        = false;
 float gapHeadingHoldDeg              = 0.0f;
 float lastGapHeadingErr              = 0.0f;
@@ -570,6 +574,13 @@ LegId findOfflineLegId(const char* fromName, const char* toName) {
   return LEG_NONE;
 }
 
+static inline void resetLegCornerAnchorStateLocked() {
+  cornerSensorAnchored = false;
+  crossBarEnteredFromLine = false;
+  consecutiveCrossBarFrames = 0;
+  framesSinceTracked12Line = 999;
+}
+
 static inline void clearLineHistoryLocked() {
   histHead = 0;
   histCount = 0;
@@ -687,6 +698,7 @@ void applyDynamicLegLocked(const DynamicLeg &leg, float &outHeadingErr, bool &ou
   finalAimUx = ux;
   finalAimUy = uy;
   stationCrossBarLatched = false;
+  resetLegCornerAnchorStateLocked();
   curvedExcursionDetected = false;
   bendCatchAttemptedForGap = false;
   bendCatchStage    = 0;
@@ -1462,6 +1474,74 @@ static inline float computeDistToTarget2DM(float remainingProjM) {
            : fmaxf(0.0f, remainingProjM);
 }
 
+// Neo cự ly dọc 1 lần theo đúng điểm cảm biến vừa chạm giao điểm góc 90° cuối chặng
+// (chỉ kích hoạt khi từ line 1-2 mắt tiến thẳng vào góc đích, bỏ qua khúc gãy/đứt vạch).
+static inline void applyCornerSensorAnchorLocked(int activeCount,
+                                                 float liveGzDegPerSec,
+                                                 float &remainingLegMRef,
+                                                 float &distToTarget2DRef,
+                                                 bool &outLogAnchor,
+                                                 float &outShiftCm) {
+  if (activeCount >= 3) {
+    if (consecutiveCrossBarFrames == 0) {
+      crossBarEnteredFromLine = (framesSinceTracked12Line <= 4);
+    }
+    if (consecutiveCrossBarFrames < 50) consecutiveCrossBarFrames++;
+  } else {
+    consecutiveCrossBarFrames = 0;
+    crossBarEnteredFromLine = false;
+  }
+
+  float yawErrDeg = fabsf(normalizeAngleDeg(yawDeg - legTargetHeadingDeg));
+  float pureYawErrDeg = fabsf(normalizeAngleDeg(pureMpuYawDeg - legTargetHeadingDeg));
+  if (cornerSensorAnchored || !lineTrackedOnLeg || !crossBarEnteredFromLine ||
+      consecutiveCrossBarFrames < 2 || (legArcDistM < 0.72f * legTargetDistM) ||
+      (yawErrDeg > 10.0f) || (pureYawErrDeg > 12.0f) || (fabsf(liveGzDegPerSec) > 45.0f)) {
+    return;
+  }
+
+  float desiredRemM = DIST_AXLE_TO_SENSOR_M - 0.005f;
+  float legRad = legTargetHeadingDeg * DEG2RAD_F;
+  float ux = cosf(legRad);
+  float uy = sinf(legRad);
+  float curRemAlong = currentTargetHasCoord
+                        ? ((currentTargetX - odomX) * ux + (currentTargetY - odomY) * uy)
+                        : remainingLegMRef;
+  if (curRemAlong < -0.05f || curRemAlong > 0.36f) {
+    return;
+  }
+
+  float rawShiftAlong = curRemAlong - desiredRemM;
+  cornerSensorAnchored = true;
+  if (fabsf(rawShiftAlong) <= 0.030f) {
+    return;
+  }
+
+  float shiftAlong = constrain(rawShiftAlong, -0.22f, 0.22f);
+  if (currentTargetHasCoord) {
+    ekfX += shiftAlong * ux;
+    ekfY += shiftAlong * uy;
+    odomX = ekfX;
+    odomY = ekfY;
+    pureMpuLegX += shiftAlong * ux;
+    pureMpuLegY += shiftAlong * uy;
+    legProgressM = useGlobalLineProgress
+                     ? computeLegAlongM()
+                     : fmaxf(0.0f, legProgressM + shiftAlong);
+  } else {
+    legProgressM = fmaxf(0.0f, legProgressM + shiftAlong);
+  }
+  remainingLegMRef = legTargetDistM - legProgressM;
+  distToTarget2DRef = computeDistToTarget2DM(remainingLegMRef);
+  if (cornerApproachLatched) {
+    finalAimUx = ux;
+    finalAimUy = uy;
+  }
+  stationCrossBarLatched = true;
+  outLogAnchor = true;
+  outShiftCm = shiftAlong * 100.0f;
+}
+
 // Dừng an toàn kèm phanh ngắn chủ động 90ms khi vượt giới hạn bridge/mất vạch
 static inline void enterGapTimeoutStopLocked(unsigned long nowMs) {
   smoothedBaseSpeed = 0.0f;
@@ -1621,6 +1701,7 @@ static inline void enterLineFollowingFromTurnLocked(bool lineSeen, float initial
   pureMpuLegY = odomY;
   bridgeRefHeadingDeg = yawDeg;
   stationCrossBarLatched = false;
+  resetLegCornerAnchorStateLocked();
   curvedExcursionDetected = false;
   bendCatchAttemptedForGap = false;
   bendCatchStage    = 0;
@@ -1662,6 +1743,7 @@ static inline void resetStopStateLocked(const char* stateLabel) {
   bridgeTurnAligning = false;
   cornerApproachLatched = false;
   stationCrossBarLatched = false;
+  resetLegCornerAnchorStateLocked();
   curvedExcursionDetected = false;
   bendCatchAttemptedForGap = false;
   bendCatchStage    = 0;
@@ -1743,11 +1825,11 @@ void updateControlAndOdometry(float dt = 0.010f) {
   int outRightPwm = 0;
 
   // Flags log ngoài stateMux (tránh chặn ngắt khi in Serial)
-  bool logCaught = false, logArrived = false, logGapStart = false, logGapTimeout = false, logGapRecovered = false;
+  bool logCaught = false, logArrived = false, logGapStart = false, logGapTimeout = false, logGapRecovered = false, logCornerAnchor = false;
   bool needReinitMpu = false, logZuptRecover = false;
   char logLegBuf[28] = {0};
   char logStBuf[12]  = {0};
-  float logYaw = 0.0f, logX = 0.0f, logY = 0.0f, logGapVal = 0.0f, recoveredGyroOffset = gyroZOffset;
+  float logYaw = 0.0f, logX = 0.0f, logY = 0.0f, logGapVal = 0.0f, logAnchorShiftCm = 0.0f, recoveredGyroOffset = gyroZOffset;
 
   portENTER_CRITICAL(&stateMux);
 
@@ -2144,8 +2226,11 @@ void updateControlAndOdometry(float dt = 0.010f) {
       legProgressM += fwdDelta;
     }
   }
+  if (framesSinceTracked12Line < 999) framesSinceTracked12Line++;
   float remainingLegM = legTargetDistM - legProgressM;
   float distToTarget2D = computeDistToTarget2DM(remainingLegM);
+  applyCornerSensorAnchorLocked(activeCount, liveGzDegPerSec, remainingLegM, distToTarget2D, logCornerAnchor, logAnchorShiftCm);
+  if (logCornerAnchor) snprintf(logLegBuf, sizeof(logLegBuf), "%s", currentLegName);
   float sensorReachCornerDistM = legTargetDistM - DIST_AXLE_TO_SENSOR_M;
   bool pastMinArc = (legArcDistM >= 0.65f * legTargetDistM);
   bool stationCrossBarSeen = (activeCount >= 3) || ((lineMask & 0b01110) == 0b01110);
@@ -2155,6 +2240,9 @@ void updateControlAndOdometry(float dt = 0.010f) {
                                  (distToTarget2D <= 0.34f);
 
   if (!cornerApproachLatched && pastMinArc) {
+    bool alignedOnLegNearEnd        = lineTrackedOnLeg && (legArcDistM >= 0.82f * legTargetDistM) &&
+                                      (remainingLegM <= (DIST_AXLE_TO_SENSOR_M + 0.02f)) &&
+                                      (fabsf(normalizeAngleDeg(yawDeg - legTargetHeadingDeg)) <= 14.0f);
     bool reachByZoneAndCrossBar     = currentTargetHasCoord && (distToTarget2D <= 0.30f) && stationCrossBarSeen;
     bool reachByAxleRadius          = currentTargetHasCoord && (distToTarget2D <= (DIST_AXLE_TO_SENSOR_M + 0.02f));
     bool reachByCornerBarAlongPlane = currentTargetHasCoord && (legArcDistM >= 0.72f * legTargetDistM) &&
@@ -2162,15 +2250,17 @@ void updateControlAndOdometry(float dt = 0.010f) {
                                       (remainingLegM >= -0.20f) && (distToTarget2D <= 0.30f);
     bool reachByForwardPlane        = (legArcDistM >= 0.85f * legTargetDistM) &&
                                       (remainingLegM <= (DIST_AXLE_TO_SENSOR_M + 0.02f)) &&
-                                      (!currentTargetHasCoord || (distToTarget2D <= 0.24f && fabsf(computeLegCrossTrackM()) <= 0.18f));
+                                      (!currentTargetHasCoord || alignedOnLegNearEnd ||
+                                       (distToTarget2D <= 0.24f && fabsf(computeLegCrossTrackM()) <= 0.18f));
     bool reachBy1DFallback          = (!currentTargetHasCoord && legProgressM >= sensorReachCornerDistM);
     if (reachByZoneAndCrossBar || reachByAxleRadius || reachByCornerBarAlongPlane ||
         reachByForwardPlane || straightCorridorNearEnd || reachBy1DFallback) {
       cornerApproachLatched = true;
-      stationCrossBarLatched = stationCrossBarSeen;
+      stationCrossBarLatched = stationCrossBarLatched || stationCrossBarSeen;
       inGapBridgeMode = false;
       bridgeTurnAligning = false;
-      if (currentTargetHasCoord && distToTarget2D <= 0.36f && distToTarget2D > 0.04f) {
+      bool alignedWithLeg = (fabsf(normalizeAngleDeg(yawDeg - legTargetHeadingDeg)) <= 14.0f);
+      if (currentTargetHasCoord && !alignedWithLeg && distToTarget2D <= 0.36f && distToTarget2D > 0.04f) {
         finalAimUx = (currentTargetX - odomX) / distToTarget2D;
         finalAimUy = (currentTargetY - odomY) / distToTarget2D;
       } else {
@@ -2200,6 +2290,7 @@ void updateControlAndOdometry(float dt = 0.010f) {
       smoothedBaseSpeed = 0.0f;
       cornerApproachLatched = false;
       stationCrossBarLatched = false;
+      resetLegCornerAnchorStateLocked();
       curvedExcursionDetected = false;
       bendCatchAttemptedForGap = false;
       bendCatchStage = 0;
@@ -2297,6 +2388,7 @@ void updateControlAndOdometry(float dt = 0.010f) {
         lastLineError = liveMaskErr;
       }
       consecutiveZeroLineFrames = 0;
+      framesSinceTracked12Line = 0;
       lineTrackedOnLeg = true;
       lastLineYawDeg = yawDeg;
       currentLineErr = liveMaskErr;
@@ -2308,10 +2400,11 @@ void updateControlAndOdometry(float dt = 0.010f) {
       float omegaRefRadS = constrain(-(2.0f * uApp) / (slope * WHEEL_BASE_W_M), -1.8f, 1.8f);
       computeLoadedCascadePwm((float)max(approachBase, minMovePwm), omegaRefRadS, liveGzDegPerSec, deltaSL, deltaSR, realDt, leftPwm, rightPwm);
     } else {
-      float aimClampDeg = (curvedExcursionDetected && currentTargetHasCoord && fabsf(computeLegCrossTrackM()) > 0.07f) ? 68.0f : 12.0f;
+      bool alignedApproach = (fabsf(normalizeAngleDeg(yawDeg - legTargetHeadingDeg)) <= 14.0f);
+      float aimClampDeg = (!alignedApproach && curvedExcursionDetected && currentTargetHasCoord && fabsf(computeLegCrossTrackM()) > 0.07f) ? 68.0f : 12.0f;
       float relAimFromLeg = constrain(normalizeAngleDeg(baseAimHeadingDeg - legTargetHeadingDeg), -aimClampDeg, aimClampDeg);
       float cornerHeading = normalizeAngleDeg(legTargetHeadingDeg + relAimFromLeg);
-      if (remAlongFinal <= 0.14f && (!curvedExcursionDetected || !currentTargetHasCoord || fabsf(computeLegCrossTrackM()) <= 0.07f)) {
+      if (alignedApproach || (remAlongFinal <= 0.14f && (!curvedExcursionDetected || !currentTargetHasCoord || fabsf(computeLegCrossTrackM()) <= 0.07f))) {
         cornerHeading = legTargetHeadingDeg;
       } else if (currentTargetHasCoord && distToTarget2D > 0.10f) {
         float rawCornerDeg = atan2f(currentTargetY - odomY, currentTargetX - odomX) * RAD2DEG_F;
@@ -2323,6 +2416,10 @@ void updateControlAndOdometry(float dt = 0.010f) {
     robotStateStr = "APPROACH_CORNER";
     portEXIT_CRITICAL(&stateMux);
     setMotors(leftPwm, rightPwm);
+    if (logCornerAnchor) {
+      Serial.printf("\n📐 [NEO GÓC CUỐI CHẶNG %s] Chỉnh cự ly dọc %+.1fcm -> Còn 22.5cm về tâm góc\n",
+                    logLegBuf, logAnchorShiftCm);
+    }
     return;
   }
 
@@ -2382,7 +2479,7 @@ void updateControlAndOdometry(float dt = 0.010f) {
       summarizeRecentBendSignalsLocked(outsideStationZone, recentHadBendMask, recentDirErr, recentMeanGzAbs);
       float pureYawErrLeg = fabsf(normalizeAngleDeg(pureMpuYawDeg - legTargetHeadingDeg));
       bool isBendLoss = lineTrackedOnLeg && !bendCatchAttemptedForGap && !stationCrossBarLatched &&
-                        (distToTarget2D > 0.28f) &&
+                        (distToTarget2D > 0.28f) && (remainingLegM > 0.30f) &&
                         (curvedExcursionDetected || pureYawErrLeg > 14.0f || recentMeanGzAbs >= 26.0f ||
                          (recentHadBendMask && fabsf(recentDirErr) >= 1.15f));
 
@@ -2585,6 +2682,9 @@ void updateControlAndOdometry(float dt = 0.010f) {
 
     // Bám Line Tự Do trong Nón Đích: Chỉ ghi nhận bám line vững (lineTrackedOnLeg) khi 4 khung hình
     // liên tiếp giữ gần tâm vạch (chống chạm mép rìa 1 khung lúc mới xuất phát rồi quay đầu).
+    if (activeCount >= 1 && activeCount <= 2 && fabsf(liveMaskErr) <= 1.5f && !isBendMask) {
+      framesSinceTracked12Line = 0;
+    }
     if (fabsf(currentLineErr) <= 1.0f && !isBendMask) {
       if (consecutiveGoodLineFrames < 50) consecutiveGoodLineFrames++;
       if (activeCount <= 3) {
@@ -2687,6 +2787,10 @@ void updateControlAndOdometry(float dt = 0.010f) {
   if (logGapRecovered) {
     Serial.printf("\n🎯 [BẮT LẠI VẠCH] Đã vượt qua khoảng đứt %.2fm -> Tiếp tục bám line %s!\n",
                   logGapVal, logLegBuf);
+  }
+  if (logCornerAnchor) {
+    Serial.printf("\n📐 [NEO GÓC CUỐI CHẶNG %s] Chỉnh cự ly dọc %+.1fcm -> Còn 22.5cm về tâm góc\n",
+                  logLegBuf, logAnchorShiftCm);
   }
 }
 
@@ -2956,6 +3060,7 @@ void telemetryTask(void *pvParameters) {
             finalAimUx = 0.0f;
             finalAimUy = 1.0f;
             stationCrossBarLatched = false;
+            resetLegCornerAnchorStateLocked();
             curvedExcursionDetected = false;
             bendCatchAttemptedForGap = false;
             bendCatchStage = 0;
