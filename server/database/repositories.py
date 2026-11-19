@@ -5,10 +5,14 @@ HỖ TRỢ: ĐA BẢN ĐỒ LINE, TỒN KHO ĐA MẶT HÀNG, PHÂN BỔ KHO THÔ
 ===================================================================================
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+import hashlib
+import json
+import math
 import sys
 SERVER_DIR = Path(__file__).resolve().parent.parent
 if str(SERVER_DIR) not in sys.path:
@@ -16,10 +20,265 @@ if str(SERVER_DIR) not in sys.path:
 
 from database.db_connection import get_db, DB_PATH
 
+MAX_FIRMWARE_MAP_NODES = 16
+MAX_FIRMWARE_MAP_EDGES = 64
+
+
+def normalize_heading_deg(deg: float) -> float:
+    """Chuẩn hóa góc la bàn về khoảng (-180.0, 180.0] giống hệt tools/sync_map.py."""
+    val = float(deg) % 360.0
+    if val > 180.0:
+        val -= 360.0
+    if val == -180.0:
+        val = 180.0
+    return round(val, 1)
+
+
+def compute_map_hash(
+    map_id: str,
+    nodes: List[Dict[str, Any]],
+    segments: List[Dict[str, Any]],
+) -> str:
+    """Tính mã băm 8 ký tự hex đồng nhất giữa JSON Map-as-Code, SQLite DB và Firmware ESP32."""
+    canon_nodes = sorted(
+        [
+            [
+                str(n["node_id"]).strip().upper(),
+                round(float(n["x"]), 3),
+                round(float(n["y"]), 3),
+                str(n.get("type") or n.get("node_type") or "STATION").strip().upper(),
+            ]
+            for n in nodes
+        ],
+        key=lambda item: item[0],
+    )
+    canon_edges = sorted(
+        [
+            [
+                str(e.get("from_node") or e.get("from", "")).strip().upper(),
+                str(e.get("to_node") or e.get("to", "")).strip().upper(),
+                round(float(e["distance_m"] if "distance_m" in e else e["dist_m"]), 3),
+                normalize_heading_deg(float(e["heading_deg"] if "heading_deg" in e else e["heading"])),
+            ]
+            for e in segments
+        ],
+        key=lambda item: (item[0], item[1]),
+    )
+    payload = json.dumps(
+        {"map_id": str(map_id).strip().upper(), "nodes": canon_nodes, "edges": canon_edges},
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+
+
+def validate_and_expand_map_config(
+    config: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Kiểm tra chặt chẽ cấu hình bản đồ JSON và mở rộng các chặng hai chiều."""
+    if not isinstance(config, dict):
+        raise ValueError("Cấu hình bản đồ phải là đối tượng JSON")
+
+    map_id = str(config.get("map_id", "")).strip().upper()
+    if not map_id or len(map_id) > 64:
+        raise ValueError("map_id không được rỗng và tối đa 64 ký tự")
+
+    name = str(config.get("name") or f"Bản đồ {map_id}").strip()
+    desc = str(config.get("description", "Bản đồ Map-as-Code")).strip()
+    try:
+        width_m = float(config.get("width_m", 2.0))
+        length_m = float(config.get("length_m", 2.0))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"[{map_id}] Kích thước bản đồ không hợp lệ: {e}") from e
+
+    if not (math.isfinite(width_m) and width_m > 0.2 and math.isfinite(length_m) and length_m > 0.2):
+        raise ValueError(f"[{map_id}] width_m và length_m phải > 0.2m")
+
+    raw_nodes = config.get("nodes")
+    raw_segments = config.get("segments")
+    if not isinstance(raw_nodes, list) or len(raw_nodes) < 2:
+        raise ValueError(f"[{map_id}] Bản đồ phải có ít nhất 2 trạm (nodes)")
+    if len(raw_nodes) > MAX_FIRMWARE_MAP_NODES:
+        raise ValueError(f"[{map_id}] Số trạm ({len(raw_nodes)}) vượt giới hạn firmware {MAX_FIRMWARE_MAP_NODES}")
+    if not isinstance(raw_segments, list) or len(raw_segments) < 1:
+        raise ValueError(f"[{map_id}] Bản đồ phải có ít nhất 1 đoạn đường (segments)")
+
+    allowed_types = {"INBOUND", "STATION", "INTERSECTION", "CHARGING", "PARKING"}
+    norm_nodes: List[Dict[str, Any]] = []
+    node_map: Dict[str, Dict[str, Any]] = {}
+
+    for idx, n in enumerate(raw_nodes):
+        if not isinstance(n, dict):
+            raise ValueError(f"[{map_id}] Node #{idx} không hợp lệ")
+        nid = str(n.get("node_id", "")).strip().upper()
+        if not nid or len(nid) > 11 or " " in nid:
+            raise ValueError(f"[{map_id}] node_id '{nid}' không hợp lệ (1..11 ký tự, không khoảng trắng)")
+        if nid in node_map:
+            raise ValueError(f"[{map_id}] Trùng node_id '{nid}'")
+
+        ntype = str(n.get("type") or n.get("node_type") or "STATION").strip().upper()
+        if ntype not in allowed_types:
+            raise ValueError(f"[{map_id}] Node '{nid}' có type không hợp lệ: '{ntype}'")
+
+        try:
+            nx = float(n["x"])
+            ny = float(n["y"])
+            ncap = int(n.get("max_capacity", 30))
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"[{map_id}] Node '{nid}' thiếu hoặc sai tọa độ/sức chứa: {e}") from e
+
+        if not (math.isfinite(nx) and math.isfinite(ny)) or ncap <= 0:
+            raise ValueError(f"[{map_id}] Node '{nid}' có tọa độ/sức chứa không hợp lệ")
+
+        nobj = {
+            "node_id": nid,
+            "name": str(n.get("name", f"Trạm {nid}")).strip(),
+            "type": ntype,
+            "x": round(nx, 3),
+            "y": round(ny, 3),
+            "color": str(n.get("color", "#38bdf8")).strip() or "#38bdf8",
+            "max_capacity": ncap,
+        }
+        norm_nodes.append(nobj)
+        node_map[nid] = nobj
+
+    inbound_nodes = [n["node_id"] for n in norm_nodes if n["type"] == "INBOUND"]
+    raw_home = config.get("home_node")
+    if raw_home is not None and str(raw_home).strip():
+        home_node = str(raw_home).strip().upper()
+    elif inbound_nodes:
+        home_node = inbound_nodes[0]
+    elif "A" in node_map:
+        home_node = "A"
+    else:
+        raise ValueError(f"[{map_id}] Bản đồ phải có ít nhất 1 trạm type='INBOUND' hoặc chỉ định 'home_node'")
+
+    if home_node not in node_map:
+        raise ValueError(f"[{map_id}] Không tìm thấy home_node '{home_node}' trong danh sách nodes")
+    if not inbound_nodes:
+        node_map[home_node]["type"] = "INBOUND"
+
+    expanded_edges: List[Dict[str, Any]] = []
+    seen_segs = set()
+    adj_fwd: Dict[str, List[str]] = {nid: [] for nid in node_map}
+    adj_rev: Dict[str, List[str]] = {nid: [] for nid in node_map}
+
+    for idx, s in enumerate(raw_segments):
+        if not isinstance(s, dict):
+            raise ValueError(f"[{map_id}] Segment #{idx} không hợp lệ")
+        from_n = str(s.get("from") or s.get("from_node", "")).strip().upper()
+        to_n = str(s.get("to") or s.get("to_node", "")).strip().upper()
+        if from_n not in node_map or to_n not in node_map:
+            raise ValueError(f"[{map_id}] Segment #{idx} ({from_n}->{to_n}) tham chiếu trạm không tồn tại")
+        if from_n == to_n:
+            raise ValueError(f"[{map_id}] Segment #{idx} tự nối chính nó ({from_n}->{to_n})")
+
+        try:
+            raw_dist = s["dist_m"] if "dist_m" in s else s["distance_m"]
+            dist_m = float(raw_dist)
+            raw_spd = s["speed_limit"] if "speed_limit" in s else s.get("speed_limit_cm_s", 25.0)
+            spd = float(raw_spd)
+            has_gap = int(bool(s.get("has_gap", 0)))
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"[{map_id}] Segment ({from_n}->{to_n}) sai dist_m/speed_limit: {e}") from e
+
+        if not (math.isfinite(dist_m) and dist_m >= 0.05):
+            raise ValueError(f"[{map_id}] Segment ({from_n}->{to_n}) dist_m={dist_m} phải >= 0.05m")
+        if not (math.isfinite(spd) and 5.0 <= spd <= 150.0):
+            raise ValueError(f"[{map_id}] Segment ({from_n}->{to_n}) speed_limit={spd} ngoài [5, 150] cm/s")
+
+        dx = node_map[to_n]["x"] - node_map[from_n]["x"]
+        dy = node_map[to_n]["y"] - node_map[from_n]["y"]
+        euclid = math.hypot(dx, dy)
+        if euclid > 0.05 and dist_m < 0.85 * euclid:
+            raise ValueError(
+                f"[{map_id}] Segment ({from_n}->{to_n}) dist_m={dist_m:.2f}m ngắn bất thường (< 0.85 * {euclid:.2f}m)"
+            )
+
+        raw_head = s["heading"] if "heading" in s else s.get("heading_deg")
+        if raw_head is None:
+            head_deg = normalize_heading_deg(math.degrees(math.atan2(dy, dx)))
+        else:
+            try:
+                head_deg = normalize_heading_deg(float(raw_head))
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"[{map_id}] Segment ({from_n}->{to_n}) heading không hợp lệ: {e}") from e
+
+        two_way = bool(s.get("two_way", True)) if "direction" not in s else (str(s["direction"]).upper() == "TWO_WAY")
+        direction = "TWO_WAY" if two_way else "ONE_WAY"
+
+        sid_fwd = f"SEG_{from_n}{to_n}"
+        if sid_fwd not in seen_segs:
+            seen_segs.add(sid_fwd)
+            expanded_edges.append({
+                "segment_id": sid_fwd,
+                "from_node": from_n,
+                "to_node": to_n,
+                "distance_m": round(dist_m, 3),
+                "direction": direction,
+                "heading_deg": head_deg,
+                "speed_limit_cm_s": round(spd, 1),
+                "has_gap": has_gap,
+            })
+            adj_fwd[from_n].append(to_n)
+            adj_rev[to_n].append(from_n)
+
+        if two_way:
+            sid_rev = f"SEG_{to_n}{from_n}"
+            if sid_rev not in seen_segs:
+                seen_segs.add(sid_rev)
+                rev_head = normalize_heading_deg(head_deg + 180.0)
+                expanded_edges.append({
+                    "segment_id": sid_rev,
+                    "from_node": to_n,
+                    "to_node": from_n,
+                    "distance_m": round(dist_m, 3),
+                    "direction": "TWO_WAY",
+                    "heading_deg": rev_head,
+                    "speed_limit_cm_s": round(spd, 1),
+                    "has_gap": has_gap,
+                })
+                adj_fwd[to_n].append(from_n)
+                adj_rev[from_n].append(to_n)
+
+    if len(expanded_edges) > MAX_FIRMWARE_MAP_EDGES:
+        raise ValueError(f"[{map_id}] Tổng số chặng ({len(expanded_edges)}) vượt giới hạn firmware {MAX_FIRMWARE_MAP_EDGES}")
+
+    def _bfs(adj: Dict[str, List[str]], start: str) -> set:
+        visited = {start}
+        q = deque([start])
+        while q:
+            cur = q.popleft()
+            for nxt in adj.get(cur, []):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    q.append(nxt)
+        return visited
+
+    unreach_out = set(node_map.keys()) - _bfs(adj_fwd, home_node)
+    if unreach_out:
+        raise ValueError(f"[{map_id}] Không thể đi từ trạm gốc '{home_node}' tới: {sorted(unreach_out)}")
+    unreach_back = set(node_map.keys()) - _bfs(adj_rev, home_node)
+    if unreach_back:
+        raise ValueError(f"[{map_id}] Không có đường quay về trạm gốc '{home_node}' từ: {sorted(unreach_back)}")
+
+    meta = {
+        "map_id": map_id,
+        "name": name,
+        "width_m": round(width_m, 3),
+        "length_m": round(length_m, 3),
+        "description": desc,
+        "home_node": home_node,
+        "default_rules": list(config.get("default_rules") or []),
+    }
+    return meta, norm_nodes, expanded_edges
+
+
 class MapRepository:
     """Quản lý các bản đồ mạng lưới line (Topological Maps), Nodes và Segments"""
     def __init__(self, db_file: Path = DB_PATH):
         self.db_file = db_file
+        self.last_import_error: Optional[str] = None
 
     def get_active_map(self) -> Optional[Dict[str, Any]]:
         """Lấy bản đồ hiện đang được kích hoạt"""
@@ -27,16 +286,87 @@ class MapRepository:
             row = conn.execute("SELECT * FROM maps WHERE is_active = 1 LIMIT 1;").fetchone()
             return dict(row) if row else None
 
+    def get_map_by_id(self, map_id: str) -> Optional[Dict[str, Any]]:
+        target = str(map_id or "").strip().upper()
+        if not target:
+            return None
+        with get_db(self.db_file) as conn:
+            row = conn.execute("SELECT * FROM maps WHERE map_id = ? LIMIT 1;", (target,)).fetchone()
+            return dict(row) if row else None
+
     def get_all_maps(self) -> List[Dict[str, Any]]:
         with get_db(self.db_file) as conn:
             rows = conn.execute("SELECT * FROM maps ORDER BY created_at DESC;").fetchall()
             return [dict(r) for r in rows]
 
-    def set_active_map(self, map_id: str) -> bool:
-        """Kích hoạt một bản đồ mới mà không cần sửa code"""
+    def get_home_node(self, map_id: Optional[str] = None) -> Dict[str, Any]:
+        """Lấy thông tin trạm gốc (node_type='INBOUND'), fallback sang 'A' hoặc node đầu tiên."""
+        target_id = str(map_id or "").strip().upper()
+        if not target_id:
+            active = self.get_active_map()
+            target_id = str(active["map_id"]).upper() if active else "SABAN_154_151"
+        nodes = self.get_nodes(target_id)
+        for n in nodes:
+            if str(n.get("node_type", "")).upper() == "INBOUND":
+                return n
+        for n in nodes:
+            if str(n.get("node_id", "")).upper() == "A":
+                return n
+        if nodes:
+            return nodes[0]
+        return {"node_id": "A", "name": "Trạm A (Mặc định)", "node_type": "INBOUND", "x": 0.0, "y": 0.0}
+
+    def get_map_hash(self, map_id: Optional[str] = None) -> str:
+        """Tính map_hash hiện tại trong DB cho bản đồ chỉ định (hoặc bản đồ đang kích hoạt)."""
+        target_id = str(map_id or "").strip().upper()
+        if not target_id:
+            active = self.get_active_map()
+            if not active:
+                return ""
+            target_id = str(active["map_id"]).upper()
+        nodes = self.get_nodes(target_id)
+        segments = self.get_segments(target_id)
+        if not nodes or not segments:
+            return ""
+        return compute_map_hash(target_id, nodes, segments)
+
+    def set_active_map(self, map_id: str, sync_fleet: bool = True) -> bool:
+        """Kích hoạt an toàn một bản đồ đã tồn tại trong DB (tránh rơi về 0 active maps)."""
+        target_id = str(map_id or "").strip().upper()
+        if not target_id:
+            return False
         with get_db(self.db_file) as conn:
-            conn.execute("UPDATE maps SET is_active = 0;")
-            conn.execute("UPDATE maps SET is_active = 1 WHERE map_id = ?;", (map_id,))
+            exists = conn.execute("SELECT 1 FROM maps WHERE map_id = ?;", (target_id,)).fetchone()
+            if not exists:
+                return False
+            conn.execute("UPDATE maps SET is_active = 0 WHERE map_id != ?;", (target_id,))
+            conn.execute("UPDATE maps SET is_active = 1 WHERE map_id = ?;", (target_id,))
+
+            if sync_fleet:
+                nodes = conn.execute(
+                    "SELECT node_id, node_type, x, y FROM map_nodes WHERE map_id = ? ORDER BY node_id;",
+                    (target_id,),
+                ).fetchall()
+                node_ids = {r["node_id"] for r in nodes}
+                home_row = next((r for r in nodes if r["node_type"] == "INBOUND"), None)
+                if not home_row:
+                    home_row = next((r for r in nodes if r["node_id"] == "A"), None) or (nodes[0] if nodes else None)
+                if home_row:
+                    home_id = home_row["node_id"]
+                    hx, hy = float(home_row["x"]), float(home_row["y"])
+                    fleet_rows = conn.execute("SELECT agv_id, current_node, status FROM agv_fleet;").fetchall()
+                    for agv in fleet_rows:
+                        cur_n = str(agv["current_node"] or "").upper()
+                        if cur_n not in node_ids or agv["status"] == "OFFLINE":
+                            conn.execute(
+                                "UPDATE agv_fleet SET map_id = ?, current_node = ?, x = ?, y = ? WHERE agv_id = ?;",
+                                (target_id, home_id, hx, hy, agv["agv_id"]),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE agv_fleet SET map_id = ? WHERE agv_id = ?;",
+                                (target_id, agv["agv_id"]),
+                            )
             return True
 
     def get_nodes(self, map_id: str) -> List[Dict[str, Any]]:
@@ -95,97 +425,178 @@ class MapRepository:
                 """, (agv_id,))
             return True
 
-    def import_map_config(self, config: Dict[str, Any]) -> bool:
+    def upsert_map_config(self, config: Dict[str, Any], activate: bool = True) -> Dict[str, Any]:
         """
-        Nạp cấu hình bản đồ tùy biến linh hoạt từ JSON:
-          - map_id, name, width_m, length_m, description
-          - nodes: [ {node_id, name, type, x, y, color, max_capacity}, ... ]
-          - segments: [ {from, to, dist_m, heading, two_way, speed_limit}, ... ]
+        Nạp hoặc cập nhật bản đồ an toàn (Non-destructive UPSERT):
+          - Kiểm tra chặt chẽ schema, tọa độ, khoảng cách, node gốc INBOUND và tính liên thông đồ thị.
+          - KHÔNG BAO GIỜ xóa trắng map_nodes (bảo toàn 100% inventory & allocation_rules hiện hữu).
+          - Từ chối xóa trạm nếu trạm đó vẫn còn hàng tồn kho (> 0).
         """
-        map_id = str(config.get("map_id", "")).strip().upper()
-        name = str(config.get("name", "Bản đồ Tùy biến")).strip()
-        width_m = float(config.get("width_m", 2.0))
-        length_m = float(config.get("length_m", 2.0))
-        desc = str(config.get("description", "Bản đồ nạp linh hoạt qua JSON")).strip()
-        nodes = config.get("nodes", [])
-        segments = config.get("segments", [])
-
-        if not map_id or not nodes or not segments:
-            return False
+        meta, norm_nodes, expanded_edges = validate_and_expand_map_config(config)
+        map_id = meta["map_id"]
+        home_node = meta["home_node"]
+        new_node_ids = {n["node_id"] for n in norm_nodes}
+        home_info = next(n for n in norm_nodes if n["node_id"] == home_node)
 
         with get_db(self.db_file) as conn:
-            # 1. Lưu thông tin bản đồ
+            # 1. UPSERT thông tin bản đồ (tuyệt đối không dùng INSERT OR REPLACE vì gây ON DELETE CASCADE)
             conn.execute("""
                 INSERT INTO maps (map_id, name, width_m, length_m, description, is_active)
-                VALUES (?, ?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(map_id) DO UPDATE SET
                     name = excluded.name,
                     width_m = excluded.width_m,
                     length_m = excluded.length_m,
                     description = excluded.description;
-            """, (map_id, name, width_m, length_m, desc))
+            """, (map_id, meta["name"], meta["width_m"], meta["length_m"], meta["description"], 1 if activate else 0))
 
-            # Đặt map này làm active
-            conn.execute("UPDATE maps SET is_active = 0 WHERE map_id != ?;", (map_id,))
-            conn.execute("UPDATE maps SET is_active = 1 WHERE map_id = ?;", (map_id,))
+            if activate:
+                conn.execute("UPDATE maps SET is_active = 0 WHERE map_id != ?;", (map_id,))
+                conn.execute("UPDATE maps SET is_active = 1 WHERE map_id = ?;", (map_id,))
 
-            # 2. Xóa các node và segment cũ của map này nếu có
-            conn.execute("DELETE FROM line_segments WHERE map_id = ?;", (map_id,))
-            conn.execute("DELETE FROM map_nodes WHERE map_id = ?;", (map_id,))
+            # 2. Kiểm tra an toàn các node bị loại bỏ khỏi bản đồ cũ (chặn xóa nếu còn tồn kho > 0)
+            existing_nodes = {
+                r["node_id"]
+                for r in conn.execute("SELECT node_id FROM map_nodes WHERE map_id = ?;", (map_id,)).fetchall()
+            }
+            removed_nodes = existing_nodes - new_node_ids
+            for rid in sorted(removed_nodes):
+                qty_row = conn.execute(
+                    "SELECT COALESCE(SUM(quantity), 0) FROM inventory WHERE map_id = ? AND node_id = ?;",
+                    (map_id, rid),
+                ).fetchone()
+                if qty_row and int(qty_row[0]) > 0:
+                    raise ValueError(
+                        f"Không thể xóa trạm '{rid}' của bản đồ '{map_id}' vì vẫn còn {int(qty_row[0])} kiện hàng tồn kho."
+                    )
 
-            # 3. Nạp nodes mới
-            for n in nodes:
-                nid = str(n.get("node_id", "")).strip().upper()
-                nname = str(n.get("name", f"Trạm {nid}")).strip()
-                ntype = str(n.get("type", "STATION")).strip().upper()
-                nx = float(n.get("x", 0.0))
-                ny = float(n.get("y", 0.0))
-                ncolor = str(n.get("color", "#38bdf8")).strip()
-                ncap = int(n.get("max_capacity", 30))
-                is_occ = 1 if nid == "A" else 0
-                occ_agv = "AGV_Ver2" if nid == "A" else None
+            # Xóa trước các line_segments không còn tồn tại trong cấu hình mới (hoặc trỏ tới node bị xóa)
+            existing_segs = {
+                r["segment_id"]
+                for r in conn.execute("SELECT segment_id FROM line_segments WHERE map_id = ?;", (map_id,)).fetchall()
+            }
+            new_seg_ids = {e["segment_id"] for e in expanded_edges}
+            for sid in existing_segs - new_seg_ids:
+                conn.execute(
+                    "DELETE FROM line_segments WHERE map_id = ? AND segment_id = ?;",
+                    (map_id, sid),
+                )
 
+            # Xóa các node thừa đã xác nhận không còn tồn kho (> 0)
+            for rid in removed_nodes:
+                conn.execute(
+                    "DELETE FROM map_nodes WHERE map_id = ? AND node_id = ?;",
+                    (map_id, rid),
+                )
+
+            # 3. UPSERT từng trạm (bảo toàn khóa ngoại inventory & allocation_rules của các trạm giữ lại)
+            is_fresh_map = (len(existing_nodes) == 0)
+            for n in norm_nodes:
+                nid = n["node_id"]
+                is_occ = 1 if (is_fresh_map and nid == home_node) else 0
+                occ_agv = "AGV_Ver2" if (is_fresh_map and nid == home_node) else None
                 conn.execute("""
                     INSERT INTO map_nodes (map_id, node_id, name, node_type, x, y, color, max_capacity, is_occupied, occupied_by_agv)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, (map_id, nid, nname, ntype, nx, ny, ncolor, ncap, is_occ, occ_agv))
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(map_id, node_id) DO UPDATE SET
+                        name = excluded.name,
+                        node_type = excluded.node_type,
+                        x = excluded.x,
+                        y = excluded.y,
+                        color = excluded.color,
+                        max_capacity = excluded.max_capacity;
+                """, (map_id, nid, n["name"], n["type"], n["x"], n["y"], n["color"], n["max_capacity"], is_occ, occ_agv))
 
-            # 4. Nạp segments mới
-            seen_segs = set()
-            for s in segments:
-                from_n = str(s.get("from") or s.get("from_node", "")).strip().upper()
-                to_n = str(s.get("to") or s.get("to_node", "")).strip().upper()
-                dist_m = float(s.get("dist_m") or s.get("distance_m", 1.0))
-                heading = float(s.get("heading") or s.get("heading_deg", 0.0))
-                two_way = bool(s.get("two_way", True))
-                spd = float(s.get("speed_limit") or s.get("speed_limit_cm_s", 25.0))
+            # 4. UPSERT các đoạn line đã chuẩn hóa từ validate_and_expand_map_config
+            for e in expanded_edges:
+                conn.execute("""
+                    INSERT INTO line_segments (
+                        map_id, segment_id, from_node, to_node, distance_m, direction,
+                        heading_deg, speed_limit_cm_s, has_gap
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(map_id, segment_id) DO UPDATE SET
+                        from_node = excluded.from_node,
+                        to_node = excluded.to_node,
+                        distance_m = excluded.distance_m,
+                        direction = excluded.direction,
+                        heading_deg = excluded.heading_deg,
+                        speed_limit_cm_s = excluded.speed_limit_cm_s,
+                        has_gap = excluded.has_gap;
+                """, (
+                    map_id,
+                    e["segment_id"],
+                    e["from_node"],
+                    e["to_node"],
+                    e["distance_m"],
+                    e["direction"],
+                    e["heading_deg"],
+                    e["speed_limit_cm_s"],
+                    e["has_gap"],
+                ))
 
-                sid_fwd = f"SEG_{from_n}{to_n}"
-                if sid_fwd not in seen_segs:
-                    seen_segs.add(sid_fwd)
+            # 5. Khởi tạo luật phân bổ mặc định CHỈ khi bản đồ này chưa có bất kỳ quy tắc nào
+            rules_cnt = conn.execute(
+                "SELECT COUNT(*) FROM allocation_rules WHERE map_id = ?;",
+                (map_id,),
+            ).fetchone()[0]
+            if rules_cnt == 0:
+                inserted_rules = 0
+                for rule in meta.get("default_rules") or []:
+                    target_n = str(rule.get("target_node_id", "")).strip().upper()
+                    if target_n not in new_node_ids:
+                        continue
+                    cat = rule.get("product_category")
+                    pcode = rule.get("product_code")
+                    prio = int(rule.get("priority", 1))
                     conn.execute("""
-                        INSERT INTO line_segments (map_id, segment_id, from_node, to_node, distance_m, direction, heading_deg, speed_limit_cm_s)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-                    """, (map_id, sid_fwd, from_n, to_n, dist_m, "TWO_WAY" if two_way else "ONE_WAY", heading, spd))
+                        INSERT INTO allocation_rules (map_id, product_category, product_code, target_node_id, priority, is_active)
+                        VALUES (?, ?, ?, ?, ?, 1);
+                    """, (map_id, cat, pcode, target_n, prio))
+                    inserted_rules += 1
 
-                if two_way:
-                    sid_rev = f"SEG_{to_n}{from_n}"
-                    if sid_rev not in seen_segs:
-                        seen_segs.add(sid_rev)
-                        rev_heading = (heading + 180.0) % 360.0
-                        if rev_heading > 180.0: rev_heading -= 360.0
-                        conn.execute("""
-                            INSERT INTO line_segments (map_id, segment_id, from_node, to_node, distance_m, direction, heading_deg, speed_limit_cm_s)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-                        """, (map_id, sid_rev, to_n, from_n, dist_m, "TWO_WAY", rev_heading, spd))
+                if inserted_rules == 0:
+                    fallback_node = next((n["node_id"] for n in norm_nodes if n["node_id"] != home_node), home_node)
+                    conn.execute("""
+                        INSERT INTO allocation_rules (map_id, product_category, product_code, target_node_id, priority, is_active)
+                        VALUES (?, '*', NULL, ?, 9, 1);
+                    """, (map_id, fallback_node))
 
-            # 5. Khởi tạo luật phân bổ dự phòng cho map mới nếu chưa có
-            conn.execute("""
-                INSERT OR IGNORE INTO allocation_rules (map_id, product_category, product_code, target_node_id, priority, is_active)
-                SELECT ?, '*', NULL, node_id, 9, 1 FROM map_nodes WHERE map_id = ? AND node_id != 'A' LIMIT 1;
-            """, (map_id, map_id))
+            # 6. Đồng bộ vị trí đội xe AGV nếu kích hoạt map này
+            if activate:
+                fleet_rows = conn.execute("SELECT agv_id, current_node, status FROM agv_fleet;").fetchall()
+                for agv in fleet_rows:
+                    cur_n = str(agv["current_node"] or "").upper()
+                    if cur_n not in new_node_ids or agv["status"] == "OFFLINE":
+                        conn.execute(
+                            "UPDATE agv_fleet SET map_id = ?, current_node = ?, x = ?, y = ? WHERE agv_id = ?;",
+                            (map_id, home_node, home_info["x"], home_info["y"], agv["agv_id"]),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE agv_fleet SET map_id = ? WHERE agv_id = ?;",
+                            (map_id, agv["agv_id"]),
+                        )
 
+        return {
+            "map_id": map_id,
+            "home_node": home_node,
+            "map_hash": compute_map_hash(map_id, norm_nodes, expanded_edges),
+            "nodes_count": len(norm_nodes),
+            "edges_count": len(expanded_edges),
+        }
+
+    def import_map_config(self, config: Dict[str, Any], activate: bool = True) -> bool:
+        """
+        Nạp cấu hình bản đồ tùy biến an toàn (giữ tương thích trả về bool, chi tiết lỗi lưu ở last_import_error).
+        """
+        self.last_import_error = None
+        try:
+            self.upsert_map_config(config, activate=activate)
             return True
+        except Exception as e:
+            self.last_import_error = str(e)
+            return False
 
     def export_map_config(self, map_id: str) -> Optional[Dict[str, Any]]:
         """Xuất toàn bộ cấu trúc bản đồ ra định dạng JSON chuẩn"""

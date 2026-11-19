@@ -135,7 +135,7 @@
       </div>
     </div>
     <div class="flex items-center gap-2 shrink-0">
-      <span id="txtHeartbeatWait" class="font-mono text-[11px] text-slate-500">UDP Beacon: Port 5005</span>
+      <span id="txtHeartbeatWait" class="font-mono text-[11px] text-slate-500">mDNS: agv-wms.local:5000</span>
       <button onclick="updateState()" class="px-2.5 py-1 rounded bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-mono text-[11px] font-semibold transition-colors flex items-center gap-1 shadow-xs">
         <span class="material-symbols-outlined text-[13px]">refresh</span>Quét lại
       </button>
@@ -164,11 +164,18 @@
                 <span class="font-mono text-[10px] text-primary bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded uppercase font-semibold">2D Floor Twin</span>
               </div>
               <div class="flex items-center gap-1.5 font-mono text-[11px]">
+                <span id="mapSyncWarnBadge" class="hidden bg-red-50 border border-red-300 text-red-700 px-2 py-0.5 rounded font-semibold flex items-center gap-1" title="Firmware ESP32 đang chạy bản đồ khác Server!">
+                  <span class="material-symbols-outlined text-[13px]">warning</span>
+                  <span id="mapSyncWarnText">LỆCH MAP FW</span>
+                </span>
                 <span class="bg-blue-50 border border-blue-200/60 px-2 py-0.5 rounded text-primary flex items-center gap-1 font-medium">
                   <span class="w-1.5 h-1.5 rounded-full bg-primary animate-pulse"></span>Dijkstra Router
                 </span>
                 <span id="lblActiveMapBadge" class="bg-slate-100 border border-slate-200 text-slate-700 px-2 py-0.5 rounded font-medium">
                   SABAN_154_151
+                </span>
+                <span id="lblMapHashBadge" class="bg-slate-50 border border-slate-200 text-slate-500 px-1.5 py-0.5 rounded text-[10px]" title="Mã băm đồng bộ Map-as-Code Server/ESP32">
+                  #--
                 </span>
               </div>
             </div>
@@ -242,17 +249,17 @@
                 <div id="camPlaceholder" class="flex flex-col items-center justify-center text-slate-500 gap-1.5">
                   <span class="material-symbols-outlined text-[32px] text-slate-600">center_focus_weak</span>
                   <span class="font-mono text-[11px]">Sẵn sàng nhận ảnh từ CameraX</span>
-                  <span class="font-sans text-[10px] text-slate-600 text-center px-4">Khi AGV dừng ở Trạm Nhập A, ứng dụng Android sẽ tự động chụp và gửi ảnh phân loại.</span>
+                  <span id="lblInboundCamHint" class="font-sans text-[10px] text-slate-600 text-center px-4">Khi AGV dừng ở Trạm Nhập gốc (INBOUND), ứng dụng Android sẽ tự động chụp và gửi ảnh phân loại.</span>
                 </div>
 
                 <!-- Industrial Crosshair Overlay -->
                 <div class="absolute inset-0 pointer-events-none p-2 flex flex-col justify-between">
                   <div class="flex justify-between items-start">
                     <span class="font-mono text-[9px] text-sky-300 bg-black/60 px-1.5 py-0.5 rounded">SOURCE: /api/camera</span>
-                    <span class="font-mono text-[9px] text-slate-200 bg-black/60 px-1.5 py-0.5 rounded">MobileNetV3-Small</span>
+                    <span class="font-mono text-[9px] text-slate-200 bg-black/60 px-1.5 py-0.5 rounded">CV Ver3 (YOLO11n + MNv3)</span>
                   </div>
                   <div class="flex justify-between items-end">
-                    <span class="font-mono text-[9px] text-slate-300 bg-black/60 px-1 rounded">ROI: WMS Inbound</span>
+                    <span id="camOverlayMode" class="font-mono text-[9px] text-slate-300 bg-black/60 px-1 rounded">ROI: Chờ chụp</span>
                     <span id="aiConfidenceBadge" class="font-mono text-[9px] text-emerald-400 bg-black/60 px-1 rounded font-semibold">AI CONF: --</span>
                   </div>
                 </div>
@@ -439,7 +446,7 @@
                 <span class="material-symbols-outlined text-primary text-[20px]">inventory_2</span>
                 <span class="font-headline text-[16px] font-bold text-slate-900">Quản Lý Tồn Kho Đa Mặt Hàng Theo Trạm</span>
               </div>
-              <span class="font-mono text-[11px] text-slate-500 bg-slate-100 px-2 py-0.5 rounded">Sức Chứa: 30 kiện/trạm</span>
+              <span id="lblInvCapBadge" class="font-mono text-[11px] text-slate-500 bg-slate-100 px-2 py-0.5 rounded">Tồn Kho Theo Trạm</span>
             </div>
 
             <!-- Dynamic Station Inventory Container -->
@@ -489,18 +496,7 @@
 
             <!-- Quick Dispatch Waypoint Targets (Đồng bộ tự động theo Bản đồ active) -->
             <div id="quickDispatchGrid" class="grid grid-cols-4 gap-2 mb-3">
-              <button onclick="sendGoTo('A')" class="py-1.5 px-2 rounded-md bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 text-center transition-colors font-sans text-xs font-semibold" type="button">
-                Đến Trạm A
-              </button>
-              <button onclick="sendGoTo('B')" class="py-1.5 px-2 rounded-md bg-blue-50 hover:bg-blue-100 border border-blue-200 text-primary text-center transition-colors font-sans text-xs font-semibold" type="button">
-                Đến Kho B
-              </button>
-              <button onclick="sendGoTo('C')" class="py-1.5 px-2 rounded-md bg-purple-50 hover:bg-purple-100 border border-purple-200 text-purple-700 text-center transition-colors font-sans text-xs font-semibold" type="button">
-                Đến Kho C
-              </button>
-              <button onclick="sendGoTo('D')" class="py-1.5 px-2 rounded-md bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-700 text-center transition-colors font-sans text-xs font-semibold" type="button">
-                Đến Kho D
-              </button>
+              <span class="col-span-4 text-center text-xs text-slate-400 font-mono py-1.5">Đang tải trạm bản đồ...</span>
             </div>
 
             <!-- Primary Operational Actuation Buttons -->
@@ -548,7 +544,7 @@
               <button onclick="sendCmd('simulate_gap')" class="py-1.5 px-2 rounded bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-800 font-medium transition-colors" type="button" title="Giả lập mất vạch 25cm để test cầu nối quán tính">
                 ⚡ Test Đứt Vạch
               </button>
-              <button onclick="sendCmd('return_home')" class="py-1.5 px-2 rounded bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 font-semibold transition-colors" type="button" title="Hủy tác vụ hiện tại và điều hướng về Trạm A">
+              <button id="btnReturnHome" onclick="sendCmd('return_home')" class="py-1.5 px-2 rounded bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 font-semibold transition-colors" type="button" title="Hủy tác vụ hiện tại và điều hướng về trạm gốc">
                 ⌂ Quay Về A
               </button>
               <button onclick="sendCmd('abort_missions')" class="py-1.5 px-2 rounded bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-800 font-semibold transition-colors" type="button" title="Hủy mission/task đang bị kẹt trên WMS mà không reset odometry xe">
@@ -613,32 +609,43 @@
       <!-- Modal Body Content -->
       <div class="overflow-y-auto p-5 flex flex-col gap-3.5 max-h-[calc(92vh-125px)] bg-white">
         
-        <!-- TAB 1: BẢN ĐỒ SA BÀN & NẠP MAP LINH HOẠT -->
+        <!-- TAB 1: BẢN ĐỒ SA BÀN & QUẢN TRỊ MAP-AS-CODE -->
         <div id="modalTabMap" class="flex flex-col gap-3">
-          <p class="text-[12px] text-slate-600 leading-relaxed">
-            Chọn bản đồ sa bàn có sẵn hoặc nạp file cấu hình bản đồ mới (JSON) để AGV tự động tải mạng lưới line, trạm dừng và thuật toán Dijkstra:
-          </p>
+          <div id="mapCodePolicyBanner" class="bg-amber-50 border border-amber-200 rounded-lg p-3 flex items-start gap-2.5 text-[11px] text-amber-900">
+            <span class="material-symbols-outlined text-amber-600 text-[18px] mt-0.5 shrink-0">lock</span>
+            <div class="flex flex-col gap-1">
+              <div class="flex items-center gap-2">
+                <span class="font-bold">Cơ Chế Map-as-Code Đang Bật (Chỉ Đổi Qua Source Code)</span>
+                <span id="lblMapLockBadge" class="font-mono text-[10px] bg-amber-100 border border-amber-300 px-1.5 py-0.5 rounded font-semibold">LOCKED</span>
+              </div>
+              <p class="leading-relaxed text-amber-800">
+                Thay đổi bản đồ trực tiếp trên Web bị khóa để đồng bộ tuyệt đối tọa độ EKF/Line của Firmware ESP32 với Server.
+                Lập trình viên được phân quyền cập nhật file <code class="font-mono bg-white/80 px-1 rounded">config/active_map.json</code> rồi chạy
+                <code class="font-mono bg-white/80 px-1 rounded">python tools/sync_map.py --map &lt;file&gt; --apply-db</code> và nạp lại firmware.
+              </p>
+            </div>
+          </div>
 
           <!-- Dropdown Bản đồ có sẵn -->
           <div class="flex items-center gap-2 bg-slate-50 p-2.5 rounded-lg border border-slate-200">
             <div class="flex-1 flex flex-col">
-              <span class="text-[10px] text-slate-500 uppercase font-mono tracking-wider font-semibold">Bản Đồ Hiện Tuyến</span>
+              <span class="text-[10px] text-slate-500 uppercase font-mono tracking-wider font-semibold">Xem Trước Bản Đồ Trong Kho CSDL</span>
               <select id="selMapList" onchange="previewMapDetails()" class="bg-white text-slate-800 text-[12px] font-mono rounded px-2.5 py-1.5 border border-slate-300 focus:border-primary focus:ring-1 focus:ring-primary outline-none transition-colors">
                 <!-- Sẽ được nạp tự động qua JavaScript -->
               </select>
             </div>
-            <button onclick="applySwitchMap()" class="self-end bg-primary hover:bg-primary-hover text-white font-semibold px-3.5 py-1.5 rounded text-[12px] flex items-center gap-1 transition-colors shadow-sm" type="button">
+            <button id="btnSwitchMap" onclick="applySwitchMap()" class="hidden self-end bg-primary hover:bg-primary-hover text-white font-semibold px-3.5 py-1.5 rounded text-[12px] flex items-center gap-1 transition-colors shadow-sm" type="button">
               <span class="material-symbols-outlined text-[15px]">check_circle</span>
               <span>Kích Hoạt</span>
             </button>
           </div>
 
-          <!-- Thông số kỹ thuật tuyến đang áp dụng -->
+          <!-- Thông số kỹ thuật tuyến đang chọn -->
           <div class="bg-slate-50 border border-slate-200 rounded-lg p-3.5 flex flex-col gap-2.5">
             <div class="flex items-center justify-between pb-1.5 border-b border-slate-200/80">
               <span class="text-[12px] text-primary font-bold flex items-center gap-1.5">
                 <span class="material-symbols-outlined text-[16px]">info</span>
-                Thông Số Kỹ Thuật Tuyến Đang Áp Dụng
+                Thông Số Kỹ Thuật Tuyến Bản Đồ
               </span>
               <span class="text-[10px] text-blue-700 font-mono bg-blue-50 border border-blue-200 px-2 py-0.5 rounded flex items-center gap-1 font-semibold">
                 <span class="material-symbols-outlined text-[12px]">shield</span>Traffic Guard Active
@@ -650,7 +657,7 @@
                 <span id="lblMapName" class="text-slate-900 font-semibold mt-0.5">--</span>
               </div>
               <div class="bg-white p-2.5 rounded border border-slate-200 flex flex-col shadow-2xs">
-                <span class="text-slate-500 text-[10px] font-sans">Kích Thước Sa Bàn</span>
+                <span class="text-slate-500 text-[10px] font-sans">Kích Thước &amp; Hash</span>
                 <span id="lblMapDim" class="text-slate-900 font-semibold mt-0.5">--</span>
               </div>
               <div class="col-span-2 bg-white p-2.5 rounded border border-slate-200 flex flex-col shadow-2xs">
@@ -660,12 +667,12 @@
             </div>
           </div>
 
-          <!-- Nạp bản đồ tùy biến linh hoạt JSON -->
+          <!-- Công cụ Xuất / Tham khảo JSON & Khu vực Dev Mode (ẩn mặc định khi Map-as-Code khóa) -->
           <div class="bg-slate-50 border border-slate-200 rounded-lg p-3.5 flex flex-col gap-2.5">
             <div class="flex items-center justify-between">
               <span class="text-[12px] text-slate-800 font-bold flex items-center gap-1.5">
-                <span class="material-symbols-outlined text-primary text-[17px]">upload_file</span>
-                Nạp Bản Đồ Tùy Biến Linh Hoạt (JSON)
+                <span class="material-symbols-outlined text-primary text-[17px]">description</span>
+                Cấu Hình Bản Đồ Chuẩn JSON (Template &amp; Export)
               </span>
               <div class="flex items-center gap-1.5">
                 <button onclick="downloadMapTemplate()" class="text-[10px] font-mono text-slate-600 hover:text-slate-900 bg-white border border-slate-200 px-2 py-1 rounded flex items-center gap-1 transition-colors" type="button">
@@ -677,27 +684,28 @@
               </div>
             </div>
 
-            <!-- Upload drag/drop box -->
-            <input type="file" id="inpMapFile" accept=".json" class="hidden" onchange="handleMapFileUpload(event)"/>
-            <div onclick="document.getElementById('inpMapFile').click()" class="border border-dashed border-slate-300 hover:border-primary bg-white p-3.5 rounded-lg text-center cursor-pointer transition-colors flex flex-col items-center justify-center gap-1 group">
-              <span class="material-symbols-outlined text-primary group-hover:scale-110 transition-transform text-[24px]">cloud_upload</span>
-              <span class="text-[12px] text-slate-700 font-medium">Chọn file bản đồ JSON từ máy tính</span>
-              <span class="text-[10px] text-slate-500 font-mono">Hỗ trợ: map_id, nodes (x, y), segments (khoảng cách, hướng)</span>
-            </div>
+            <div id="devMapUploadSection" class="hidden flex flex-col gap-2.5 pt-1 border-t border-slate-200/80">
+              <input type="file" id="inpMapFile" accept=".json" class="hidden" onchange="handleMapFileUpload(event)"/>
+              <div id="mapUploadDropzone" onclick="if (allowRuntimeMapChange) document.getElementById('inpMapFile').click()" class="border border-dashed border-slate-300 hover:border-primary bg-white p-3.5 rounded-lg text-center cursor-pointer transition-colors flex flex-col items-center justify-center gap-1 group">
+                <span class="material-symbols-outlined text-primary group-hover:scale-110 transition-transform text-[24px]">cloud_upload</span>
+                <span class="text-[12px] text-slate-700 font-medium">Chọn file bản đồ JSON từ máy tính</span>
+                <span class="text-[10px] text-slate-500 font-mono">Hỗ trợ: map_id, home_node, nodes (x, y), segments (khoảng cách, hướng)</span>
+              </div>
 
-            <div class="flex items-center justify-between">
-              <button onclick="toggleJsonPasteBox()" class="text-[11px] font-mono text-primary hover:underline flex items-center gap-1 font-semibold" type="button">
-                <span class="material-symbols-outlined text-[14px]">code</span>
-                <span>&lt;&gt; Dán mã JSON trực tiếp (Editor)</span>
-              </button>
-            </div>
+              <div class="flex items-center justify-between">
+                <button id="btnToggleJsonPaste" onclick="toggleJsonPasteBox()" class="text-[11px] font-mono text-primary hover:underline flex items-center gap-1 font-semibold" type="button">
+                  <span class="material-symbols-outlined text-[14px]">code</span>
+                  <span>&lt;&gt; Dán mã JSON trực tiếp (Dev Mode)</span>
+                </button>
+              </div>
 
-            <div id="jsonPasteBox" class="hidden flex flex-col gap-1.5">
-              <textarea id="txtMapJson" rows="6" placeholder="Dán cấu trúc JSON bản đồ vào đây..." class="w-full bg-white text-slate-800 font-mono text-[10px] p-2.5 rounded border border-slate-300 focus:border-primary focus:ring-1 focus:ring-primary outline-none" spellcheck="false"></textarea>
-              <button onclick="applyJsonMapPaste()" class="w-full py-2 rounded-lg font-bold text-white bg-primary hover:bg-primary-hover text-[12px] flex items-center justify-center gap-1.5 shadow-sm transition-colors" type="button">
-                <span class="material-symbols-outlined text-[16px]">bolt</span>
-                <span>Nạp &amp; Kích Hoạt Bản Đồ Này</span>
-              </button>
+              <div id="jsonPasteBox" class="hidden flex flex-col gap-1.5">
+                <textarea id="txtMapJson" rows="6" placeholder="Dán cấu trúc JSON bản đồ vào đây..." class="w-full bg-white text-slate-800 font-mono text-[10px] p-2.5 rounded border border-slate-300 focus:border-primary focus:ring-1 focus:ring-primary outline-none" spellcheck="false"></textarea>
+                <button id="btnApplyJsonMap" onclick="applyJsonMapPaste()" class="w-full py-2 rounded-lg font-bold text-white bg-primary hover:bg-primary-hover text-[12px] flex items-center justify-center gap-1.5 shadow-sm transition-colors" type="button">
+                  <span class="material-symbols-outlined text-[16px]">bolt</span>
+                  <span>Nạp &amp; Kích Hoạt Bản Đồ Này</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -766,15 +774,12 @@
                 </select>
               </div>
               <div class="col-span-2 text-[10px] text-slate-500 font-mono bg-white border border-slate-200/80 rounded px-2 py-1">
-                MobileNetV3 (best.pth): <span class="text-slate-700 font-semibold">0</span> = Hình trụ (cylinder) • <span class="text-slate-700 font-semibold">1</span> = Hộp chữ nhật (rectangular_box) • <span class="text-slate-700 font-semibold">2</span> = Lăng trụ (triangular_prism)
+                CV Ver3 (`yolo11n_v5b_best.pt` + `best.pth`): <span class="text-slate-700 font-semibold">0</span> = Hình trụ (cylinder) • <span class="text-slate-700 font-semibold">1</span> = Hộp chữ nhật (rectangular_box) • <span class="text-slate-700 font-semibold">2</span> = Lăng trụ (triangular_prism)
               </div>
               <div class="col-span-2 flex flex-col gap-0.5">
                 <label class="text-[10px] text-slate-500 font-semibold">KHO ĐÍCH ƯU TIÊN (Thay thế trạm cũ khi lưu)</label>
                 <select id="selProdTargetNode" class="bg-white text-primary px-2.5 py-1.5 rounded border border-slate-300 focus:border-primary outline-none font-medium">
-                  <option value="B">Kho B (Kệ 1) - Tự động định tuyến Trạm B</option>
-                  <option value="C">Kho C (Kệ 2) - Tự động định tuyến Trạm C</option>
-                  <option value="D">Kho D (Kệ 3) - Tự động định tuyến Trạm D</option>
-                  <option value="E">Kho E (Kệ Dự phòng)</option>
+                  <option value="">Đang tải danh sách trạm...</option>
                 </select>
               </div>
             </div>

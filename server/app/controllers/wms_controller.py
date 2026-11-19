@@ -10,75 +10,153 @@ import csv
 import io
 import sqlite3
 from datetime import datetime
-from app.config import DEFAULT_MAP_ID
+from app.config import ALLOW_RUNTIME_MAP_CHANGE, DEFAULT_MAP_ID
 
 class WMSController:
-    def __init__(self, workflow_manager):
+    def __init__(self, workflow_manager, agv_controller=None):
         self.workflow_manager = workflow_manager
+        self.agv_controller = agv_controller
+
+    def _has_active_work(self) -> Optional[str]:
+        wf = self.workflow_manager
+        if wf.active_mission is not None:
+            return f"AGV đang thực thi mission tới Trạm {wf.active_mission.get('to_node', '?')}"
+        if getattr(wf, "active_unloading_tasks", None):
+            return "Đang có tác vụ chờ xác nhận dỡ hàng tại trạm đích"
+        if getattr(wf, "manual_route_target", None):
+            return f"AGV đang chạy lộ trình thủ công tới Trạm {wf.manual_route_target}"
+        recent_tasks = wf.task_repo.get_recent_tasks(limit=10)
+        busy_task = next(
+            (t for t in recent_tasks if t["status"] in ("DISPATCHED", "IN_TRANSIT", "DELIVERED", "UNLOADING")),
+            None,
+        )
+        if busy_task:
+            return f"Task #{busy_task['task_id']} đang ở trạng thái {busy_task['status']}"
+        return None
 
     def get_map_data(self, map_id: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
-        """Trả về thông tin bản đồ hiện hoạt, danh sách Điểm nút và các đoạn line đo đạc thực tế"""
-        active_map = self.workflow_manager.map_repo.get_active_map() or {"map_id": DEFAULT_MAP_ID, "name": "Bản đồ Mặc định"}
-        cur_map_id = map_id or active_map.get("map_id", DEFAULT_MAP_ID)
-        nodes = self.workflow_manager.map_repo.get_nodes(cur_map_id)
-        segments = self.workflow_manager.map_repo.get_segments(cur_map_id)
+        """Trả về thông tin bản đồ hiện hoạt (hoặc map_id chỉ định), nodes, segments và map_hash."""
+        repo = self.workflow_manager.map_repo
+        active_map = repo.get_active_map() or {"map_id": DEFAULT_MAP_ID, "name": "Bản đồ Mặc định"}
+        if map_id:
+            cur_map_id = str(map_id).strip().upper()
+            map_meta = repo.get_map_by_id(cur_map_id)
+            if not map_meta:
+                return 404, {"status": "error", "message": f"Không tìm thấy bản đồ '{cur_map_id}'"}
+        else:
+            cur_map_id = str(active_map.get("map_id", DEFAULT_MAP_ID)).strip().upper()
+            map_meta = active_map
+
+        nodes = repo.get_nodes(cur_map_id)
+        segments = repo.get_segments(cur_map_id)
+        map_hash = repo.get_map_hash(cur_map_id)
+        home_node = self.workflow_manager.get_home_node(cur_map_id)
         return 200, {
             "status": "success",
-            "map": active_map,
+            "map": map_meta,
             "nodes": nodes,
-            "segments": segments
+            "segments": segments,
+            "map_hash": map_hash,
+            "home_node": home_node,
+            "allow_runtime_map_change": ALLOW_RUNTIME_MAP_CHANGE,
         }
 
     def get_all_maps(self) -> Tuple[int, Dict[str, Any]]:
-        """Lấy danh sách tất cả các bản đồ có trong hệ thống"""
-        maps = self.workflow_manager.map_repo.get_all_maps()
-        active_map = self.workflow_manager.map_repo.get_active_map()
+        """Lấy danh sách tất cả các bản đồ có trong hệ thống kèm trạng thái Map-as-Code."""
+        repo = self.workflow_manager.map_repo
+        maps = repo.get_all_maps()
+        active_map = repo.get_active_map()
+        active_id = active_map["map_id"] if active_map else DEFAULT_MAP_ID
         return 200, {
             "status": "success",
-            "active_map_id": active_map["map_id"] if active_map else DEFAULT_MAP_ID,
-            "maps": maps
+            "active_map_id": active_id,
+            "active_map_hash": repo.get_map_hash(active_id),
+            "active_home_node": self.workflow_manager.get_home_node(active_id),
+            "allow_runtime_map_change": ALLOW_RUNTIME_MAP_CHANGE,
+            "maps": maps,
         }
 
     def switch_map(self, body_json: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-        """Chuyển đổi bản đồ hoạt động trực tiếp từ Web UI"""
-        target_map_id = str(body_json.get("map_id", "")).strip()
+        """Chuyển đổi bản đồ hoạt động (chỉ cho phép khi AGV_ALLOW_RUNTIME_MAP_CHANGE=true và không có nhiệm vụ chạy)."""
+        if not ALLOW_RUNTIME_MAP_CHANGE:
+            return 403, {
+                "status": "error",
+                "code": "MAP_LOCKED_BY_CODE",
+                "message": "Bản đồ đang KHÓA theo cơ chế Map-as-Code. Vui lòng cập nhật config/active_map.json và chạy: python tools/sync_map.py --map <file> --apply-db",
+            }
+
+        target_map_id = str(body_json.get("map_id", "")).strip().upper()
         if not target_map_id:
             return 400, {"status": "error", "message": "Thiếu mã bản đồ (map_id)"}
 
-        success = self.workflow_manager.map_repo.set_active_map(target_map_id)
+        busy_reason = self._has_active_work()
+        if busy_reason:
+            return 409, {"status": "error", "message": f"Không thể chuyển bản đồ lúc này: {busy_reason}"}
+
+        repo = self.workflow_manager.map_repo
+        if not repo.get_map_by_id(target_map_id):
+            return 404, {"status": "error", "message": f"Không tìm thấy bản đồ '{target_map_id}'"}
+
+        old_active = repo.get_active_map()
+        if old_active:
+            repo.unlock_all_by_agv(self.workflow_manager.agv_id, old_active["map_id"])
+
+        success = repo.set_active_map(target_map_id, sync_fleet=True)
         if not success:
             return 500, {"status": "error", "message": "Không thể chuyển bản đồ"}
 
-        # Trả về cấu hình bản đồ mới vừa kích hoạt
+        if self.agv_controller is not None:
+            self.agv_controller.trail = []
+        self.workflow_manager.last_reported_station = self.workflow_manager.get_home_node(target_map_id)
         return self.get_map_data(target_map_id)
 
     def import_map(self, body_json: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-        """Nhận file hoặc cấu trúc JSON cấu hình bản đồ tùy biến và nạp vào hệ thống"""
+        """Nạp cấu hình bản đồ JSON (chỉ cho phép khi AGV_ALLOW_RUNTIME_MAP_CHANGE=true và không có nhiệm vụ chạy)."""
+        if not ALLOW_RUNTIME_MAP_CHANGE:
+            return 403, {
+                "status": "error",
+                "code": "MAP_LOCKED_BY_CODE",
+                "message": "Nạp bản đồ trực tiếp từ Web UI đang KHÓA (Map-as-Code). Hãy chỉnh file JSON trong config/maps/ và chạy python tools/sync_map.py",
+            }
+
         if not body_json:
             return 400, {"status": "error", "message": "Dữ liệu JSON rỗng"}
-        success = self.workflow_manager.map_repo.import_map_config(body_json)
-        if not success:
-            return 400, {"status": "error", "message": "Cấu trúc JSON không hợp lệ (cần map_id, nodes, segments)"}
-        
-        map_id = body_json.get("map_id", "").strip().upper()
-        return self.get_map_data(map_id)
+
+        busy_reason = self._has_active_work()
+        if busy_reason:
+            return 409, {"status": "error", "message": f"Không thể cập nhật bản đồ lúc này: {busy_reason}"}
+
+        repo = self.workflow_manager.map_repo
+        old_active = repo.get_active_map()
+        try:
+            res = repo.upsert_map_config(body_json, activate=True)
+        except ValueError as e:
+            return 400, {"status": "error", "message": str(e)}
+
+        if old_active and old_active["map_id"] != res["map_id"]:
+            repo.unlock_all_by_agv(self.workflow_manager.agv_id, old_active["map_id"])
+        if self.agv_controller is not None:
+            self.agv_controller.trail = []
+        self.workflow_manager.last_reported_station = res["home_node"]
+        return self.get_map_data(res["map_id"])
 
     def export_map(self, map_id: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
         """Xuất file JSON cấu hình của bản đồ"""
         active_map = self.workflow_manager.map_repo.get_active_map()
-        target_id = map_id or (active_map["map_id"] if active_map else DEFAULT_MAP_ID)
+        target_id = str(map_id).strip().upper() if map_id else (active_map["map_id"] if active_map else DEFAULT_MAP_ID)
         cfg = self.workflow_manager.map_repo.export_map_config(target_id)
         if not cfg:
             return 404, {"status": "error", "message": "Không tìm thấy bản đồ"}
         return 200, {"status": "success", "config": cfg}
 
     def get_map_template(self) -> Tuple[int, Dict[str, Any]]:
-        """Trả về mẫu JSON chuẩn để người dùng tải về chỉnh sửa theo ý muốn"""
+        """Trả về mẫu JSON chuẩn Map-as-Code để người dùng tham khảo hoặc dùng với tools/sync_map.py"""
         template = {
             "map_id": "MAP_CUSTOM_01",
             "name": "Bản Đồ Nhà Kho Mới 2.0m x 1.5m",
             "width_m": 2.0,
             "length_m": 1.5,
+            "home_node": "A",
             "description": "Bản đồ tự định nghĩa gồm 4 trạm hình chữ nhật",
             "nodes": [
                 {"node_id": "A", "name": "Trạm Nhập Hàng A", "type": "INBOUND", "x": 0.0, "y": 0.0, "color": "#10b981", "max_capacity": 100},
@@ -125,7 +203,7 @@ class WMSController:
         return 200, {"status": "success", "data": data}
 
     def get_products(self) -> Tuple[int, Dict[str, Any]]:
-        """Lấy danh mục sản phẩm, ánh xạ MobileNetV3 và trạm đích hiện tại trên bản đồ active"""
+        """Lấy danh mục sản phẩm, ánh xạ CV Ver3 và trạm đích hiện tại trên bản đồ active"""
         active_map = self.workflow_manager.map_repo.get_active_map() or {"map_id": DEFAULT_MAP_ID}
         map_id = active_map.get("map_id", DEFAULT_MAP_ID)
         products = self.workflow_manager.prod_repo.get_all()

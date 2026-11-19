@@ -6,7 +6,11 @@
 __pycache__/
 *.pyc
 server/database/test_*.db
+server/database/wms_database.db
+server/database/wms_database.db-wal
+server/database/wms_database.db-shm
 server/uploads/*.jpg
+!.gitkeep
 .env
 include/secrets.h
 test/secrets.h

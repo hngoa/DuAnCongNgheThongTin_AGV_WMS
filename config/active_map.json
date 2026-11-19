@@ -1,0 +1,29 @@
+{
+  "map_id": "SABAN_154_151",
+  "map_version": "1.0.0",
+  "name": "Sa bàn Thực nghiệm Lab 1.54m x 1.51m",
+  "width_m": 1.54,
+  "length_m": 1.51,
+  "home_node": "A",
+  "initial_heading_deg": 90.0,
+  "corridor_guard_m": 0.85,
+  "description": "Mạng lưới line 4 trạm hình chữ nhật 8 chặng 2 chiều",
+  "nodes": [
+    {"node_id": "A", "name": "Trạm Nhập Hàng A (0.00m, 0.00m)", "type": "INBOUND", "x": 0.00, "y": 0.00, "color": "#10b981", "max_capacity": 100},
+    {"node_id": "B", "name": "Kho Kệ 1 B (0.00m, 1.51m)", "type": "STATION", "x": 0.00, "y": 1.51, "color": "#38bdf8", "max_capacity": 30},
+    {"node_id": "C", "name": "Kho Kệ 2 C (1.54m, 1.51m)", "type": "STATION", "x": 1.54, "y": 1.51, "color": "#a855f7", "max_capacity": 30},
+    {"node_id": "D", "name": "Kho Kệ 3 D (1.54m, 0.00m)", "type": "STATION", "x": 1.54, "y": 0.00, "color": "#f59e0b", "max_capacity": 30}
+  ],
+  "segments": [
+    {"from": "A", "to": "B", "dist_m": 1.51, "heading": 90.0, "two_way": true, "speed_limit": 25.0, "has_gap": 0},
+    {"from": "B", "to": "C", "dist_m": 1.54, "heading": 0.0, "two_way": true, "speed_limit": 25.0, "has_gap": 0},
+    {"from": "C", "to": "D", "dist_m": 1.51, "heading": -90.0, "two_way": true, "speed_limit": 25.0, "has_gap": 0},
+    {"from": "D", "to": "A", "dist_m": 1.54, "heading": 180.0, "two_way": true, "speed_limit": 25.0, "has_gap": 0}
+  ],
+  "default_rules": [
+    {"product_category": "ELECTRONIC", "product_code": null, "target_node_id": "B", "priority": 1},
+    {"product_category": "MECHANICAL", "product_code": null, "target_node_id": "C", "priority": 1},
+    {"product_category": "TOOL", "product_code": null, "target_node_id": "D", "priority": 1},
+    {"product_category": "*", "product_code": null, "target_node_id": "D", "priority": 9}
+  ]
+}

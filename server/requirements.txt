@@ -1,0 +1,7 @@
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+# OpenCV 4.8-4.9 cần numpy<2.0.0; OpenCV 5.0+ tương thích numpy>=2.0.0 (slam_cv_recognizer.py hỗ trợ cả hai)
+numpy>=1.24.0
+Pillow>=9.5.0

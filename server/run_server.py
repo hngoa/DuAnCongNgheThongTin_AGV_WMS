@@ -56,7 +56,7 @@ def main():
     print(">> [3/4] Đang kết nối Controllers & Tầng điều phối HTTP Router...")
     cam_controller = CameraController(workflow_manager, ai_service)
     agv_controller = AGVController(workflow_manager)
-    wms_controller = WMSController(workflow_manager)
+    wms_controller = WMSController(workflow_manager, agv_controller=agv_controller)
 
     # Liên kết phụ thuộc chéo cho điều khiển tự động Shot 1 & Shot 2
     workflow_manager.camera_controller = cam_controller

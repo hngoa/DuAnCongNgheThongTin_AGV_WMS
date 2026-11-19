@@ -5,10 +5,14 @@
 #include <ESPmDNS.h>
 #include <math.h>
 #include <esp_arduino_version.h>
+#include <esp_system.h>
+#include <driver/i2s.h>
 #include "soc/usb_serial_jtag_reg.h"
 #include "driver/gpio.h"
 #include "mbedtls/md.h"
 #include "secrets.h"
+#include "generated_map_config.h"
+#include "agv_voice_prompts.h"
 
 /*
  * ===================================================================================
@@ -91,6 +95,17 @@ unsigned long  lastPowerCalcUs = 0;
 #define LINE_R1_PIN          20
 #define LINE_R2_PIN          19
 
+// --- 2.2. MODULE ÂM THANH I2S MAX98357A + LOA 8 OHM 3W (MẶC ĐỊNH MAX 100%) ---
+#define AUDIO_BCLK_PIN         42
+#define AUDIO_LRC_PIN          41
+#define AUDIO_DIN_PIN          40
+#define AUDIO_SD_PIN           1
+#define AUDIO_I2S_PORT         I2S_NUM_0
+#define AUDIO_SAMPLE_RATE      16000
+#define AUDIO_CHUNK_FRAMES     128
+#define AUDIO_DEFAULT_VOL_PCT  100
+#define AUDIO_BROWNOUT_VOL_PCT 15
+
 // --- 3. THÔNG SỐ VẬT LÝ & TỐC ĐỘ CHO XE MANG TẢI ---
 bool invertLeftMotor         = true;
 bool invertRightMotor        = true;
@@ -139,6 +154,7 @@ uint8_t bendCatchStage               = 0;
 int8_t bendCatchDir                  = 1;
 float bendCatchStartYawDeg           = 90.0f;
 unsigned long bendCatchStartMs       = 0;
+float lastBendCatchArcM              = -1.0f;
 float gapStartDistM                  = 0.0f;
 float gapStartArcM                   = 0.0f;
 float legArcDistM                    = 0.0f;
@@ -221,38 +237,8 @@ float simGapStartLegDistM            = 0.0f;
 const float SIM_GAP_LENGTH_M         = 0.25f;
 
 // --- 5. MÔ HÌNH ĐỒ THỊ ĐỘNG ĐA TRẠM (HỖ TRỢ route_legs TỪ SERVER + DỰ PHÒNG OFFLINE 4 TRẠM) ---
-enum StationId {
-  STATION_A = 0,
-  STATION_B = 1,
-  STATION_C = 2,
-  STATION_D = 3,
-  STATION_UNKNOWN = 4
-};
-
-enum LegId {
-  LEG_AB = 0, // Xuôi A -> B (1.51m, +90°)
-  LEG_BC = 1, // Xuôi B -> C (1.54m, 0°)
-  LEG_CD = 2, // Xuôi C -> D (1.51m, -90°)
-  LEG_DA = 3, // Xuôi D -> A (1.54m, 180°)
-  LEG_BA = 4, // Ngược B -> A (1.51m, -90°)
-  LEG_CB = 5, // Ngược C -> B (1.54m, 180°)
-  LEG_DC = 6, // Ngược D -> C (1.51m, +90°)
-  LEG_AD = 7, // Ngược A -> D (1.54m, 0°)
-  LEG_NONE = 8
-};
-
-struct LegDef {
-  StationId fromStation;
-  StationId toStation;
-  float targetDistM;
-  float targetHeadingDeg;
-  const char* name;
-};
-
-struct StationCoord {
-  float x;
-  float y;
-};
+#define MAX_MAP_NODES 16
+#define MAX_MAP_EDGES 64
 
 struct DynamicLeg {
   char  fromName[12];
@@ -264,53 +250,101 @@ struct DynamicLeg {
   bool  hasTargetCoord;
 };
 
-StationCoord STATION_COORDS[4] = {
-  { 0.00f, 0.00f }, // STATION_A (0.00m, 0.00m)
-  { 0.00f, 1.51f }, // STATION_B (0.00m, 1.51m)
-  { 1.54f, 1.51f }, // STATION_C (1.54m, 1.51m)
-  { 1.54f, 0.00f }  // STATION_D (1.54m, 0.00m)
+struct MapNodeRuntime {
+  char  id[12];
+  float x;
+  float y;
+  bool  isInbound;
 };
 
-LegDef LEG_TABLE[8] = {
-  { STATION_A, STATION_B, 1.51f,  90.0f, "A -> B" },
-  { STATION_B, STATION_C, 1.54f,   0.0f, "B -> C" },
-  { STATION_C, STATION_D, 1.51f, -90.0f, "C -> D" },
-  { STATION_D, STATION_A, 1.54f, 180.0f, "D -> A" },
-  { STATION_B, STATION_A, 1.51f, -90.0f, "B -> A" },
-  { STATION_C, STATION_B, 1.54f, 180.0f, "C -> B" },
-  { STATION_D, STATION_C, 1.51f,  90.0f, "D -> C" },
-  { STATION_A, STATION_D, 1.54f,   0.0f, "A -> D" }
+struct MapEdgeRuntime {
+  int   fromIdx;
+  int   toIdx;
+  float distM;
+  float headingDeg;
+  float speedLimitCmS;
+  char  name[28];
 };
+
+MapNodeRuntime runtimeNodes[MAX_MAP_NODES];
+MapEdgeRuntime runtimeEdges[MAX_MAP_EDGES];
+int runtimeNumNodes = 0;
+int runtimeNumEdges = 0;
+int runtimeHomeIdx  = 0;
 
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 
-float activeMapWidthM  = 1.54f;
-float activeMapLengthM = 1.51f;
+float activeMapWidthM  = ACTIVE_MAP_WIDTH_M;
+float activeMapLengthM = ACTIVE_MAP_LENGTH_M;
+unsigned long lastMapWarnLogMs = 0;
 
-void syncMapDimensionsFromServer(float w, float h) {
+void initRuntimeMapFromGenerated() {
+  portENTER_CRITICAL(&stateMux);
+  runtimeNumNodes = (GENERATED_NUM_NODES <= MAX_MAP_NODES) ? GENERATED_NUM_NODES : MAX_MAP_NODES;
+  for (int i = 0; i < runtimeNumNodes; i++) {
+    snprintf(runtimeNodes[i].id, sizeof(runtimeNodes[i].id), "%s", GENERATED_MAP_NODES[i].id);
+    runtimeNodes[i].x = GENERATED_MAP_NODES[i].x;
+    runtimeNodes[i].y = GENERATED_MAP_NODES[i].y;
+    runtimeNodes[i].isInbound = GENERATED_MAP_NODES[i].isInbound;
+  }
+
+  runtimeNumEdges = (GENERATED_NUM_EDGES <= MAX_MAP_EDGES) ? GENERATED_NUM_EDGES : MAX_MAP_EDGES;
+  for (int i = 0; i < runtimeNumEdges; i++) {
+    runtimeEdges[i].fromIdx = GENERATED_MAP_EDGES[i].fromIdx;
+    runtimeEdges[i].toIdx = GENERATED_MAP_EDGES[i].toIdx;
+    runtimeEdges[i].distM = GENERATED_MAP_EDGES[i].distM;
+    runtimeEdges[i].headingDeg = GENERATED_MAP_EDGES[i].headingDeg;
+    runtimeEdges[i].speedLimitCmS = GENERATED_MAP_EDGES[i].speedLimitCmS;
+    snprintf(runtimeEdges[i].name, sizeof(runtimeEdges[i].name), "%s", GENERATED_MAP_EDGES[i].name);
+  }
+
+  runtimeHomeIdx = (ACTIVE_HOME_STATION_IDX >= 0 && ACTIVE_HOME_STATION_IDX < runtimeNumNodes)
+                     ? ACTIVE_HOME_STATION_IDX : 0;
+  activeMapWidthM  = ACTIVE_MAP_WIDTH_M;
+  activeMapLengthM = ACTIVE_MAP_LENGTH_M;
+  portEXIT_CRITICAL(&stateMux);
+}
+
+void syncMapDimensionsFromServer(float w, float h, const char* srvMapId, const char* srvMapHash) {
+  unsigned long nowMs = millis();
+  bool idDiff = (srvMapId && srvMapId[0] != '\0' && strcasecmp(srvMapId, ACTIVE_MAP_ID) != 0);
+  bool hashDiff = (srvMapHash && srvMapHash[0] != '\0' && strcasecmp(srvMapHash, ACTIVE_MAP_HASH) != 0);
+  if (idDiff || hashDiff) {
+    if (nowMs - lastMapWarnLogMs >= 10000UL) {
+      lastMapWarnLogMs = nowMs;
+      Serial.printf("\n⚠️ [CẢNH BÁO MAP-AS-CODE]: Firmware=%s(%s) ≠ Server=%s(%s). Hãy chạy tools/sync_map.py và nạp lại!\n",
+                    ACTIVE_MAP_ID, ACTIVE_MAP_HASH,
+                    (srvMapId && srvMapId[0]) ? srvMapId : "?",
+                    (srvMapHash && srvMapHash[0]) ? srvMapHash : "?");
+    }
+    return;
+  }
+
   if (w < 0.30f || h < 0.30f || w > 20.0f || h > 20.0f) return;
   if (fabsf(w - activeMapWidthM) < 0.005f && fabsf(h - activeMapLengthM) < 0.005f) return;
 
   portENTER_CRITICAL(&stateMux);
   activeMapWidthM  = w;
   activeMapLengthM = h;
-
-  STATION_COORDS[STATION_A] = { 0.00f, 0.00f };
-  STATION_COORDS[STATION_B] = { 0.00f, h     };
-  STATION_COORDS[STATION_C] = { w,     h     };
-  STATION_COORDS[STATION_D] = { w,     0.00f };
-
-  LEG_TABLE[LEG_AB].targetDistM = h;
-  LEG_TABLE[LEG_BC].targetDistM = w;
-  LEG_TABLE[LEG_CD].targetDistM = h;
-  LEG_TABLE[LEG_DA].targetDistM = w;
-  LEG_TABLE[LEG_BA].targetDistM = h;
-  LEG_TABLE[LEG_CB].targetDistM = w;
-  LEG_TABLE[LEG_DC].targetDistM = h;
-  LEG_TABLE[LEG_AD].targetDistM = w;
+#if ACTIVE_MAP_IS_RECT4
+  if (runtimeNumNodes == 4) {
+    runtimeNodes[0].x = 0.00f; runtimeNodes[0].y = 0.00f;
+    runtimeNodes[1].x = 0.00f; runtimeNodes[1].y = h;
+    runtimeNodes[2].x = w;     runtimeNodes[2].y = h;
+    runtimeNodes[3].x = w;     runtimeNodes[3].y = 0.00f;
+    for (int i = 0; i < runtimeNumEdges; i++) {
+      int u = runtimeEdges[i].fromIdx;
+      int v = runtimeEdges[i].toIdx;
+      if (u >= 0 && u < 4 && v >= 0 && v < 4) {
+        runtimeEdges[i].distM = hypotf(runtimeNodes[v].x - runtimeNodes[u].x,
+                                       runtimeNodes[v].y - runtimeNodes[u].y);
+      }
+    }
+  }
+#endif
   portEXIT_CRITICAL(&stateMux);
 
-  Serial.printf("\n🗺️ [ĐỒNG BỘ MAP SERVER]: Đã cập nhật bản đồ dẫn đường %.2fm x %.2fm!\n", w, h);
+  Serial.printf("\n🗺️ [ĐỒNG BỘ MAP SERVER]: Đã cập nhật kích thước %.2fm x %.2fm!\n", w, h);
 }
 
 // Hàng đợi lộ trình đa chặng (Multi-leg Dynamic Queue - tối đa 16 chặng)
@@ -319,10 +353,10 @@ DynamicLeg legQueue[MAX_ROUTE_LEGS];
 int   queueLength = 0;
 int   queueIndex  = 0;
 
-volatile StationId     currentStation       = STATION_A;
-volatile LegId         currentLeg           = LEG_AB;
-char                   currentStationName[12] = "A";
-char                   currentLegName[28]     = "A -> B";
+volatile int           currentStationIdx    = ACTIVE_HOME_STATION_IDX;
+volatile int           currentEdgeIdx       = ACTIVE_FIRST_EDGE_IDX;
+char                   currentStationName[12] = ACTIVE_MAP_HOME_NODE_ID;
+char                   currentLegName[28]     = "";
 char                   currentTargetName[12]  = "B";
 float                  currentTargetX       = 0.00f;
 float                  currentTargetY       = 1.51f;
@@ -538,40 +572,43 @@ void brakeMotorsHard() {
   writeRightPwm(255);
 }
 
-StationId parseStationId(const char* name) {
-  if (!name || name[0] == '\0') return STATION_UNKNOWN;
-  if (strcmp(name, "A") == 0) return STATION_A;
-  if (strcmp(name, "B") == 0) return STATION_B;
-  if (strcmp(name, "C") == 0) return STATION_C;
-  if (strcmp(name, "D") == 0) return STATION_D;
-  return STATION_UNKNOWN;
+int findMapNodeIndex(const char* name) {
+  if (!name || name[0] == '\0') return -1;
+  for (int i = 0; i < runtimeNumNodes; i++) {
+    if (strcasecmp(runtimeNodes[i].id, name) == 0) return i;
+  }
+  return -1;
 }
 
-DynamicLeg makeDynamicLegFromId(LegId leg) {
+int findMapEdgeIndex(const char* fromName, const char* toName) {
+  int fIdx = findMapNodeIndex(fromName);
+  int tIdx = findMapNodeIndex(toName);
+  if (fIdx < 0 || tIdx < 0) return -1;
+  for (int i = 0; i < runtimeNumEdges; i++) {
+    if (runtimeEdges[i].fromIdx == fIdx && runtimeEdges[i].toIdx == tIdx) return i;
+  }
+  return -1;
+}
+
+DynamicLeg makeDynamicLegFromEdgeIdx(int edgeIdx) {
   DynamicLeg d;
   memset(&d, 0, sizeof(d));
-  const char* stNames[4] = {"A", "B", "C", "D"};
-  int fIdx = (int)LEG_TABLE[leg].fromStation;
-  int tIdx = (int)LEG_TABLE[leg].toStation;
-  snprintf(d.fromName, sizeof(d.fromName), "%s", (fIdx >= 0 && fIdx < 4) ? stNames[fIdx] : "A");
-  snprintf(d.toName, sizeof(d.toName), "%s", (tIdx >= 0 && tIdx < 4) ? stNames[tIdx] : "B");
-  d.distM = LEG_TABLE[leg].targetDistM;
-  d.headingDeg = LEG_TABLE[leg].targetHeadingDeg;
-  d.targetX = (tIdx >= 0 && tIdx < 4) ? STATION_COORDS[tIdx].x : 0.0f;
-  d.targetY = (tIdx >= 0 && tIdx < 4) ? STATION_COORDS[tIdx].y : 0.0f;
-  d.hasTargetCoord = (tIdx >= 0 && tIdx < 4);
-  return d;
-}
-
-LegId findOfflineLegId(const char* fromName, const char* toName) {
-  StationId fSt = parseStationId(fromName);
-  StationId tSt = parseStationId(toName);
-  for (int i = 0; i < 8; i++) {
-    if (LEG_TABLE[i].fromStation == fSt && LEG_TABLE[i].toStation == tSt) {
-      return (LegId)i;
-    }
+  if (runtimeNumEdges <= 0) return d;
+  if (edgeIdx < 0 || edgeIdx >= runtimeNumEdges) edgeIdx = 0;
+  int fIdx = runtimeEdges[edgeIdx].fromIdx;
+  int tIdx = runtimeEdges[edgeIdx].toIdx;
+  snprintf(d.fromName, sizeof(d.fromName), "%s",
+           (fIdx >= 0 && fIdx < runtimeNumNodes) ? runtimeNodes[fIdx].id : ACTIVE_MAP_HOME_NODE_ID);
+  snprintf(d.toName, sizeof(d.toName), "%s",
+           (tIdx >= 0 && tIdx < runtimeNumNodes) ? runtimeNodes[tIdx].id : ACTIVE_MAP_HOME_NODE_ID);
+  d.distM = runtimeEdges[edgeIdx].distM;
+  d.headingDeg = runtimeEdges[edgeIdx].headingDeg;
+  if (tIdx >= 0 && tIdx < runtimeNumNodes) {
+    d.targetX = runtimeNodes[tIdx].x;
+    d.targetY = runtimeNodes[tIdx].y;
+    d.hasTargetCoord = true;
   }
-  return LEG_NONE;
+  return d;
 }
 
 static inline void resetLegCornerAnchorStateLocked() {
@@ -651,9 +688,9 @@ static inline void summarizeRecentBendSignalsLocked(bool outsideStationZone,
 
 // Khởi chạy DynamicLeg bên trong stateMux (không gọi Serial hoặc mutex lồng nhau)
 void applyDynamicLegLocked(const DynamicLeg &leg, float &outHeadingErr, bool &outTurning) {
-  currentLeg = findOfflineLegId(leg.fromName, leg.toName);
+  currentEdgeIdx = findMapEdgeIndex(leg.fromName, leg.toName);
   snprintf(currentStationName, sizeof(currentStationName), "%s", leg.fromName);
-  currentStation = parseStationId(currentStationName);
+  currentStationIdx = findMapNodeIndex(currentStationName);
   snprintf(currentTargetName, sizeof(currentTargetName), "%s", leg.toName);
   currentTargetX = leg.targetX;
   currentTargetY = leg.targetY;
@@ -702,6 +739,7 @@ void applyDynamicLegLocked(const DynamicLeg &leg, float &outHeadingErr, bool &ou
   curvedExcursionDetected = false;
   bendCatchAttemptedForGap = false;
   bendCatchStage    = 0;
+  lastBendCatchArcM = -1.0f;
   clearLineHistoryLocked();
 
   outHeadingErr = normalizeAngleDeg(legTargetHeadingDeg - yawDeg);
@@ -771,32 +809,38 @@ void startDynamicLeg(const DynamicLeg &leg) {
   }
 }
 
-void startMission(LegId leg) {
-  if (leg >= LEG_NONE) leg = LEG_AB;
-  DynamicLeg d = makeDynamicLegFromId(leg);
+void startEdgeMission(int edgeIdx) {
+  if (edgeIdx < 0 || edgeIdx >= runtimeNumEdges) {
+    edgeIdx = (runtimeNumEdges > 0) ? 0 : -1;
+  }
+  if (edgeIdx < 0) return;
+  DynamicLeg d = makeDynamicLegFromEdgeIdx(edgeIdx);
   startDynamicLeg(d);
 }
 
-// Lập kế hoạch lộ trình Điểm - Điểm tự động (dự phòng khi offline hoặc không có route_legs)
-void planAndExecuteRoute(StationId fromSt, StationId toSt) {
-  if (toSt >= STATION_UNKNOWN) {
-    Serial.println("\n>> [CẢNH BÁO] Trạm đích không nằm trong bảng 4 trạm dự phòng offline!");
+// Lập kế hoạch lộ trình Điểm - Điểm tự động bằng Dijkstra tổng quát (dự phòng khi offline)
+void planAndExecuteRoute(int fromIdx, int toIdx) {
+  if (toIdx < 0 || toIdx >= runtimeNumNodes) {
+    Serial.printf("\n>> [CẢNH BÁO] Trạm đích không nằm trong bản đồ '%s' (%d trạm)!\n",
+                  ACTIVE_MAP_ID, runtimeNumNodes);
     return;
   }
-  if (fromSt == toSt) {
+  if (fromIdx < 0 || fromIdx >= runtimeNumNodes) fromIdx = runtimeHomeIdx;
+
+  if (fromIdx == toIdx) {
     stopMotors();
     portENTER_CRITICAL(&stateMux);
     queueLength = 0;
     queueIndex = 0;
-    currentStation = toSt;
-    snprintf(currentStationName, sizeof(currentStationName), "%c", "ABCD"[toSt]);
-    ekfSyncFromPoseLocked(STATION_COORDS[toSt].x, STATION_COORDS[toSt].y, yawDeg, false, 0.01f, 2.5f);
+    currentStationIdx = toIdx;
+    snprintf(currentStationName, sizeof(currentStationName), "%s", runtimeNodes[toIdx].id);
+    ekfSyncFromPoseLocked(runtimeNodes[toIdx].x, runtimeNodes[toIdx].y, yawDeg, false, 0.01f, 2.5f);
     resetWheelCascadeLocked();
     robotSubState = SUB_STOPPED;
     robotStateStr = "AT_STATION";
     isRunning = false;
     portEXIT_CRITICAL(&stateMux);
-    Serial.printf("\n>> [THÔNG BÁO] Xe đang ở sẵn trạm đích: %c!\n", "ABCD"[toSt]);
+    Serial.printf("\n>> [THÔNG BÁO] Xe đang ở sẵn trạm đích: %s!\n", runtimeNodes[toIdx].id);
     return;
   }
 
@@ -806,50 +850,74 @@ void planAndExecuteRoute(StationId fromSt, StationId toSt) {
   float hErr = 0.0f;
   float snapYaw = 0.0f;
 
-  portENTER_CRITICAL(&stateMux);
-  queueLength = 0;
-  queueIndex = 0;
+  // Dijkstra O(N^2) trên đồ thị MAX_MAP_NODES=16
+  float distArr[MAX_MAP_NODES];
+  int prevNode[MAX_MAP_NODES];
+  int prevEdge[MAX_MAP_NODES];
+  bool used[MAX_MAP_NODES];
+  for (int i = 0; i < MAX_MAP_NODES; i++) {
+    distArr[i] = 1e9f;
+    prevNode[i] = -1;
+    prevEdge[i] = -1;
+    used[i] = false;
+  }
+  distArr[fromIdx] = 0.0f;
 
-  for (int i = 0; i < 8; i++) {
-    if (LEG_TABLE[i].fromStation == fromSt && LEG_TABLE[i].toStation == toSt) {
-      legQueue[0] = makeDynamicLegFromId((LegId)i);
-      queueLength = 1;
+  for (int iter = 0; iter < runtimeNumNodes; iter++) {
+    int u = -1;
+    float bestD = 1e9f;
+    for (int i = 0; i < runtimeNumNodes; i++) {
+      if (!used[i] && distArr[i] < bestD) {
+        bestD = distArr[i];
+        u = i;
+      }
+    }
+    if (u < 0 || u == toIdx) break;
+    used[u] = true;
+    for (int e = 0; e < runtimeNumEdges; e++) {
+      if (runtimeEdges[e].fromIdx != u) continue;
+      int v = runtimeEdges[e].toIdx;
+      if (v < 0 || v >= runtimeNumNodes) continue;
+      float nd = distArr[u] + runtimeEdges[e].distM;
+      if (nd < distArr[v]) {
+        distArr[v] = nd;
+        prevNode[v] = u;
+        prevEdge[v] = e;
+      }
+    }
+  }
+
+  int revEdges[MAX_ROUTE_LEGS];
+  int revCount = 0;
+  for (int cur = toIdx; cur != fromIdx && cur >= 0 && revCount < MAX_ROUTE_LEGS; cur = prevNode[cur]) {
+    if (prevEdge[cur] < 0) {
+      revCount = 0;
       break;
     }
+    revEdges[revCount++] = prevEdge[cur];
   }
 
-  if (queueLength == 0) {
-    if (fromSt == STATION_A && toSt == STATION_C) {
-      legQueue[0] = makeDynamicLegFromId(LEG_AB);
-      legQueue[1] = makeDynamicLegFromId(LEG_BC);
-      queueLength = 2;
-    } else if (fromSt == STATION_C && toSt == STATION_A) {
-      legQueue[0] = makeDynamicLegFromId(LEG_CD);
-      legQueue[1] = makeDynamicLegFromId(LEG_DA);
-      queueLength = 2;
-    } else if (fromSt == STATION_B && toSt == STATION_D) {
-      legQueue[0] = makeDynamicLegFromId(LEG_BC);
-      legQueue[1] = makeDynamicLegFromId(LEG_CD);
-      queueLength = 2;
-    } else if (fromSt == STATION_D && toSt == STATION_B) {
-      legQueue[0] = makeDynamicLegFromId(LEG_DA);
-      legQueue[1] = makeDynamicLegFromId(LEG_AB);
-      queueLength = 2;
-    }
+  if (revCount <= 0) {
+    Serial.printf("\n>> [CẢNH BÁO OFFLINE] Không tìm thấy đường từ %s tới %s!\n",
+                  runtimeNodes[fromIdx].id, runtimeNodes[toIdx].id);
+    return;
   }
 
+  portENTER_CRITICAL(&stateMux);
+  queueLength = revCount;
+  queueIndex = 0;
+  for (int i = 0; i < revCount; i++) {
+    legQueue[i] = makeDynamicLegFromEdgeIdx(revEdges[revCount - 1 - i]);
+  }
   len = queueLength;
-  if (queueLength > 0) {
-    firstLeg = legQueue[0];
-    applyDynamicLegLocked(firstLeg, hErr, turning);
-    snapYaw = yawDeg;
-  }
+  firstLeg = legQueue[0];
+  applyDynamicLegLocked(firstLeg, hErr, turning);
+  snapYaw = yawDeg;
   portEXIT_CRITICAL(&stateMux);
 
-  if (len > 0) {
-    Serial.printf("\n🚀 [ĐIỀU PHỐI OFFLINE] Lộ trình %d chặng: %c -> %c (Khởi hành %s -> %s, Yaw=%.1f°)\n",
-                  len, "ABCD"[fromSt], "ABCD"[toSt], firstLeg.fromName, firstLeg.toName, snapYaw);
-  }
+  Serial.printf("\n🚀 [ĐIỀU PHỐI OFFLINE] Lộ trình %d chặng: %s -> %s (Khởi hành %s -> %s, Yaw=%.1f°)\n",
+                len, runtimeNodes[fromIdx].id, runtimeNodes[toIdx].id,
+                firstLeg.fromName, firstLeg.toName, snapYaw);
 }
 
 void executeServerRouteLegs(DynamicLeg legs[], int count) {
@@ -864,25 +932,45 @@ void executeServerRouteLegs(DynamicLeg legs[], int count) {
     legQueue[i] = legs[i];
   }
   queueLength = count;
-  queueIndex = 0;
-  applyDynamicLegLocked(legQueue[0], hErr, turning);
+  int startIdx = 0;
+  while (startIdx + 1 < count) {
+    const DynamicLeg &curL = legQueue[startIdx];
+    if (!curL.hasTargetCoord) break;
+    float distToDest = hypotf(curL.targetX - odomX, curL.targetY - odomY);
+    int fromIdx = findMapNodeIndex(curL.fromName);
+    float distFromStart = (fromIdx >= 0 && fromIdx < runtimeNumNodes)
+                            ? hypotf(runtimeNodes[fromIdx].x - odomX, runtimeNodes[fromIdx].y - odomY)
+                            : 999.0f;
+    if (distToDest <= 0.22f && distFromStart >= 0.40f &&
+        strcasecmp(curL.toName, legQueue[startIdx + 1].fromName) == 0) {
+      startIdx++;
+    } else {
+      break;
+    }
+  }
+  queueIndex = startIdx;
+  applyDynamicLegLocked(legQueue[startIdx], hErr, turning);
   portEXIT_CRITICAL(&stateMux);
 
-  Serial.printf("\n🛰️ [ĐIỀU PHỐI DIJKSTRA SERVER] Nạp %d chặng, khởi hành: %s -> %s (dist=%.2fm, head=%.1f°)\n",
-                count, legs[0].fromName, legs[0].toName, legs[0].distM, legs[0].headingDeg);
+  Serial.printf("\n🛰️ [ĐIỀU PHỐI DIJKSTRA SERVER] Nạp %d chặng (bắt đầu chặng %d/%d), khởi hành: %s -> %s (dist=%.2fm, head=%.1f°)\n",
+                count, startIdx + 1, count,
+                legs[startIdx].fromName, legs[startIdx].toName,
+                legs[startIdx].distM, legs[startIdx].headingDeg);
 }
 
-LegId nextOfflineLegLocked(bool reverseDir) {
-  if (reverseDir) {
-    if (currentStation == STATION_B) return LEG_BA;
-    if (currentStation == STATION_C) return LEG_CB;
-    if (currentStation == STATION_D) return LEG_DC;
-    return LEG_AD;
+int nextOfflineEdgeLocked(bool reverseDir) {
+  if (runtimeNumEdges <= 0) return -1;
+  const int* loopArr = reverseDir ? GENERATED_LOOP_REV_EDGES : GENERATED_LOOP_FWD_EDGES;
+  for (int i = 0; i < GENERATED_LOOP_LEN; i++) {
+    int eIdx = loopArr[i];
+    if (eIdx >= 0 && eIdx < runtimeNumEdges && runtimeEdges[eIdx].fromIdx == currentStationIdx) {
+      return eIdx;
+    }
   }
-  if (currentStation == STATION_A) return LEG_AB;
-  if (currentStation == STATION_B) return LEG_BC;
-  if (currentStation == STATION_C) return LEG_CD;
-  return LEG_DA;
+  for (int e = 0; e < runtimeNumEdges; e++) {
+    if (runtimeEdges[e].fromIdx == currentStationIdx) return e;
+  }
+  return 0;
 }
 
 // Chuyển sang chặng kế tiếp (tôn trọng autoLoopReverse & legQueue)
@@ -898,7 +986,7 @@ void advanceToNextLeg() {
   } else {
     queueLength = 0;
     queueIndex = 0;
-    nextDyn = makeDynamicLegFromId(nextOfflineLegLocked(autoLoopReverse));
+    nextDyn = makeDynamicLegFromEdgeIdx(nextOfflineEdgeLocked(autoLoopReverse));
   }
   applyDynamicLegLocked(nextDyn, hErr, turning);
   portEXIT_CRITICAL(&stateMux);
@@ -916,7 +1004,7 @@ void advanceToPrevLeg() {
   portENTER_CRITICAL(&stateMux);
   queueLength = 0;
   queueIndex = 0;
-  prevDyn = makeDynamicLegFromId(nextOfflineLegLocked(true));
+  prevDyn = makeDynamicLegFromEdgeIdx(nextOfflineEdgeLocked(true));
   applyDynamicLegLocked(prevDyn, hErr, turning);
   portEXIT_CRITICAL(&stateMux);
 
@@ -1705,6 +1793,7 @@ static inline void enterLineFollowingFromTurnLocked(bool lineSeen, float initial
   curvedExcursionDetected = false;
   bendCatchAttemptedForGap = false;
   bendCatchStage    = 0;
+  lastBendCatchArcM = -1.0f;
   clearLineHistoryLocked();
   lastLineError = lineSeen ? initialErr : 0.0f;
   lastValidError = lineSeen ? initialErr : 0.0f;
@@ -1747,6 +1836,7 @@ static inline void resetStopStateLocked(const char* stateLabel) {
   curvedExcursionDetected = false;
   bendCatchAttemptedForGap = false;
   bendCatchStage    = 0;
+  lastBendCatchArcM = -1.0f;
   clearLineHistoryLocked();
   smoothedBaseSpeed = 0.0f;
   wheelSlipDetected = false;
@@ -1954,7 +2044,7 @@ void updateControlAndOdometry(float dt = 0.010f) {
       } else {
         queueLength = 0;
         queueIndex = 0;
-        nextDyn = makeDynamicLegFromId(nextOfflineLegLocked(autoLoopReverse));
+        nextDyn = makeDynamicLegFromEdgeIdx(nextOfflineEdgeLocked(autoLoopReverse));
       }
       applyDynamicLegLocked(nextDyn, hErr, turning);
     }
@@ -2124,14 +2214,16 @@ void updateControlAndOdometry(float dt = 0.010f) {
     int8_t activeDir = (bendCatchStage == 0) ? bendCatchDir : -bendCatchDir;
     if (activeDir == 0) activeDir = 1;
     float sweptDeg = (float)activeDir * normalizeAngleDeg(yawDeg - bendCatchStartYawDeg);
-    float sweepLimitDeg = (bendCatchStage == 0) ? 78.0f : 35.0f;
-    unsigned long phaseMs = (bendCatchStage == 0) ? 950UL : 1100UL;
+    float sweepLimitDeg = (bendCatchStage == 0) ? 68.0f : 32.0f;
+    unsigned long phaseMs = (bendCatchStage == 0) ? 650UL : 580UL;
     bool outOfDestCone = (fabsf(curRelFromLeg) > 92.0f) && (((float)activeDir * curRelFromLeg) > 0.0f);
+    bool divergingWideInReverse = (bendCatchStage > 0) && (fabsf(curRelFromLeg) > 58.0f) &&
+                                  (((float)activeDir * curRelFromLeg) > 0.0f);
 
-    if (sweptDeg >= sweepLimitDeg || outOfDestCone || (nowMs - bendCatchStartMs > phaseMs)) {
-      if (bendCatchStage == 0 && !outOfDestCone) {
+    if (sweptDeg >= sweepLimitDeg || outOfDestCone || divergingWideInReverse || (nowMs - bendCatchStartMs > phaseMs)) {
+      if (bendCatchStage == 0 && !outOfDestCone && fabsf(curRelFromLeg) <= 68.0f) {
         bendCatchStage = 1;
-        turnBrakeUntilMs = nowMs + 30;
+        turnBrakeUntilMs = nowMs + 25;
         bendCatchStartMs = turnBrakeUntilMs;
       } else {
         bendCatchStage = 0;
@@ -2305,16 +2397,16 @@ void updateControlAndOdometry(float dt = 0.010f) {
       resetWheelCascadeLocked();
 
       snprintf(currentStationName, sizeof(currentStationName), "%s", currentTargetName);
-      currentStation = parseStationId(currentStationName);
+      currentStationIdx = findMapNodeIndex(currentStationName);
       if (allowStationSnap) {
         float snapX = odomX;
         float snapY = odomY;
         if (currentTargetHasCoord) {
           snapX = currentTargetX;
           snapY = currentTargetY;
-        } else if (currentStation < STATION_UNKNOWN) {
-          snapX = STATION_COORDS[currentStation].x;
-          snapY = STATION_COORDS[currentStation].y;
+        } else if (currentStationIdx >= 0 && currentStationIdx < runtimeNumNodes) {
+          snapX = runtimeNodes[currentStationIdx].x;
+          snapY = runtimeNodes[currentStationIdx].y;
         }
         // Bảo toàn góc thật của Gyro (chỉ tinh chỉnh nếu sai số <= 2.5°) tránh bơm sai số hướng cho chặng sau
         float snapYaw = (yawErrCorner <= 2.5f) ? legTargetHeadingDeg : yawDeg;
@@ -2425,14 +2517,17 @@ void updateControlAndOdometry(float dt = 0.010f) {
 
   // GIAI ĐOẠN 3.2: BÁM LINE TỰ DO + PHÂN NHÁNH CỨU HỘ MẤT LINE THEO NGỮ CẢNH (QUÉT CUA ±100° VS CẦU ĐỨT ĐOẠN)
   if (activeCount == 0) {
-    if (turnCatchGraceUntilMs > nowMs && hasSeenLineOnLeg) {
+    float graceYawToLeg = normalizeAngleDeg(legTargetHeadingDeg - yawDeg);
+    if (turnCatchGraceUntilMs > nowMs && hasSeenLineOnLeg && fabsf(graceYawToLeg) <= 20.0f) {
       int8_t recenterDir = 0;
-      if (fabsf(lastValidError) >= 0.4f) {
+      if (fabsf(graceYawToLeg) >= 8.0f) {
+        recenterDir = (graceYawToLeg >= 0.0f) ? 1 : -1;
+      } else if (fabsf(lastValidError) >= 0.4f) {
         recenterDir = (lastValidError < 0.0f) ? 1 : -1;
       } else if (lastTurnSpinDir != 0) {
         recenterDir = -lastTurnSpinDir;
       } else {
-        recenterDir = (normalizeAngleDeg(legTargetHeadingDeg - yawDeg) >= 0.0f) ? 1 : -1;
+        recenterDir = (graceYawToLeg >= 0.0f) ? 1 : -1;
       }
       int recenterPwm = computeRegulatedTurnPwm(0.0f, true, fabsf(liveGzDegPerSec));
       if (recenterPwm < 0) {
@@ -2446,6 +2541,8 @@ void updateControlAndOdometry(float dt = 0.010f) {
       portEXIT_CRITICAL(&stateMux);
       setMotors(leftPwm, rightPwm);
       return;
+    } else if (turnCatchGraceUntilMs > nowMs && fabsf(graceYawToLeg) > 20.0f) {
+      turnCatchGraceUntilMs = 0;
     }
 
     consecutiveZeroLineFrames++;
@@ -2478,13 +2575,16 @@ void updateControlAndOdometry(float dt = 0.010f) {
       bool outsideStationZone = !currentTargetHasCoord || (distToTarget2D > 0.35f);
       summarizeRecentBendSignalsLocked(outsideStationZone, recentHadBendMask, recentDirErr, recentMeanGzAbs);
       float pureYawErrLeg = fabsf(normalizeAngleDeg(pureMpuYawDeg - legTargetHeadingDeg));
+      bool bendCooldownOk = (lastBendCatchArcM < 0.0f) || ((legArcDistM - lastBendCatchArcM) >= 0.28f);
       bool isBendLoss = lineTrackedOnLeg && !bendCatchAttemptedForGap && !stationCrossBarLatched &&
+                        bendCooldownOk && (legArcDistM >= 0.14f) &&
                         (distToTarget2D > 0.28f) && (remainingLegM > 0.30f) &&
                         (curvedExcursionDetected || pureYawErrLeg > 14.0f || recentMeanGzAbs >= 26.0f ||
                          (recentHadBendMask && fabsf(recentDirErr) >= 1.15f));
 
       if (isBendLoss) {
         bendCatchAttemptedForGap = true;
+        lastBendCatchArcM = legArcDistM;
         if (fabsf(normalizeAngleDeg(yawDeg - pureMpuYawDeg)) > 2.5f) {
           ekfSyncFromPoseLocked(pureMpuLegX, pureMpuLegY, pureMpuYawDeg, true, 0.015f, 1.5f);
         }
@@ -2642,7 +2742,7 @@ void updateControlAndOdometry(float dt = 0.010f) {
     // Hàng rào An toàn Quỹ đạo Rộng: Giữ tự do cho chữ Z / < / đường cong (~0.45m), nhưng cắt an toàn
     // nếu xe bám nhầm sang tuyến đường khác (> 0.85m hoặc cung chạy gấp > 2.2x chiều dài chặng + 0.5m).
     float maxCorridorM = currentTargetHasCoord
-                           ? fmaxf(0.85f, 0.55f * fminf(activeMapWidthM, activeMapLengthM))
+                           ? fmaxf(ACTIVE_CORRIDOR_GUARD_M, 0.55f * fminf(activeMapWidthM, activeMapLengthM))
                            : 1.50f;
     float maxArcOnLegM = fmaxf(legTargetDistM * 2.2f + 0.50f, 3.00f);
     float curCrossTrackM = computeLegCrossTrackM();
@@ -2695,8 +2795,10 @@ void updateControlAndOdometry(float dt = 0.010f) {
     }
     if (consecutiveGoodLineFrames >= 4) {
       lineTrackedOnLeg = true;
-      bendCatchAttemptedForGap = false;
       lastConfirmedLineProgM = legProgressM;
+    }
+    if (consecutiveGoodLineFrames >= 10) {
+      bendCatchAttemptedForGap = false;
     }
 
     // Phân biệt tự động Tuyến Thẳng vs Tuyến Cong / Chữ < dùng CẢ EKF & trục thuần MPU-6050:
@@ -2917,6 +3019,333 @@ int parseRouteLegsFromResponse(const String &resp, DynamicLeg outLegs[], int max
 }
 
 // ===================================================================================
+// HỆ THỐNG GIỌNG NÓI THÔNG BÁO LẤY HÀNG & DỠ HÀNG ĐÚNG QUY ĐỊNH (MAX98357A I2S)
+// ===================================================================================
+struct AgvVoiceMsg {
+  char cue[64];
+};
+
+static QueueHandle_t agvAudioQueue = NULL;
+static volatile int agvAudioVolPct = AUDIO_DEFAULT_VOL_PCT;
+static bool agvAudioInstalled = false;
+static volatile bool agvVoiceBusy = false;
+static int lastVoiceSeq = 0;
+
+struct PendingMoveCommand {
+  bool active;
+  int nLegs;
+  DynamicLeg legs[MAX_ROUTE_LEGS];
+  char cmd[48];
+  unsigned long queuedAtMs;
+};
+static PendingMoveCommand pendingMoveCmd = { false, 0, {}, {0}, 0 };
+static volatile bool cancelPendingMoveFlag = false;
+
+bool initAgvAudioI2S() {
+  if (AUDIO_SD_PIN >= 0) {
+    pinMode(AUDIO_SD_PIN, OUTPUT);
+    digitalWrite(AUDIO_SD_PIN, LOW);
+  }
+
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  cfg.sample_rate = AUDIO_SAMPLE_RATE;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count = 6;
+  cfg.dma_buf_len = 256;
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = true;
+
+  if (i2s_driver_install(AUDIO_I2S_PORT, &cfg, 0, NULL) != ESP_OK) return false;
+
+  i2s_pin_config_t pinCfg = {};
+  pinCfg.mck_io_num = I2S_PIN_NO_CHANGE;
+  pinCfg.bck_io_num = AUDIO_BCLK_PIN;
+  pinCfg.ws_io_num = AUDIO_LRC_PIN;
+  pinCfg.data_out_num = AUDIO_DIN_PIN;
+  pinCfg.data_in_num = I2S_PIN_NO_CHANGE;
+
+  if (i2s_set_pin(AUDIO_I2S_PORT, &pinCfg) != ESP_OK) {
+    i2s_driver_uninstall(AUDIO_I2S_PORT);
+    return false;
+  }
+
+  i2s_zero_dma_buffer(AUDIO_I2S_PORT);
+  agvAudioInstalled = true;
+  return true;
+}
+
+void voiceWriteSilenceMs(int ms) {
+  if (!agvAudioInstalled || ms <= 0) return;
+  int totalFrames = (AUDIO_SAMPLE_RATE * ms) / 1000;
+  int16_t buf[AUDIO_CHUNK_FRAMES * 2] = {0};
+  int remaining = totalFrames;
+  while (remaining > 0) {
+    int batch = (remaining > AUDIO_CHUNK_FRAMES) ? AUDIO_CHUNK_FRAMES : remaining;
+    size_t written = 0;
+    i2s_write(AUDIO_I2S_PORT, buf, (size_t)batch * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(100));
+    remaining -= batch;
+  }
+}
+
+void voicePlayClipRef(const int16_t *pcm, size_t len, int volPct) {
+  if (!agvAudioInstalled || !pcm || len == 0) return;
+  int vol = constrain(volPct, 5, 100);
+  int16_t buf[AUDIO_CHUNK_FRAMES * 2];
+  size_t pos = 0;
+  while (pos < len) {
+    size_t batch = len - pos;
+    if (batch > AUDIO_CHUNK_FRAMES) batch = AUDIO_CHUNK_FRAMES;
+    for (size_t i = 0; i < batch; i++) {
+      int16_t raw = (int16_t)pgm_read_word(&pcm[pos + i]);
+      int32_t scaled = ((int32_t)raw * vol) / 100;
+      if (scaled > 32767) scaled = 32767;
+      else if (scaled < -32768) scaled = -32768;
+      int16_t s = (int16_t)scaled;
+      buf[i * 2] = s;
+      buf[i * 2 + 1] = s;
+    }
+    size_t written = 0;
+    i2s_write(AUDIO_I2S_PORT, buf, batch * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(200));
+    pos += batch;
+  }
+}
+
+VoiceClipRef resolveStationClip(const char *st) {
+  if (!st || !st[0]) return { VP_ST_GEN_PCM, VP_ST_GEN_LEN };
+  if (strcmp(st, "A") == 0)  return { VP_ST_A_PCM, VP_ST_A_LEN };
+  if (strcmp(st, "B") == 0)  return { VP_ST_B_PCM, VP_ST_B_LEN };
+  if (strcmp(st, "C") == 0)  return { VP_ST_C_PCM, VP_ST_C_LEN };
+  if (strcmp(st, "D") == 0)  return { VP_ST_D_PCM, VP_ST_D_LEN };
+  if (strcmp(st, "E") == 0)  return { VP_ST_E_PCM, VP_ST_E_LEN };
+  if (strcmp(st, "F") == 0)  return { VP_ST_F_PCM, VP_ST_F_LEN };
+  if (strcmp(st, "H1") == 0) return { VP_ST_H1_PCM, VP_ST_H1_LEN };
+  return { VP_ST_GEN_PCM, VP_ST_GEN_LEN };
+}
+
+VoiceClipRef resolveProductClip(const char *prod) {
+  if (!prod || !prod[0]) return { VP_PROD_GEN_PCM, VP_PROD_GEN_LEN };
+  if (strcmp(prod, "MULTI") == 0) return { VP_PROD_MULTI_PCM, VP_PROD_MULTI_LEN };
+  if (strcmp(prod, "PKG_ELEC") == 0 || strcmp(prod, "ELECTRONIC") == 0) return { VP_PROD_ELEC_PCM, VP_PROD_ELEC_LEN };
+  if (strcmp(prod, "PKG_MECH") == 0 || strcmp(prod, "MECHANICAL") == 0) return { VP_PROD_MECH_PCM, VP_PROD_MECH_LEN };
+  if (strcmp(prod, "PKG_TOOL") == 0 || strcmp(prod, "TOOL") == 0)       return { VP_PROD_TOOL_PCM, VP_PROD_TOOL_LEN };
+  return { VP_PROD_GEN_PCM, VP_PROD_GEN_LEN };
+}
+
+void playVoiceCueSequence(const char *cueRaw) {
+  if (!agvAudioInstalled || !cueRaw || !cueRaw[0]) return;
+
+  char work[64];
+  snprintf(work, sizeof(work), "%s", cueRaw);
+  char *tok0 = work;
+  char *tok1 = NULL;
+  char *tok2 = NULL;
+  char *p1 = strchr(work, '|');
+  if (p1) {
+    *p1 = '\0';
+    tok1 = p1 + 1;
+    char *p2 = strchr(tok1, '|');
+    if (p2) {
+      *p2 = '\0';
+      tok2 = p2 + 1;
+    }
+  }
+
+  VoiceClipRef seq[8];
+  int cnt = 0;
+  int playVol = agvAudioVolPct;
+
+  if (strcmp(tok0, "BOOT_READY") == 0) {
+    seq[cnt++] = { VP_BOOT_READY_PCM, VP_BOOT_READY_LEN };
+  } else if (strcmp(tok0, "BROWNOUT") == 0) {
+    seq[cnt++] = { VP_BROWNOUT_PCM, VP_BROWNOUT_LEN };
+    playVol = AUDIO_BROWNOUT_VOL_PCT;
+  } else if (strcmp(tok0, "WAIT_LOAD") == 0) {
+    seq[cnt++] = { VP_WAIT_LOAD_PCM, VP_WAIT_LOAD_LEN };
+  } else if (strcmp(tok0, "RETRY_LOAD") == 0) {
+    seq[cnt++] = { VP_RETRY_LOAD_PCM, VP_RETRY_LOAD_LEN };
+  } else if (strcmp(tok0, "DISPATCH") == 0) {
+    seq[cnt++] = { VP_DISPATCH_PRE_PCM, VP_DISPATCH_PRE_LEN };
+    seq[cnt++] = resolveProductClip(tok2);
+    seq[cnt++] = { VP_GO_TO_PRE_PCM, VP_GO_TO_PRE_LEN };
+    seq[cnt++] = resolveStationClip(tok1);
+  } else if (strcmp(tok0, "UNLOAD_MULTI") == 0) {
+    seq[cnt++] = { VP_ARRIVED_PRE_PCM, VP_ARRIVED_PRE_LEN };
+    seq[cnt++] = resolveStationClip(tok1);
+    seq[cnt++] = { VP_UNLOAD_PRE_PCM, VP_UNLOAD_PRE_LEN };
+    seq[cnt++] = resolveProductClip(tok2);
+    seq[cnt++] = { VP_UNLOAD_KEEP_OTHER_PCM, VP_UNLOAD_KEEP_OTHER_LEN };
+  } else if (strcmp(tok0, "UNLOAD_SINGLE") == 0) {
+    seq[cnt++] = { VP_ARRIVED_PRE_PCM, VP_ARRIVED_PRE_LEN };
+    seq[cnt++] = resolveStationClip(tok1);
+    seq[cnt++] = { VP_UNLOAD_PRE_PCM, VP_UNLOAD_PRE_LEN };
+    seq[cnt++] = resolveProductClip(tok2);
+    seq[cnt++] = { VP_UNLOAD_CLEAR_HAND_PCM, VP_UNLOAD_CLEAR_HAND_LEN };
+  } else if (strcmp(tok0, "STILL_PRESENT") == 0) {
+    seq[cnt++] = { VP_STILL_PRESENT_PCM, VP_STILL_PRESENT_LEN };
+  } else if (strcmp(tok0, "RETRY_UNLOAD") == 0) {
+    seq[cnt++] = { VP_RETRY_UNLOAD_PCM, VP_RETRY_UNLOAD_LEN };
+  } else if (strcmp(tok0, "ADVANCE") == 0) {
+    seq[cnt++] = { VP_UNLOAD_OK_NEXT_PCM, VP_UNLOAD_OK_NEXT_LEN };
+    seq[cnt++] = resolveStationClip(tok1);
+  } else if (strcmp(tok0, "RETURN_HOME") == 0) {
+    seq[cnt++] = { VP_UNLOAD_ALL_RET_PCM, VP_UNLOAD_ALL_RET_LEN };
+  } else if (strcmp(tok0, "HOME_READY") == 0) {
+    seq[cnt++] = { VP_HOME_READY_PCM, VP_HOME_READY_LEN };
+  } else if (strcmp(tok0, "LOST_LINE") == 0) {
+    seq[cnt++] = { VP_LOST_LINE_PCM, VP_LOST_LINE_LEN };
+  } else if (strcmp(tok0, "LOW_BATTERY") == 0) {
+    seq[cnt++] = { VP_LOW_BATTERY_PCM, VP_LOW_BATTERY_LEN };
+  }
+
+  if (cnt <= 0) return;
+
+  Serial.printf("🔊 [VOICE @ %d%%]: %s\n", playVol, cueRaw);
+  if (AUDIO_SD_PIN >= 0) {
+    digitalWrite(AUDIO_SD_PIN, HIGH);
+    voiceWriteSilenceMs(16);
+  }
+  for (int i = 0; i < cnt; i++) {
+    voicePlayClipRef(seq[i].pcm, seq[i].len, playVol);
+    if (i + 1 < cnt) {
+      voiceWriteSilenceMs(45);
+    }
+  }
+  voiceWriteSilenceMs(20);
+  i2s_zero_dma_buffer(AUDIO_I2S_PORT);
+  if (AUDIO_SD_PIN >= 0) {
+    digitalWrite(AUDIO_SD_PIN, LOW);
+  }
+}
+
+bool isVoiceSpeakingOrQueued() {
+  return agvVoiceBusy || (agvAudioQueue && uxQueueMessagesWaiting(agvAudioQueue) > 0);
+}
+
+void enqueueVoiceCue(const char *cue) {
+  if (!agvAudioQueue || !cue || !cue[0]) return;
+  AgvVoiceMsg msg;
+  snprintf(msg.cue, sizeof(msg.cue), "%s", cue);
+  agvVoiceBusy = true;
+  if (xQueueSend(agvAudioQueue, &msg, 0) != pdTRUE) {
+    if (uxQueueMessagesWaiting(agvAudioQueue) == 0) {
+      agvVoiceBusy = false;
+    }
+  }
+}
+
+void audioVoiceTask(void *pvParameters) {
+  initAgvAudioI2S();
+  AgvVoiceMsg msg;
+  while (true) {
+    if (xQueueReceive(agvAudioQueue, &msg, portMAX_DELAY) == pdTRUE) {
+      agvVoiceBusy = true;
+      playVoiceCueSequence(msg.cue);
+      if (uxQueueMessagesWaiting(agvAudioQueue) == 0) {
+        agvVoiceBusy = false;
+      }
+    }
+  }
+}
+
+bool isMotionCommandName(const String &cmdStr) {
+  return (cmdStr == "START" ||
+          cmdStr == "MISSION:NEXT" ||
+          cmdStr == "MISSION:PREV" ||
+          cmdStr.startsWith("MISSION:") ||
+          cmdStr.startsWith("GO_TO:") ||
+          cmdStr == "AUTO_LOOP:ON" ||
+          cmdStr == "AUTO_LOOP:REVERSE" ||
+          cmdStr == "TURN_LEFT_90" ||
+          cmdStr == "TURN_RIGHT_90" ||
+          cmdStr == "TURN_180");
+}
+
+void executeMovementCommandNow(const String &cmdStr, DynamicLeg parsedLegs[], int nLegs) {
+  if (cmdStr == "START") {
+    startEdgeMission(currentEdgeIdx);
+  } else if (cmdStr == "MISSION:NEXT") {
+    advanceToNextLeg();
+  } else if (cmdStr == "MISSION:PREV") {
+    advanceToPrevLeg();
+  } else if (cmdStr.startsWith("MISSION:")) {
+    String sub = cmdStr.substring(8);
+    sub.trim();
+    sub.toUpperCase();
+    int eIdx = -1;
+    if (sub.startsWith("M") && sub.length() >= 2) {
+      int step = sub.substring(1).toInt() - 1;
+      if (step >= 0 && step < GENERATED_LOOP_LEN) {
+        eIdx = GENERATED_LOOP_FWD_EDGES[step];
+      }
+    } else {
+      int arrowPos = sub.indexOf("->");
+      if (arrowPos > 0) {
+        String u = sub.substring(0, arrowPos);
+        String v = sub.substring(arrowPos + 2);
+        u.trim(); v.trim();
+        eIdx = findMapEdgeIndex(u.c_str(), v.c_str());
+      } else if (sub.length() == 2) {
+        char u[2] = { sub[0], '\0' };
+        char v[2] = { sub[1], '\0' };
+        eIdx = findMapEdgeIndex(u, v);
+      }
+    }
+    if (eIdx >= 0) {
+      autoLoopEnabled = false;
+      startEdgeMission(eIdx);
+    } else {
+      Serial.printf("\n⚠️ [LỆNH MISSION]: Không tìm thấy chặng '%s' trên bản đồ %s!\n",
+                    sub.c_str(), ACTIVE_MAP_ID);
+    }
+  } else if (cmdStr.startsWith("GO_TO:")) {
+    String targetName = cmdStr.substring(6);
+    targetName.trim();
+    targetName.toUpperCase();
+
+    if (nLegs > 0) {
+      executeServerRouteLegs(parsedLegs, nLegs);
+    } else {
+      char curStBuf[12];
+      portENTER_CRITICAL(&stateMux);
+      snprintf(curStBuf, sizeof(curStBuf), "%s", currentStationName);
+      portEXIT_CRITICAL(&stateMux);
+      int destIdx = findMapNodeIndex(targetName.c_str());
+      if (targetName.equals(String(curStBuf))) {
+        stopMotors();
+        portENTER_CRITICAL(&stateMux);
+        queueLength = 0;
+        queueIndex = 0;
+        robotSubState = SUB_STOPPED;
+        robotStateStr = "AT_STATION";
+        isRunning = false;
+        portEXIT_CRITICAL(&stateMux);
+        Serial.printf("\n>> [THÔNG BÁO] Xe đang ở sẵn trạm đích: %s!\n", targetName.c_str());
+      } else {
+        planAndExecuteRoute(currentStationIdx, destIdx);
+      }
+    }
+  } else if (cmdStr == "AUTO_LOOP:ON") {
+    autoLoopEnabled = true;
+    autoLoopReverse = false;
+    startEdgeMission(currentEdgeIdx);
+  } else if (cmdStr == "AUTO_LOOP:REVERSE") {
+    autoLoopEnabled = true;
+    autoLoopReverse = true;
+    advanceToPrevLeg();
+  } else if (cmdStr == "TURN_LEFT_90") {
+    startManualTurn(90.0f);
+  } else if (cmdStr == "TURN_RIGHT_90") {
+    startManualTurn(-90.0f);
+  } else if (cmdStr == "TURN_180") {
+    startManualTurn(180.0f);
+  }
+}
+
+// ===================================================================================
 // CORE 0: TELEMETRY & BẢO MẬT RBAC & ĐIỀU PHỐI ĐA TRẠM 2 CHIỀU
 // ===================================================================================
 void telemetryTask(void *pvParameters) {
@@ -2956,6 +3385,23 @@ void telemetryTask(void *pvParameters) {
   int consecutiveHttpErrors = 0;
 
   while (true) {
+    if (cancelPendingMoveFlag) {
+      cancelPendingMoveFlag = false;
+      pendingMoveCmd.active = false;
+    }
+    if (pendingMoveCmd.active) {
+      bool voiceDone = !isVoiceSpeakingOrQueued();
+      bool timedOut = (millis() - pendingMoveCmd.queuedAtMs >= 12000UL);
+      if (voiceDone || timedOut) {
+        PendingMoveCommand runCmd = pendingMoveCmd;
+        pendingMoveCmd.active = false;
+        Serial.printf("▶️ [%s]: Bắt đầu thực thi lệnh '%s'\n",
+                      voiceDone ? "ĐỌC XONG CÂU THOẠI" : "HẾT THỜI GIAN CHỜ THOẠI",
+                      runCmd.cmd);
+        executeMovementCommandNow(String(runCmd.cmd), runCmd.legs, runCmd.nLegs);
+      }
+    }
+
     if (WiFi.status() == WL_CONNECTED) {
       // Snapshot dữ liệu an toàn đa nhân (Thread-safe Snapshot)
       portENTER_CRITICAL(&stateMux);
@@ -2978,14 +3424,15 @@ void telemetryTask(void *pvParameters) {
       const char* snapStatePtr = robotStateStr ? robotStateStr : "STOPPED";
       portEXIT_CRITICAL(&stateMux);
 
-      char payloadBuf[384];
+      char payloadBuf[512];
       snprintf(
           payloadBuf, sizeof(payloadBuf),
-          "{\"x\":%.3f,\"y\":%.3f,\"yaw\":%.1f,\"dist\":%.3f,\"speed\":%.1f,"
+          "{\"map_id\":\"%s\",\"map_hash\":\"%s\",\"x\":%.3f,\"y\":%.3f,\"yaw\":%.1f,\"dist\":%.3f,\"speed\":%.1f,"
           "\"line_mask\":%d,\"line_err\":%.2f,\"ticks_l\":%ld,\"ticks_r\":%ld,"
           "\"pwm_l\":%d,\"pwm_r\":%d,\"station\":\"%s\",\"leg\":\"%s\","
           "\"ack_id\":%d,\"auto_loop\":%s,\"voltage\":%.3f,\"current\":%.3f,"
           "\"power\":%.3f,\"energy_mah\":%.1f,\"ina_ok\":%s,\"state\":\"%s\"}",
+          ACTIVE_MAP_ID, ACTIVE_MAP_HASH,
           snapX, snapY, snapYaw, snapDist, snapSpeed,
           snapMask, snapLineErr, snapTicksL, snapTicksR,
           snapPwmL, snapPwmR, snapStation, snapLeg,
@@ -3003,14 +3450,27 @@ void telemetryTask(void *pvParameters) {
         consecutiveHttpErrors = 0;
         String resp = http.getString();
 
-        // Đồng bộ kích thước Bản đồ động (map_w, map_h) thời gian thực từ Server
+        // Đồng bộ Map ID, Map Hash (Map-as-Code) & kích thước Bản đồ động (map_w, map_h) từ Server
+        char srvMapId[64] = {0};
+        char srvMapHash[24] = {0};
+        extractJsonStrField(resp, "map_id", srvMapId, sizeof(srvMapId));
+        extractJsonStrField(resp, "map_hash", srvMapHash, sizeof(srvMapHash));
         float srvW = 0.0f, srvH = 0.0f;
         if (extractJsonFloatField(resp, "map_w", srvW) && extractJsonFloatField(resp, "map_h", srvH)) {
-          syncMapDimensionsFromServer(srvW, srvH);
+          syncMapDimensionsFromServer(srvW, srvH, srvMapId, srvMapHash);
         }
 
         float cmdIdFloat = 0.0f;
         int incomingId = extractJsonFloatField(resp, "cmd_id", cmdIdFloat) ? (int)cmdIdFloat : 0;
+
+        float voiceSeqFloat = 0.0f;
+        int incomingVoiceSeq = extractJsonFloatField(resp, "voice_seq", voiceSeqFloat) ? (int)voiceSeqFloat : 0;
+        char voiceCueBuf[64] = {0};
+        extractJsonStrField(resp, "voice_cue", voiceCueBuf, sizeof(voiceCueBuf));
+        if (incomingVoiceSeq > 0 && incomingVoiceSeq != lastVoiceSeq && voiceCueBuf[0] != '\0') {
+          lastVoiceSeq = incomingVoiceSeq;
+          enqueueVoiceCue(voiceCueBuf);
+        }
 
         // Trích xuất chuỗi cmd, route và chữ ký cmd_sig từ JSON bằng bộ hàm chung
         char cmdBuf[48] = {0};
@@ -3039,26 +3499,30 @@ void telemetryTask(void *pvParameters) {
             lastAckId = incomingId;
             Serial.printf("\n>> [LỆNH MẠNG #%d]: cmd='%s' (HMAC Verified)\n", incomingId, cmdStr.c_str());
 
-          // 1. Lệnh cơ bản
-          if (cmdStr == "START") {
-            startMission(currentLeg);
-          } else if (cmdStr == "STOP") {
+          // 1. Lệnh tức thời không cần đợi thoại (STOP / RESET / CALIBRATE / CONFIG)
+          if (cmdStr == "STOP") {
+            pendingMoveCmd.active = false;
             portENTER_CRITICAL(&stateMux);
             resetStopStateLocked("STOPPED");
             portEXIT_CRITICAL(&stateMux);
             stopMotors();
           } else if (cmdStr == "RESET_ODOM") {
+            pendingMoveCmd.active = false;
             stopMotors();
             noInterrupts(); rawTicksL = 0; rawTicksR = 0; interrupts();
             portENTER_CRITICAL(&stateMux);
-            ekfSyncFromPoseLocked(0.0f, 0.0f, 90.0f, true, 0.010f, 1.5f);
+            float hx = (runtimeHomeIdx >= 0 && runtimeHomeIdx < runtimeNumNodes) ? runtimeNodes[runtimeHomeIdx].x : 0.0f;
+            float hy = (runtimeHomeIdx >= 0 && runtimeHomeIdx < runtimeNumNodes) ? runtimeNodes[runtimeHomeIdx].y : 0.0f;
+            float initHead = ACTIVE_INITIAL_HEADING_DEG;
+            float initRad = (initHead * PI) / 180.0f;
+            ekfSyncFromPoseLocked(hx, hy, initHead, true, 0.010f, 1.5f);
             totalDistM = 0.0f; legProgressM = 0.0f; legArcDistM = 0.0f;
-            lastLineYawDeg = 90.0f;
-            bridgeOriginX = 0.0f;
-            bridgeOriginY = 0.0f;
-            bridgeRefHeadingDeg = 90.0f;
-            finalAimUx = 0.0f;
-            finalAimUy = 1.0f;
+            lastLineYawDeg = initHead;
+            bridgeOriginX = hx;
+            bridgeOriginY = hy;
+            bridgeRefHeadingDeg = initHead;
+            finalAimUx = cosf(initRad);
+            finalAimUy = sinf(initRad);
             stationCrossBarLatched = false;
             resetLegCornerAnchorStateLocked();
             curvedExcursionDetected = false;
@@ -3067,20 +3531,34 @@ void telemetryTask(void *pvParameters) {
             clearLineHistoryLocked();
             gapStartArcM = 0.0f;
             stillGyroSamples = 0;
-            currentLeg = LEG_AB;
-            currentStation = STATION_A;
-            snprintf(currentStationName, sizeof(currentStationName), "A");
-            snprintf(currentTargetName, sizeof(currentTargetName), "B");
-            snprintf(currentLegName, sizeof(currentLegName), "A -> B");
-            currentTargetX = STATION_COORDS[STATION_B].x;
-            currentTargetY = STATION_COORDS[STATION_B].y;
-            currentTargetHasCoord = true;
-            legTargetDistM = activeMapLengthM;
-            legTargetHeadingDeg = 90.0f;
-            legStartX = 0.0f;
-            legStartY = 0.0f;
-            legLineOriginX = 0.0f;
-            legLineOriginY = 0.0f;
+            int firstEdge = (ACTIVE_FIRST_EDGE_IDX >= 0 && ACTIVE_FIRST_EDGE_IDX < runtimeNumEdges) ? ACTIVE_FIRST_EDGE_IDX : 0;
+            currentEdgeIdx = firstEdge;
+            currentStationIdx = runtimeHomeIdx;
+            snprintf(currentStationName, sizeof(currentStationName), "%s",
+                     (runtimeHomeIdx >= 0 && runtimeHomeIdx < runtimeNumNodes) ? runtimeNodes[runtimeHomeIdx].id : ACTIVE_MAP_HOME_NODE_ID);
+            if (runtimeNumEdges > 0) {
+              int tgtIdx = runtimeEdges[firstEdge].toIdx;
+              const char* tgtName = (tgtIdx >= 0 && tgtIdx < runtimeNumNodes) ? runtimeNodes[tgtIdx].id : currentStationName;
+              snprintf(currentTargetName, sizeof(currentTargetName), "%s", tgtName);
+              snprintf(currentLegName, sizeof(currentLegName), "%s -> %s", currentStationName, tgtName);
+              currentTargetX = (tgtIdx >= 0 && tgtIdx < runtimeNumNodes) ? runtimeNodes[tgtIdx].x : hx;
+              currentTargetY = (tgtIdx >= 0 && tgtIdx < runtimeNumNodes) ? runtimeNodes[tgtIdx].y : hy;
+              currentTargetHasCoord = true;
+              legTargetDistM = runtimeEdges[firstEdge].distM;
+              legTargetHeadingDeg = runtimeEdges[firstEdge].headingDeg;
+            } else {
+              snprintf(currentTargetName, sizeof(currentTargetName), "%s", currentStationName);
+              snprintf(currentLegName, sizeof(currentLegName), "%s", currentStationName);
+              currentTargetX = hx;
+              currentTargetY = hy;
+              currentTargetHasCoord = false;
+              legTargetDistM = 1.0f;
+              legTargetHeadingDeg = initHead;
+            }
+            legStartX = hx;
+            legStartY = hy;
+            legLineOriginX = hx;
+            legLineOriginY = hy;
             useGlobalLineProgress = true;
             autoLoopReverse = false;
             simulateGapActive = false;
@@ -3102,81 +3580,13 @@ void telemetryTask(void *pvParameters) {
             prevTicksL = 0; prevTicksR = 0;
             resetStopStateLocked("STOPPED");
             portEXIT_CRITICAL(&stateMux);
-            Serial.println(">> [LỆNH]: RESET ODOMETRY VỀ GỐC A (0,0) 90°!");
+            Serial.printf(">> [LỆNH]: RESET ODOMETRY VỀ TRẠM GỐC %s (%.2fm, %.2fm) %.1f°!\n",
+                          ACTIVE_MAP_HOME_NODE_ID, hx, hy, initHead);
           } else if (cmdStr == "CALIBRATE_GYRO") {
             requestGyroCalib = true;
             Serial.println(">> [LỆNH]: Xếp lịch hiệu chỉnh con quay trên Core 1...");
-          }
-          // 2. Chạy từng chặng cụ thể trong 8 chặng 2 chiều
-          else if (cmdStr == "MISSION:AB" || cmdStr == "MISSION:M1") {
-            autoLoopEnabled = false; startMission(LEG_AB);
-          } else if (cmdStr == "MISSION:BC" || cmdStr == "MISSION:M2") {
-            autoLoopEnabled = false; startMission(LEG_BC);
-          } else if (cmdStr == "MISSION:CD" || cmdStr == "MISSION:M3") {
-            autoLoopEnabled = false; startMission(LEG_CD);
-          } else if (cmdStr == "MISSION:DA" || cmdStr == "MISSION:M4") {
-            autoLoopEnabled = false; startMission(LEG_DA);
-          } else if (cmdStr == "MISSION:BA") {
-            autoLoopEnabled = false; startMission(LEG_BA);
-          } else if (cmdStr == "MISSION:CB") {
-            autoLoopEnabled = false; startMission(LEG_CB);
-          } else if (cmdStr == "MISSION:DC") {
-            autoLoopEnabled = false; startMission(LEG_DC);
-          } else if (cmdStr == "MISSION:AD") {
-            autoLoopEnabled = false; startMission(LEG_AD);
-          }
-          // 3. Điều hướng tiến / lùi tuần tự
-          else if (cmdStr == "MISSION:NEXT") {
-            advanceToNextLeg();
-          } else if (cmdStr == "MISSION:PREV") {
-            advanceToPrevLeg();
-          }
-          // 4. Lập lộ trình Điểm - Điểm tự động (Ưu tiên route_legs Dijkstra từ Server, dự phòng offline)
-          else if (cmdStr.startsWith("GO_TO:")) {
-            String targetName = cmdStr.substring(6);
-            targetName.trim();
-            targetName.toUpperCase();
-
-            DynamicLeg parsedLegs[MAX_ROUTE_LEGS];
-            int nLegs = parseRouteLegsFromResponse(resp, parsedLegs, MAX_ROUTE_LEGS);
-            if (nLegs > 0) {
-              executeServerRouteLegs(parsedLegs, nLegs);
-            } else {
-              StationId destSt = parseStationId(targetName.c_str());
-              if (targetName.equals(String(snapStation))) {
-                stopMotors();
-                portENTER_CRITICAL(&stateMux);
-                queueLength = 0;
-                queueIndex = 0;
-                robotSubState = SUB_STOPPED;
-                robotStateStr = "AT_STATION";
-                isRunning = false;
-                portEXIT_CRITICAL(&stateMux);
-                Serial.printf("\n>> [THÔNG BÁO] Xe đang ở sẵn trạm đích: %s!\n", targetName.c_str());
-              } else {
-                planAndExecuteRoute(currentStation, destSt);
-              }
-            }
-          }
-          // 5. Vòng lặp tuần hoàn xuôi / ngược
-          else if (cmdStr == "AUTO_LOOP:ON") {
-            autoLoopEnabled = true;
-            autoLoopReverse = false;
-            startMission(currentLeg);
-          } else if (cmdStr == "AUTO_LOOP:REVERSE") {
-            autoLoopEnabled = true;
-            autoLoopReverse = true;
-            advanceToPrevLeg();
           } else if (cmdStr == "AUTO_LOOP:OFF") {
             autoLoopEnabled = false;
-          }
-          // 6. Xoay thủ công & Giả lập đứt vạch (Trái CCW = +90°, Phải CW = -90°)
-          else if (cmdStr == "TURN_LEFT_90") {
-            startManualTurn(90.0f);
-          } else if (cmdStr == "TURN_RIGHT_90") {
-            startManualTurn(-90.0f);
-          } else if (cmdStr == "TURN_180") {
-            startManualTurn(180.0f);
           } else if (cmdStr == "SIMULATE_GAP") {
             portENTER_CRITICAL(&stateMux);
             simulateGapActive = true;
@@ -3186,6 +3596,27 @@ void telemetryTask(void *pvParameters) {
             liveEnergyMah = 0.0f;
             liveEnergyWh = 0.0f;
             Serial.println(">> [LỆNH]: ĐÃ ĐẶT LẠI NĂNG LƯỢNG TIÊU THỤ VỀ 0.0 mAh!");
+          }
+          // 2. Các lệnh di chuyển / xoay: Đợi đọc hết câu thoại hiện tại rồi mới lăn bánh
+          else if (isMotionCommandName(cmdStr)) {
+            DynamicLeg parsedLegs[MAX_ROUTE_LEGS];
+            int nLegs = cmdStr.startsWith("GO_TO:")
+                          ? parseRouteLegsFromResponse(resp, parsedLegs, MAX_ROUTE_LEGS)
+                          : 0;
+            if (isVoiceSpeakingOrQueued()) {
+              pendingMoveCmd.active = true;
+              snprintf(pendingMoveCmd.cmd, sizeof(pendingMoveCmd.cmd), "%s", cmdStr.c_str());
+              pendingMoveCmd.nLegs = nLegs;
+              for (int i = 0; i < nLegs && i < MAX_ROUTE_LEGS; i++) {
+                pendingMoveCmd.legs[i] = parsedLegs[i];
+              }
+              pendingMoveCmd.queuedAtMs = millis();
+              Serial.printf("⏳ [CHỜ ĐỌC XONG]: Giữ xe đứng yên cho tới khi đọc hết câu thoại rồi mới chạy '%s'\n",
+                            cmdStr.c_str());
+            } else {
+              pendingMoveCmd.active = false;
+              executeMovementCommandNow(cmdStr, parsedLegs, nLegs);
+            }
           }
           } // end else (sigValid)
         }
@@ -3239,20 +3670,33 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_R_A_PIN), isrEncRightA, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_R_B_PIN), isrEncRightB, CHANGE);
 
-  ekfSyncFromPoseLocked(0.00f, 0.00f, 90.0f, true, 0.010f, 1.5f);
+  initRuntimeMapFromGenerated();
+  float initX = (runtimeHomeIdx >= 0 && runtimeHomeIdx < runtimeNumNodes) ? runtimeNodes[runtimeHomeIdx].x : 0.00f;
+  float initY = (runtimeHomeIdx >= 0 && runtimeHomeIdx < runtimeNumNodes) ? runtimeNodes[runtimeHomeIdx].y : 0.00f;
+  ekfSyncFromPoseLocked(initX, initY, ACTIVE_INITIAL_HEADING_DEG, true, 0.010f, 1.5f);
   resetWheelCascadeLocked();
   legProgressM = 0.0f;
   legArcDistM = 0.0f;
-  lastLineYawDeg = 90.0f;
-  bridgeRefHeadingDeg = 90.0f;
+  lastLineYawDeg = ACTIVE_INITIAL_HEADING_DEG;
+  bridgeRefHeadingDeg = ACTIVE_INITIAL_HEADING_DEG;
   lastWheelMotionMs = millis();
-  currentStation = STATION_A;
-  currentLeg = LEG_AB;
+  currentStationIdx = runtimeHomeIdx;
+  currentEdgeIdx = (ACTIVE_FIRST_EDGE_IDX >= 0 && ACTIVE_FIRST_EDGE_IDX < runtimeNumEdges) ? ACTIVE_FIRST_EDGE_IDX : 0;
+  snprintf(currentStationName, sizeof(currentStationName), "%s",
+           (runtimeHomeIdx >= 0 && runtimeHomeIdx < runtimeNumNodes) ? runtimeNodes[runtimeHomeIdx].id : ACTIVE_MAP_HOME_NODE_ID);
+  if (runtimeNumEdges > 0) {
+    snprintf(currentLegName, sizeof(currentLegName), "%s", runtimeEdges[currentEdgeIdx].name);
+  } else {
+    snprintf(currentLegName, sizeof(currentLegName), "%s", currentStationName);
+  }
 
   Serial.println("\n=========================================================================");
   Serial.println("   AGV_VER2 - TEST 10: BÁM LINE TỰ DO & CỨU HỘ ĐỨT ĐOẠN (MANG TẢI)");
   Serial.println("=========================================================================");
-  Serial.printf("Tọa độ khởi đầu: X=%.2fm | Y=%.2fm | Yaw=%.1f° | Trạm hiện tại: Trạm A\n", odomX, odomY, yawDeg);
+  Serial.printf("Bản đồ Map-as-Code: %s (hash=%s, %d trạm, %d chặng, gốc=%s)\n",
+                ACTIVE_MAP_ID, ACTIVE_MAP_HASH, runtimeNumNodes, runtimeNumEdges, currentStationName);
+  Serial.printf("Tọa độ khởi đầu: X=%.2fm | Y=%.2fm | Yaw=%.1f° | Trạm hiện tại: %s\n",
+                odomX, odomY, yawDeg, currentStationName);
   Serial.printf("Cấu hình tốc độ tải: Straight=%d, Curve=%d, Brake=%d, Turn=%d, MinMove=%d\n",
                 straightPwm, curvePwm, brakePwm, turnPwm, minMovePwm);
   Serial.printf("Xác thực bảo mật: Token='%s' | mDNS='%s.local'\n", agv_device_token, mdns_hostname);
@@ -3263,11 +3707,27 @@ void setup() {
   Serial.println("   [u]         : Quay Đầu 180° Tại Chỗ");
   Serial.println("   [g]         : Giả Lập Đứt Vạch 25cm");
   Serial.println("   [z]         : Đặt lại năng lượng tiêu thụ (Reset 0.0 mAh)");
-  Serial.println("   [A, B, C, D]: Ra lệnh đến thẳng Trạm tương ứng (Point-to-Point)");
+  Serial.println("   [v]         : Kiểm tra giọng nói loa MAX98357A (mức mặc định 100%)");
+  Serial.print("   [");
+  for (int i = 0; i < runtimeNumNodes; i++) {
+    Serial.printf("%s%s", runtimeNodes[i].id, (i + 1 < runtimeNumNodes) ? ", " : "");
+  }
+  Serial.println("]: Ra lệnh đến thẳng Trạm tương ứng (Point-to-Point)");
   Serial.println("-------------------------------------------------------------------------");
 
+  esp_reset_reason_t rstReason = esp_reset_reason();
+  bool brownoutReset = (rstReason == ESP_RST_BROWNOUT);
+  agvAudioVolPct = brownoutReset ? AUDIO_BROWNOUT_VOL_PCT : AUDIO_DEFAULT_VOL_PCT;
+  agvAudioQueue = xQueueCreate(8, sizeof(AgvVoiceMsg));
+  xTaskCreatePinnedToCore(audioVoiceTask, "AgvAudioVoice", 6144, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(telemetryTask, "TelemetryTask", 8192, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(controlLoopTask, "Control100Hz", 8192, NULL, 2, NULL, 1);
+
+  if (brownoutReset) {
+    enqueueVoiceCue("BROWNOUT");
+  } else {
+    enqueueVoiceCue("BOOT_READY");
+  }
 }
 
 // ===================================================================================
@@ -3279,13 +3739,14 @@ void loop() {
     if (ch == ' ' || ch == 's') {
       bool nowRunning = false;
       if (isRunning) {
+        cancelPendingMoveFlag = true;
         stopMotors();
         portENTER_CRITICAL(&stateMux);
         resetStopStateLocked("STOPPED");
         nowRunning = false;
         portEXIT_CRITICAL(&stateMux);
       } else {
-        startMission(currentLeg);
+        startEdgeMission(currentEdgeIdx);
         nowRunning = true;
       }
       Serial.printf("\n[SERIAL KEY]: %s\n", nowRunning ? "START" : "STOP");
@@ -3313,17 +3774,15 @@ void loop() {
       liveEnergyWh = 0.0f;
       Serial.println("\n⚡ [SERIAL KEY]: ĐÃ reset năng lượng tiêu thụ về 0.0 mAh!");
     }
-    else if (ch == 'a' || ch == 'A') {
-      planAndExecuteRoute(currentStation, STATION_A);
+    else if (ch == 'v' || ch == 'V') {
+      enqueueVoiceCue("BOOT_READY");
     }
-    else if (ch == 'b' || ch == 'B') {
-      planAndExecuteRoute(currentStation, STATION_B);
-    }
-    else if (ch == 'c' || ch == 'C') {
-      planAndExecuteRoute(currentStation, STATION_C);
-    }
-    else if (ch == 'd' || ch == 'D') {
-      planAndExecuteRoute(currentStation, STATION_D);
+    else if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) {
+      char keyBuf[2] = { (char)((ch >= 'a' && ch <= 'z') ? (ch - 'a' + 'A') : ch), '\0' };
+      int targetIdx = findMapNodeIndex(keyBuf);
+      if (targetIdx >= 0) {
+        planAndExecuteRoute(currentStationIdx, targetIdx);
+      }
     }
   }
 
@@ -3334,7 +3793,8 @@ void loop() {
   if (reading != lastBtn) lastDeb = millis();
   if ((millis() - lastDeb) > 50) {
     if (reading == LOW && lastBtn == HIGH) {
-      if (isRunning) {
+      if (isRunning || pendingMoveCmd.active) {
+        cancelPendingMoveFlag = true;
         stopMotors();
         portENTER_CRITICAL(&stateMux);
         resetStopStateLocked("STOPPED");
@@ -3345,6 +3805,37 @@ void loop() {
     }
   }
   lastBtn = reading;
+
+  // Cảnh báo giọng nói phần cứng độc lập (mất line / pin yếu), chạy an toàn ngoài vòng 100Hz
+  static bool wasFaultStop = false;
+  static unsigned long lastFaultVoiceMs = 0;
+  static unsigned long lowBatStartMs = 0;
+  static unsigned long lastLowBatVoiceMs = 0;
+
+  portENTER_CRITICAL(&stateMux);
+  const char* stPtr = robotStateStr ? robotStateStr : "STOPPED";
+  portEXIT_CRITICAL(&stateMux);
+  unsigned long nowMs = millis();
+
+  bool isFaultStop = (strcmp(stPtr, "GAP_TIMEOUT_STOP") == 0 || strcmp(stPtr, "LOST_LINE_STOP") == 0);
+  if (isFaultStop && (!wasFaultStop || (nowMs - lastFaultVoiceMs >= 12000UL))) {
+    lastFaultVoiceMs = nowMs;
+    enqueueVoiceCue("LOST_LINE");
+  }
+  wasFaultStop = isFaultStop;
+
+  if (inaDetected && liveBusV > 3.0f) {
+    bool isLowBat = (liveBusV < 6.8f) || (liveBusV >= 8.8f && liveBusV < 10.5f);
+    if (isLowBat) {
+      if (lowBatStartMs == 0) lowBatStartMs = nowMs;
+      if ((nowMs - lowBatStartMs >= 1500UL) && (lastLowBatVoiceMs == 0 || (nowMs - lastLowBatVoiceMs >= 25000UL))) {
+        lastLowBatVoiceMs = nowMs;
+        enqueueVoiceCue("LOW_BATTERY");
+      }
+    } else {
+      lowBatStartMs = 0;
+    }
+  }
 
   vTaskDelay(pdMS_TO_TICKS(50));
 }

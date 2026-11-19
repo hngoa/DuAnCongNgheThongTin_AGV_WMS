@@ -63,11 +63,49 @@ class WMSWorkflowManager:
         self.camera_controller = None
         self.last_cam_shot2_trigger: Dict[int, float] = {} # task_id -> last_trigger_timestamp
 
-        # Theo dõi trạm hiện tại & lộ trình thủ công từ SCADA
-        self.last_reported_station: str = "A"
+        # Theo dõi đồng bộ bản đồ (Map-as-Code hash check) & trạm hiện tại
+        self.last_agv_map_id: Optional[str] = None
+        self.last_agv_map_hash: Optional[str] = None
+        self.map_hash_mismatch: bool = False
+        self.map_sync_message: str = "Chưa có dữ liệu map_hash từ AGV"
+        self._last_map_warn_at: float = 0.0
+
+        try:
+            self.last_reported_station: str = self.get_home_node()
+        except Exception:
+            self.last_reported_station = "A"
         self.manual_route_target: Optional[str] = None
         self._fault_interrupted_mission: bool = False
         self._fault_interrupted_at: float = 0.0
+
+        # Điều phối thông báo giọng nói trên loa AGV (Voice Prompts Protocol)
+        self.voice_seq: int = 0
+        self.current_voice_cue: str = ""
+        self._voice_cue_last_at: Dict[str, float] = {}
+
+    def emit_voice_cue(self, cue: str, min_interval_sec: float = 0.0, dedupe_key: Optional[str] = None) -> int:
+        """Phát tín hiệu câu thoại đồng bộ cho loa ESP32-S3 (kèm chống lặp theo dedupe_key)."""
+        cue_str = str(cue or "").strip().upper()
+        if not cue_str:
+            return 0
+        key = str(dedupe_key or cue_str).strip().upper()
+        now = time.time()
+        if min_interval_sec > 0.0:
+            prev_at = self._voice_cue_last_at.get(key, 0.0)
+            if (now - prev_at) < min_interval_sec:
+                return 0
+        self._voice_cue_last_at[key] = now
+        self.voice_seq += 1
+        self.current_voice_cue = cue_str
+        return self.voice_seq
+
+    def get_home_node_info(self, map_id: Optional[str] = None) -> Dict[str, Any]:
+        """Lấy thông tin trạm gốc (INBOUND) của bản đồ hiện hoạt."""
+        return self.map_repo.get_home_node(map_id)
+
+    def get_home_node(self, map_id: Optional[str] = None) -> str:
+        """Trả về mã node_id của trạm gốc INBOUND (không hardcode 'A')."""
+        return str(self.get_home_node_info(map_id).get("node_id", "A")).strip().upper()
 
     def get_router(self, map_id: str) -> TopologicalRouter:
         """Tạo bộ định tuyến với cấu hình các đoạn line thực tế của bản đồ"""
@@ -181,7 +219,8 @@ class WMSWorkflowManager:
         clear_missions: bool = False
     ) -> Dict[str, Any]:
         """Điều hướng thủ công GO_TO:<target_node> qua Dijkstra và khóa đoạn line hợp lệ."""
-        dest = str(target_node or "A").strip().upper()
+        home_node = self.get_home_node(map_id)
+        dest = str(target_node or home_node).strip().upper()
         self._fault_interrupted_mission = False
         if clear_missions:
             self.abort_active_missions(
@@ -194,8 +233,8 @@ class WMSWorkflowManager:
         self.map_repo.unlock_all_by_agv(self.agv_id, map_id)
 
         valid_nodes = {n["node_id"].upper() for n in self.map_repo.get_nodes(map_id)}
-        cand_start = str(current_station or self.last_reported_station or "A").strip().upper()
-        start_node = cand_start if cand_start in valid_nodes else ("A" if "A" in valid_nodes else (next(iter(valid_nodes), "A")))
+        cand_start = str(current_station or self.last_reported_station or home_node).strip().upper()
+        start_node = cand_start if cand_start in valid_nodes else (home_node if home_node in valid_nodes else next(iter(valid_nodes), home_node))
 
         router = self.get_router(map_id)
         path = router.find_shortest_path(start_node, dest, current_agv_id=self.agv_id)
@@ -225,7 +264,7 @@ class WMSWorkflowManager:
         self,
         map_id: str,
         detected_items: List[Dict[str, Any]],
-        from_node: str = "A",
+        from_node: Optional[str] = None,
         image_path: str = ""
     ) -> Dict[str, Any]:
         """
@@ -267,7 +306,14 @@ class WMSWorkflowManager:
                 "status": "NO_OBJECT"
             }
 
+        home_node = self.get_home_node(map_id)
+        from_node = str(from_node or home_node).strip().upper()
         router = self.get_router(map_id)
+        map_nodes_list = self.map_repo.get_nodes(map_id)
+        default_fallback_target = next(
+            (n["node_id"] for n in map_nodes_list if n["node_id"].upper() != home_node),
+            home_node,
+        )
 
         # 2. Phân loại và gán trạm đích cho từng sản phẩm ("tại một điểm trạm sẽ có một loại hàng hóa")
         station_to_items: Dict[str, List[Dict[str, Any]]] = {}
@@ -291,7 +337,7 @@ class WMSWorkflowManager:
             if alloc and alloc.get("target_node_id"):
                 target_st = alloc["target_node_id"]
             else:
-                target_st = item.get("target_station") or item.get("target_node") or "B"
+                target_st = item.get("target_station") or item.get("target_node") or default_fallback_target
 
             if target_st not in station_to_items:
                 station_to_items[target_st] = []
@@ -317,14 +363,17 @@ class WMSWorkflowManager:
         target_stations = list(station_to_items.keys())
 
         # 3. Tìm đường đi tốt nhất (Dijkstra Permutation Optimization)
-        home_node = "A"
+        # Ưu tiên (1) tổng lộ trình khép kín nhỏ nhất; nếu hòa, ưu tiên (2) tổng quãng đường giao hàng nhỏ nhất
+        # để xe gặp trạm đích nào trên đường thì dỡ hàng ngay tại đó (vd A->B->C dừng dỡ B trước thay vì chạy qua B tới C trước)
         best_perm = None
+        min_cost_key = None
         min_total_dist = float('inf')
         best_legs = []
 
         for perm in itertools.permutations(target_stations):
             curr = from_node
-            dist_sum = 0.0
+            delivery_dist = 0.0
+            total_hops = 0
             legs = []
             is_valid = True
             for next_st in perm:
@@ -332,18 +381,24 @@ class WMSWorkflowManager:
                 if not path:
                     is_valid = False
                     break
-                dist_sum += path["total_distance_m"]
+                delivery_dist += path["total_distance_m"]
+                total_hops += len(path.get("segments") or [])
                 legs.append({"from": curr, "to": next_st, "path": path})
                 curr = next_st
 
             # Thêm chặng quay về Trạm Tiếp Nhận A sau khi hoàn tất chuỗi giao hàng
             ret_path = router.find_shortest_path(curr, home_node, current_agv_id=self.agv_id)
             if ret_path:
-                dist_sum += ret_path["total_distance_m"]
+                dist_sum = delivery_dist + ret_path["total_distance_m"]
+                ret_hops = len(ret_path.get("segments") or [])
             else:
                 is_valid = False
+                dist_sum = float('inf')
+                ret_hops = 0
 
-            if is_valid and dist_sum < min_total_dist:
+            cost_key = (round(dist_sum, 4), round(delivery_dist, 4), total_hops + ret_hops)
+            if is_valid and (min_cost_key is None or cost_key < min_cost_key):
+                min_cost_key = cost_key
                 min_total_dist = dist_sum
                 best_perm = perm
                 best_legs = legs
@@ -443,6 +498,12 @@ class WMSWorkflowManager:
 
         optimal_sequence = [from_node] + list(best_perm) + ([home_node] if last_st != home_node else [])
 
+        delivery_stops = sum(1 for m in self.mission_queue if m.get("category") != "RETURN")
+        voice_prod_tag = "MULTI" if (len(detected_items) > 1 or delivery_stops > 1) else first_mission.get("product_code", "GEN")
+        self.emit_voice_cue(f"DISPATCH|{first_mission['to_node']}|{voice_prod_tag}")
+        self._voice_cue_last_at["WAIT_LOAD"] = time.time()
+        self._voice_cue_last_at.pop("CARGO_STILL_PRESENT", None)
+
         return {
             "success": True,
             "mode": "MISSION_QUEUE",
@@ -460,9 +521,10 @@ class WMSWorkflowManager:
         }
 
     def handle_inbound_package(self, map_id: str, product_code: str, 
-                               ai_confidence: float = 0.95, from_node: str = "A", 
+                               ai_confidence: float = 0.95, from_node: Optional[str] = None, 
                                image_path: str = "") -> Dict[str, Any]:
         """Tương thích đơn lẻ: đóng gói thành danh sách 1 sản phẩm và gọi plan_and_dispatch_mission_queue"""
+        resolved_from = from_node or self.get_home_node(map_id)
         prod = self.prod_repo.get_by_code(product_code)
         item = {
             "product_code": product_code,
@@ -473,7 +535,7 @@ class WMSWorkflowManager:
         return self.plan_and_dispatch_mission_queue(
             map_id=map_id,
             detected_items=[item],
-            from_node=from_node,
+            from_node=resolved_from,
             image_path=image_path
         )
 
@@ -485,11 +547,37 @@ class WMSWorkflowManager:
           3. Kiểm tra xe đến đích để chuyển Task sang DELIVERED và bắt đầu đếm Dwell time
           4. Kiểm tra hoàn tất Dwell time -> chuyển Task COMPLETED và TĂNG TỒN KHO (+1)
           5. Giải phóng khóa các đoạn line
-          6. Phản hồi lệnh chờ gửi xuống xe nếu có
+          6. Phản hồi lệnh chờ gửi xuống xe nếu có (kèm map_hash Map-as-Code)
         """
         now = time.time()
         active_map_cfg = self.map_repo.get_active_map() or {}
-        map_id = telemetry_data.get("map_id") or active_map_cfg.get("map_id", "SABAN_154_151")
+        map_id = str(active_map_cfg.get("map_id") or telemetry_data.get("map_id") or "SABAN_154_151").strip().upper()
+        server_map_hash = self.map_repo.get_map_hash(map_id)
+        home_info = self.get_home_node_info(map_id)
+        home_node = str(home_info.get("node_id", "A")).strip().upper()
+        hx = float(home_info.get("x", 0.0))
+        hy = float(home_info.get("y", 0.0))
+
+        agv_map_id = str(telemetry_data.get("agv_map_id") or telemetry_data.get("map_id") or "").strip().upper()
+        agv_map_hash = str(telemetry_data.get("map_hash", "")).strip().lower()
+        if agv_map_id or agv_map_hash:
+            self.last_agv_map_id = agv_map_id or self.last_agv_map_id
+            self.last_agv_map_hash = agv_map_hash or self.last_agv_map_hash
+            id_mismatch = bool(agv_map_id and agv_map_id != map_id)
+            hash_mismatch = bool(agv_map_hash and server_map_hash and agv_map_hash != server_map_hash)
+            if id_mismatch or hash_mismatch:
+                self.map_hash_mismatch = True
+                self.map_sync_message = (
+                    f"LỆCH BẢN ĐỒ FIRMWARE vs SERVER: Server={map_id}({server_map_hash}), "
+                    f"AGV={agv_map_id or '?'}({agv_map_hash or '?'})"
+                )
+                if now - self._last_map_warn_at > 10.0:
+                    self._last_map_warn_at = now
+                    print(f"⚠️ [CẢNH BÁO MAP HASH]: {self.map_sync_message}. Hãy chạy tools/sync_map.py và nạp lại firmware!")
+            else:
+                self.map_hash_mismatch = False
+                self.map_sync_message = f"Đồng bộ Map-as-Code: {map_id} (hash={server_map_hash})"
+
         reported_state = str(telemetry_data.get("state", "IDLE")).strip().upper()
         reported_station = str(telemetry_data.get("station", "")).strip().upper()
         if reported_station:
@@ -531,10 +619,10 @@ class WMSWorkflowManager:
             ack_id=ack_id
         )
 
-        # 2. Kiểm tra sự cố giữa đường hoặc xe đã quay về A sau khi kẹt/khởi động lại ESP32
+        # 2. Kiểm tra sự cố giữa đường hoặc xe đã quay về trạm gốc INBOUND sau khi kẹt/khởi động lại ESP32
         cur_x = float(telemetry_data.get("x", 0.0))
         cur_y = float(telemetry_data.get("y", 0.0))
-        near_station_a = (abs(cur_x) < 0.25 and abs(cur_y) < 0.25)
+        near_home = (math.hypot(cur_x - hx, cur_y - hy) < 0.25)
 
         recent_tasks = self.task_repo.get_recent_tasks(limit=5)
         active_tasks = [
@@ -553,13 +641,13 @@ class WMSWorkflowManager:
                 self._fault_interrupted_at = now
                 self.map_repo.unlock_all_by_agv(self.agv_id, map_id)
 
-        settled_at_a = (
+        settled_at_home = (
             reported_state in ("STOPPED", "IDLE")
-            and (reported_station == "A" or (not reported_station and near_station_a))
-            and near_station_a
+            and (reported_station == home_node or (not reported_station and near_home))
+            and near_home
         )
         has_orphaned_in_transit = any(
-            t["status"] == TaskState.IN_TRANSIT.value and t.get("to_node") not in ("A", None, "")
+            t["status"] == TaskState.IN_TRANSIT.value and t.get("to_node") not in (home_node, None, "")
             for t in active_tasks
         )
         is_post_reboot_orphan = (
@@ -567,8 +655,8 @@ class WMSWorkflowManager:
             and self.agv_fsm.pending_command is None
             and has_orphaned_in_transit
         )
-        if settled_at_a and (self.active_mission is not None or active_tasks) and (self._fault_interrupted_mission or is_post_reboot_orphan):
-            recovery_reason = "FAULT_RECOVERED_AT_A" if self._fault_interrupted_mission else "ESP32_REBOOT_AT_A"
+        if settled_at_home and (self.active_mission is not None or active_tasks) and (self._fault_interrupted_mission or is_post_reboot_orphan):
+            recovery_reason = f"FAULT_RECOVERED_AT_{home_node}" if self._fault_interrupted_mission else f"ESP32_REBOOT_AT_{home_node}"
             self.abort_active_missions(
                 reason=recovery_reason,
                 map_id=map_id,
@@ -592,6 +680,13 @@ class WMSWorkflowManager:
             if t_status == TaskState.IN_TRANSIT.value and reported_state.startswith("AT_STATION") and station_matches:
                 self.task_fsm.transition_to_delivered(t_id)
                 dest_st = task.get("to_node", "")
+                has_more_cargo = any(
+                    m.get("status") == "QUEUED" and m.get("category") != "RETURN"
+                    for m in self.mission_queue
+                )
+                unload_mode = "UNLOAD_MULTI" if has_more_cargo else "UNLOAD_SINGLE"
+                self._voice_cue_last_at.pop("CARGO_STILL_PRESENT", None)
+                self.emit_voice_cue(f"{unload_mode}|{dest_st}|{task.get('product_code', 'GEN')}")
                 if self.camera_controller:
                     # Kích hoạt Shot 2 tự động: Phát lệnh chụp khay hàng để kiểm tra dỡ hàng
                     self.camera_controller.queue_command(
@@ -673,16 +768,20 @@ class WMSWorkflowManager:
                     next_mission["cmd_id"] = cmd_obj["cmd_id"]
                     if next_task_id > 0:
                         self.cmd_to_task[cmd_obj["cmd_id"]] = next_task_id
+                    if next_mission.get("category") == "RETURN" or next_mission.get("product_code") == "NONE":
+                        self.emit_voice_cue(f"RETURN_HOME|{next_to}")
+                    else:
+                        self.emit_voice_cue(f"ADVANCE|{next_to}|{next_mission.get('product_code', 'GEN')}")
 
-        # Kiểm tra hoàn thành Mission Return khi xe đã quay về Trạm Tiếp Nhận A:
-        if self.active_mission and self.active_mission.get("to_node") == "A" and self.active_mission.get("category") == "RETURN":
+        # Kiểm tra hoàn thành Mission Return khi xe đã quay về Trạm Tiếp Nhận gốc:
+        if self.active_mission and self.active_mission.get("to_node") == home_node and self.active_mission.get("category") == "RETURN":
             expected_cmd_id = self.active_mission.get("cmd_id")
             if expected_cmd_id:
                 is_return_acked = (ack_id == expected_cmd_id)
             else:
                 is_return_acked = (self.agv_fsm.pending_command is None) or (ack_id > 0)
             arrived_home = (
-                (reported_station == "A" and (reported_state.startswith("AT_STATION") or reported_state in ("IDLE", "STOPPED")))
+                (reported_station == home_node and (reported_state.startswith("AT_STATION") or reported_state in ("IDLE", "STOPPED")))
                 or (not reported_station and reported_state.startswith("AT_STATION"))
             )
             if arrived_home and is_return_acked:
@@ -691,7 +790,9 @@ class WMSWorkflowManager:
                 self.active_mission = None
                 self.map_repo.unlock_all_by_agv(self.agv_id, map_id)
                 self.agv_fsm.current_state = AGVState.IDLE
-                print(f"🎯 [FSM MANAGER]: AGV {self.agv_id} đã quay trở về Trạm Tiếp Nhận A an toàn! Khay hàng trống sẵn sàng cho chu trình nhận hàng mới.")
+                self._voice_cue_last_at["WAIT_LOAD"] = now
+                self.emit_voice_cue(f"HOME_READY|{home_node}", min_interval_sec=3.0, dedupe_key="HOME_READY")
+                print(f"🎯 [FSM MANAGER]: AGV {self.agv_id} đã quay trở về Trạm Tiếp Nhận {home_node} an toàn! Khay hàng trống sẵn sàng cho chu trình nhận hàng mới.")
 
         # Hoàn tất lộ trình thủ công GO_TO nếu xe đã tới đúng trạm đích
         if self.manual_route_target and reported_state.startswith("AT_STATION"):
@@ -735,6 +836,8 @@ class WMSWorkflowManager:
         return {
             "status": "ok",
             "map_id": map_id,
+            "map_hash": server_map_hash,
+            "home_node": home_node,
             "agv_state": agv_state.value,
             "map_w": map_w,
             "map_h": map_h,
@@ -742,7 +845,9 @@ class WMSWorkflowManager:
             "cmd_id": cmd_id_val,
             "route": route_str,
             "route_legs": cmd_params.get("route_legs", []),
-            "cmd_sig": cmd_sig
+            "cmd_sig": cmd_sig,
+            "voice_seq": self.voice_seq,
+            "voice_cue": self.current_voice_cue
         }
 
     def confirm_unloading_with_vision(self, image_bytes: bytes, ai_service, 
@@ -752,7 +857,7 @@ class WMSWorkflowManager:
                                       image_path: str = "") -> Dict[str, Any]:
         """
         Quy trình xác nhận dỡ hàng bằng thị giác AI (Shot 2 Unload Verification):
-          1. AI kiểm tra ảnh khay hàng (MobileNetV3 best.pth + OpenCV)
+          1. AI kiểm tra ảnh khay hàng (CV Ver3: YOLO11n + MobileNetV3 + OpenCV)
           2. Kiểm tra xem mặt hàng chuyên biệt của trạm này đã được dỡ xuống chưa
           3. Nếu đã dỡ:
              - Chuyển Task sang COMPLETED
@@ -804,6 +909,7 @@ class WMSWorkflowManager:
         if dec_status == "NEEDS_REVIEW":
             if t_id and t_id in self.active_unloading_tasks:
                 self.active_unloading_tasks[t_id] = now + 120.0
+            self.emit_voice_cue("RETRY_UNLOAD", min_interval_sec=8.0, dedupe_key="RETRY_UNLOAD")
             return {
                 "success": False,
                 "unloaded": False,
@@ -824,6 +930,11 @@ class WMSWorkflowManager:
             if t_id and t_id in self.active_unloading_tasks:
                 self.active_unloading_tasks[t_id] = now + 120.0
 
+            self.emit_voice_cue(
+                f"STILL_PRESENT|{dest_node}|{expected_product or 'GEN'}",
+                min_interval_sec=10.0,
+                dedupe_key="CARGO_STILL_PRESENT"
+            )
             return {
                 "success": False,
                 "unloaded": False,
@@ -850,17 +961,18 @@ class WMSWorkflowManager:
 
         # Mở khóa các đoạn line của chặng vừa xong
         active_map_cfg = self.map_repo.get_active_map() or {}
-        map_id = active_map_cfg.get("map_id", "SABAN_154_151")
+        map_id = str(active_map_cfg.get("map_id", "SABAN_154_151")).strip().upper()
+        home_node = self.get_home_node(map_id)
         segments = self.map_repo.get_segments(map_id)
         segs_to_unlock = [s["segment_id"] for s in segments if s.get("locked_by_agv") == self.agv_id]
         if segs_to_unlock:
             self.map_repo.unlock_segments(map_id, segs_to_unlock)
 
-        # 5. Kiểm tra Hàng đợi Mission tiếp theo & Cơ chế Quay Về Trạm A khi Hết Hàng
+        # 5. Kiểm tra Hàng đợi Mission tiếp theo & Cơ chế Quay Về trạm gốc khi Hết Hàng
         if is_empty_tray:
             # =========================================================================
             # CƠ CHẾ 1: KHAY HÀNG ĐÃ TRỐNG HOÀN TOÀN (HẾT HÀNG TRÊN XE)
-            # Ngay lập tức hủy các chặng giao còn lại (nếu có) và điều hướng quay về Trạm A
+            # Ngay lập tức hủy các chặng giao còn lại (nếu có) và điều hướng quay về trạm gốc
             # =========================================================================
             for m in self.mission_queue:
                 if m["status"] == "QUEUED" and m.get("category") != "RETURN":
@@ -868,26 +980,28 @@ class WMSWorkflowManager:
                     if m.get("task_id", 0) > 0:
                         self.task_repo.update_status(m["task_id"], TaskState.COMPLETED.value)
 
-            # Nếu xe đang ở sẵn Trạm A -> Hoàn tất toàn bộ chu trình
-            if dest_node == "A":
+            # Nếu xe đang ở sẵn Trạm Tiếp Nhận gốc -> Hoàn tất toàn bộ chu trình
+            if dest_node == home_node:
                 self.active_mission = None
                 self.map_repo.unlock_all_by_agv(self.agv_id, map_id)
                 self.agv_fsm.current_state = AGVState.IDLE
+                self._voice_cue_last_at["WAIT_LOAD"] = time.time()
+                self.emit_voice_cue(f"HOME_READY|{home_node}", min_interval_sec=3.0, dedupe_key="HOME_READY")
                 return {
                     "success": True,
                     "unloaded": True,
                     "status": "COMPLETED_AT_HOME",
-                    "message": "Khay hàng đã trống hoàn toàn và AGV đang ở sẵn Trạm A. Chu trình hoàn tất, sẵn sàng cho đợt hàng mới!",
-                    "station": "A",
-                    "next_station": "A",
+                    "message": f"Khay hàng đã trống hoàn toàn và AGV đang ở sẵn Trạm {home_node}. Chu trình hoàn tất, sẵn sàng cho đợt hàng mới!",
+                    "station": home_node,
+                    "next_station": home_node,
                     "ai_result": ai_res
                 }
 
-            # Lập lộ trình tối ưu từ trạm hiện tại quay về Trạm A
+            # Lập lộ trình tối ưu từ trạm hiện tại quay về Trạm Tiếp Nhận gốc
             router = TopologicalRouter(self.map_repo.get_segments(map_id))
-            ret_path = router.find_shortest_path(dest_node, "A", current_agv_id=self.agv_id)
+            ret_path = router.find_shortest_path(dest_node, home_node, current_agv_id=self.agv_id)
             ret_segments = ret_path["segments"] if ret_path else []
-            ret_route = ret_path["route_str"] if ret_path else f"{dest_node}->A"
+            ret_route = ret_path["route_str"] if ret_path else f"{dest_node}->{home_node}"
             ret_dist = ret_path["total_distance_m"] if ret_path else 0.0
             ret_legs = self._build_route_legs(map_id, ret_path)
 
@@ -907,9 +1021,9 @@ class WMSWorkflowManager:
                     "mission_id": len(self.mission_queue) + 1,
                     "task_id": 0,
                     "from_node": dest_node,
-                    "to_node": "A",
+                    "to_node": home_node,
                     "product_code": "NONE",
-                    "product_name": "Quay về Trạm Tiếp Nhận A",
+                    "product_name": f"Quay về Trạm Tiếp Nhận {home_node}",
                     "category": "RETURN",
                     "route_str": ret_route,
                     "distance_m": ret_dist,
@@ -921,7 +1035,7 @@ class WMSWorkflowManager:
                 self.mission_queue.append(ret_mission)
             else:
                 ret_mission["from_node"] = dest_node
-                ret_mission["to_node"] = "A"
+                ret_mission["to_node"] = home_node
                 ret_mission["route_str"] = ret_route
                 ret_mission["segments"] = ret_segments
                 ret_mission["route_legs"] = ret_legs
@@ -929,8 +1043,8 @@ class WMSWorkflowManager:
 
             self.active_mission = ret_mission
 
-            # Phát lệnh GO_TO:A về cho xe AGV
-            cmd_action = "GO_TO:A"
+            # Phát lệnh GO_TO:<home_node> về cho xe AGV
+            cmd_action = f"GO_TO:{home_node}"
             cmd_obj = self.agv_fsm.queue_command(cmd_action, {
                 "task_id": 0,
                 "mission_id": ret_mission["mission_id"],
@@ -940,14 +1054,15 @@ class WMSWorkflowManager:
                 "unloaded": True
             })
             ret_mission["cmd_id"] = cmd_obj["cmd_id"]
+            self.emit_voice_cue(f"RETURN_HOME|{home_node}")
 
             return {
                 "success": True,
                 "unloaded": True,
                 "status": "ALL_CARGO_UNLOADED_RETURNING",
-                "message": f"Toàn bộ hàng đã được dỡ xuống! Khay hàng trống 100%. Xe AGV tự động kích hoạt lộ trình quay về Trạm Tiếp Nhận A ({ret_route}).",
+                "message": f"Toàn bộ hàng đã được dỡ xuống! Khay hàng trống 100%. Xe AGV tự động kích hoạt lộ trình quay về Trạm Tiếp Nhận {home_node} ({ret_route}).",
                 "station": dest_node,
-                "next_station": "A",
+                "next_station": home_node,
                 "next_mission": ret_mission,
                 "command": cmd_obj,
                 "ai_result": ai_res
@@ -981,6 +1096,7 @@ class WMSWorkflowManager:
                     first_m = dispatch_res["first_mission"]
                     next_to = first_m["to_node"]
                     cmd_obj = dispatch_res["command"]
+                    self.emit_voice_cue(f"ADVANCE|{next_to}|{first_m.get('product_code', 'GEN')}")
                     return {
                         "success": True,
                         "unloaded": True,
@@ -1045,6 +1161,10 @@ class WMSWorkflowManager:
                 self.cmd_to_task[cmd_obj["cmd_id"]] = next_task_id
 
             is_return = (next_mission.get("category") == "RETURN" or next_mission.get("product_code") == "NONE")
+            if is_return:
+                self.emit_voice_cue(f"RETURN_HOME|{next_to}")
+            else:
+                self.emit_voice_cue(f"ADVANCE|{next_to}|{next_mission.get('product_code', 'GEN')}")
             msg = f"Đã dỡ toàn bộ hàng trên xe! AGV nhận lệnh quay trở về Trạm {next_to}." if is_return else f"Xác nhận đã dỡ {expected_prod_name} tại Trạm {dest_node}! Tồn kho +1. Xe được cấp lệnh chạy sang Trạm {next_to} ({next_mission['product_name']})."
 
             return {
@@ -1060,29 +1180,30 @@ class WMSWorkflowManager:
                 "ai_result": ai_res
             }
         else:
-            # Fallback nếu không còn mission nào -> Lập đường về A
+            # Fallback nếu không còn mission nào -> Lập đường về trạm gốc
             router = TopologicalRouter(self.map_repo.get_segments(map_id))
-            ret_path = router.find_shortest_path(dest_node, "A", current_agv_id=self.agv_id)
+            ret_path = router.find_shortest_path(dest_node, home_node, current_agv_id=self.agv_id)
             ret_segments = ret_path["segments"] if ret_path else []
-            ret_route = ret_path["route_str"] if ret_path else f"{dest_node}->A"
+            ret_route = ret_path["route_str"] if ret_path else f"{dest_node}->{home_node}"
             ret_legs = self._build_route_legs(map_id, ret_path)
             if ret_segments:
                 self.map_repo.lock_segments(map_id, ret_segments, agv_id=self.agv_id)
 
-            cmd_action = "GO_TO:A"
+            cmd_action = f"GO_TO:{home_node}"
             cmd_obj = self.agv_fsm.queue_command(cmd_action, {
                 "mode": "RETURN_HOME",
                 "unloaded": True,
                 "route": ret_route,
                 "route_legs": ret_legs
             })
+            self.emit_voice_cue(f"RETURN_HOME|{home_node}")
             return {
                 "success": True,
                 "unloaded": True,
                 "status": "ALL_CARGO_UNLOADED_RETURNING",
-                "message": f"Xác nhận dỡ hàng thành công! Khay hàng trống. Tồn kho tại trạm {dest_node} đã tăng +1. Xe được cấp lệnh quay về Trạm A ({ret_route}).",
+                "message": f"Xác nhận dỡ hàng thành công! Khay hàng trống. Tồn kho tại trạm {dest_node} đã tăng +1. Xe được cấp lệnh quay về Trạm {home_node} ({ret_route}).",
                 "station": dest_node,
-                "next_station": "A",
+                "next_station": home_node,
                 "command": cmd_obj,
                 "ai_result": ai_res
             }

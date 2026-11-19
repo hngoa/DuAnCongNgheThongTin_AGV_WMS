@@ -50,8 +50,38 @@ AUTH_MAX_FAILURES = int(os.getenv("AGV_AUTH_MAX_FAILURES", "15"))
 AUTH_WINDOW_SEC = float(os.getenv("AGV_AUTH_WINDOW_SEC", "60.0"))
 AUTH_LOCKOUT_SEC = float(os.getenv("AGV_AUTH_LOCKOUT_SEC", "30.0"))
 
-# Cấu hình Bản đồ mặc định
-DEFAULT_MAP_ID = "SABAN_154_151"
+def _load_active_map_id_from_config() -> str:
+    import json
+    from pathlib import Path
+    active_cfg = Path(__file__).resolve().parent.parent.parent / "config" / "active_map.json"
+    if active_cfg.exists():
+        try:
+            data = json.loads(active_cfg.read_text(encoding="utf-8"))
+            mid = str(data.get("map_id", "")).strip().upper()
+            if mid:
+                return mid
+        except Exception:
+            pass
+    return "SABAN_154_151"
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    import os
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+from pathlib import Path as _ConfigPath
+PROJECT_ROOT_DIR = _ConfigPath(__file__).resolve().parent.parent.parent
+ACTIVE_MAP_CONFIG_PATH = PROJECT_ROOT_DIR / "config" / "active_map.json"
+MAP_PRESETS_DIR = PROJECT_ROOT_DIR / "config" / "maps"
+GENERATED_MAP_HEADER_PATH = PROJECT_ROOT_DIR / "include" / "generated_map_config.h"
+
+# Chế độ Map-as-Code: mặc định KHÓA đổi map runtime qua Web UI (chỉ đổi qua config/active_map.json + tools/sync_map.py)
+ALLOW_RUNTIME_MAP_CHANGE = _env_bool("AGV_ALLOW_RUNTIME_MAP_CHANGE", False)
+
+# Cấu hình Bản đồ mặc định (từ config/active_map.json -> fallback SABAN_154_151)
+DEFAULT_MAP_ID = _load_active_map_id_from_config()
 DEFAULT_AGV_ID = "AGV_Ver2"
 AGV_WATCHDOG_TIMEOUT_SEC = 6.0
 

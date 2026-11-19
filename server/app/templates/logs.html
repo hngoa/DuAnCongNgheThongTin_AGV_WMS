@@ -305,7 +305,7 @@
       <div class="canvas-container">
         <div style="width:100%; display:flex; justify-content:space-between; align-items:center;">
           <span style="font-size:0.8rem; font-weight:700; color:var(--text-muted); text-transform:uppercase;">Quỹ Đạo Sa Bàn Thực Tế (2D)</span>
-          <span style="font-size:0.75rem; color:var(--primary); font-family:monospace;">1.54m × 1.51m</span>
+          <span id="lblLogsMapDim" style="font-size:0.75rem; color:var(--primary); font-family:monospace;">Đang tải bản đồ...</span>
         </div>
         <canvas id="trailCanvas" width="320" height="260"></canvas>
       </div>
@@ -317,14 +317,16 @@
             <label for="stateFilter" style="font-size:0.8rem; color:var(--text-muted); font-weight:600;">Lọc Trạng Thái:</label>
             <select id="stateFilter" onchange="loadLogs()">
               <option value="ALL">-- Tất Cả Trạng Thái --</option>
-              <option value="RUNNING_FAST">RUNNING_FAST (Chạy thẳng nhanh)</option>
-              <option value="APPROACH_CORNER">APPROACH_CORNER (Tiếp cận trạm 23cm)</option>
+              <option value="RUNNING_FAST">RUNNING_FAST (Chạy bám line)</option>
+              <option value="APPROACH_CORNER">APPROACH_CORNER (Tiếp cận trạm)</option>
               <option value="AT_STATION">AT_STATION (Đã tới trạm)</option>
-              <option value="DEAD_RECKONING_BRIDGE">DEAD_RECKONING_BRIDGE (Vượt vạch đứt)</option>
               <option value="TURNING_STATION">TURNING_STATION (Xoay tại trạm)</option>
-              <option value="LINE_FLICKER_FILTER">LINE_FLICKER_FILTER (Lọc vạch mờ)</option>
-              <option value="PIVOT_LEFT">PIVOT_LEFT (Bẻ lái trái gắt)</option>
-              <option value="PIVOT_RIGHT">PIVOT_RIGHT (Bẻ lái phải gắt)</option>
+              <option value="TURNING_LINE">TURNING_LINE (Ôm cua / Bắt góc gập)</option>
+              <option value="DEAD_RECKONING_BRIDGE">DEAD_RECKONING_BRIDGE (Vượt vạch đứt)</option>
+              <option value="LINE_FLICKER_FILTER">LINE_FLICKER_FILTER (Lọc nhiễu/vạch mờ)</option>
+              <option value="GAP_TIMEOUT_STOP">GAP_TIMEOUT_STOP (Quá giới hạn đứt vạch)</option>
+              <option value="LOST_LINE_STOP">LOST_LINE_STOP (Mất vạch dừng an toàn)</option>
+              <option value="EMERGENCY_STOP">EMERGENCY_STOP (Dừng khẩn cấp)</option>
               <option value="STOPPED">STOPPED (Dừng xe)</option>
             </select>
           </div>
@@ -427,6 +429,11 @@
           activeMapH = Number(json.map.length_m || 1.51);
           if (Array.isArray(json.nodes) && json.nodes.length > 0) activeNodes = json.nodes;
           if (Array.isArray(json.segments)) activeSegments = json.segments;
+          const lblDim = document.getElementById('lblLogsMapDim');
+          if (lblDim) {
+            const hashStr = json.map_hash ? ` #${json.map_hash}` : '';
+            lblDim.innerText = `${json.map.map_id}${hashStr} • ${activeMapW.toFixed(2)}m × ${activeMapH.toFixed(2)}m`;
+          }
         }
       } catch (e) {}
     }

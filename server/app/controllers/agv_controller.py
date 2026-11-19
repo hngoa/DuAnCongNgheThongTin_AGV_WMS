@@ -54,13 +54,15 @@ class AGVController:
                 if len(self.trail) > 1000:
                     self.trail.pop(0)
 
-        # 2. Chuyển tiếp tới Bộ điều phối Workflow & FSM theo bản đồ hiện hoạt
+        # 2. Chuyển tiếp tới Bộ điều phối Workflow & FSM theo bản đồ hiện hoạt trên Server
         active_map = self.workflow_manager.map_repo.get_active_map()
-        map_id = body_json.get("map_id") or (active_map["map_id"] if active_map else DEFAULT_MAP_ID)
-        body_json["map_id"] = map_id
+        server_map_id = active_map["map_id"] if active_map else DEFAULT_MAP_ID
+        body_json["agv_map_id"] = str(body_json.get("map_id") or "").strip().upper()
+        body_json["map_id"] = server_map_id
+        map_id = server_map_id
         resp_obj = self.workflow_manager.handle_telemetry(body_json)
 
-        # Tự động kiểm tra và kích hoạt Shot 1 nếu AGV đang đỗ an toàn ở Trạm A
+        # Tự động kiểm tra và kích hoạt Shot 1 nếu AGV đang đỗ an toàn ở Trạm Nhập Hàng
         if hasattr(self, "camera_controller") and self.camera_controller:
             self.camera_controller.check_auto_inbound_capture(self)
 
@@ -95,6 +97,10 @@ class AGVController:
                 self.last_logged_state = state
                 self.last_logged_station = station
                 self.last_logged_dist = dist
+                cur_m = getattr(self.workflow_manager, "active_mission", None)
+                active_tid = None
+                if isinstance(cur_m, dict) and int(cur_m.get("task_id", 0) or 0) > 0:
+                    active_tid = int(cur_m["task_id"])
                 try:
                     self.workflow_manager.telemetry_repo.log(
                         agv_id=self.agv_id,
@@ -111,7 +117,7 @@ class AGVController:
                         w=float(body_json.get("power", 0.0)),
                         mah=float(body_json.get("energy_mah", 0.0)),
                         state=state,
-                        task_id=None,
+                        task_id=active_tid,
                         station=station,
                         leg=leg
                     )
@@ -126,8 +132,21 @@ class AGVController:
 
         if action in ("capture", "capture_now", "trigger_camera"):
             if hasattr(self, "camera_controller") and self.camera_controller:
-                st = str(body_json.get("station", "A")).upper()
+                home_node = self.workflow_manager.get_home_node()
+                st = str(body_json.get("station", home_node)).strip().upper() or home_node
                 mode = str(body_json.get("mode", "CAPTURE")).upper()
+                if mode == "CAPTURE" and hasattr(self.camera_controller, "get_shot1_blocking_reason"):
+                    block_reason = self.camera_controller.get_shot1_blocking_reason(self)
+                    if block_reason:
+                        return 200, {
+                            "status": "warning",
+                            "blocked": True,
+                            "action": "capture_blocked",
+                            "cmd": "CAPTURE_BLOCKED",
+                            "cmd_id": 0,
+                            "cam_cmd_id": 0,
+                            "message": f"⚠️ Không thể chụp Shot 1 lúc này: {block_reason}"
+                        }
                 cmd_id = self.camera_controller.queue_command("CAPTURE_NOW", metadata={"station": st, "mode": mode})
                 return 200, {
                     "status": "success",
@@ -146,7 +165,7 @@ class AGVController:
                 clear_agv_cmd=False,
                 clear_camera=True
             )
-            self.workflow_manager.last_reported_station = "A"
+            self.workflow_manager.last_reported_station = self.workflow_manager.get_home_node()
             cmd_obj = self.workflow_manager.agv_fsm.queue_command("RESET_ODOM")
         elif action == "reset_energy":
             cmd_obj = self.workflow_manager.agv_fsm.queue_command("RESET_ENERGY")
@@ -173,15 +192,19 @@ class AGVController:
                 "message": f"Đã hủy nhiệm vụ kẹt ({len(recovery['aborted_task_ids'])} task) và đưa WMS về trạng thái sẵn sàng."
             }
         elif action in ("go_to", "return_home"):
-            st = "A" if action == "return_home" else str(body_json.get("station", "A")).upper()
             active_map = self.workflow_manager.map_repo.get_active_map()
             map_id = active_map["map_id"] if active_map else DEFAULT_MAP_ID
+            home_node = self.workflow_manager.get_home_node(map_id)
+            st = home_node if action == "return_home" else str(body_json.get("station", home_node)).strip().upper()
+            valid_nodes = {n["node_id"].upper() for n in self.workflow_manager.map_repo.get_nodes(map_id)}
+            if valid_nodes and st not in valid_nodes:
+                return 400, {"status": "error", "message": f"Trạm '{st}' không tồn tại trên bản đồ {map_id}"}
             cur_st = str(self.last_telemetry_data.get("station", "")).strip().upper() or None
             dispatch_res = self.workflow_manager.dispatch_manual_goto(
                 map_id=map_id,
                 target_node=st,
                 current_station=cur_st,
-                clear_missions=(action == "return_home" or st == "A")
+                clear_missions=(action == "return_home" or st == home_node)
             )
             cmd_obj = dispatch_res["command"]
         elif action == "auto_loop_on":
@@ -210,6 +233,19 @@ class AGVController:
             "cmd": cmd_obj["cmd"]
         }
 
+    def _build_map_sync_info(self) -> Dict[str, Any]:
+        active_map = self.workflow_manager.map_repo.get_active_map()
+        server_map_id = active_map["map_id"] if active_map else DEFAULT_MAP_ID
+        server_map_hash = self.workflow_manager.map_repo.get_map_hash(server_map_id)
+        return {
+            "server_map_id": server_map_id,
+            "server_map_hash": server_map_hash,
+            "agv_map_id": getattr(self.workflow_manager, "last_agv_map_id", None),
+            "agv_map_hash": getattr(self.workflow_manager, "last_agv_map_hash", None),
+            "mismatch": bool(getattr(self.workflow_manager, "map_hash_mismatch", False)),
+            "message": getattr(self.workflow_manager, "map_sync_message", f"Server={server_map_id} ({server_map_hash})"),
+        }
+
     def get_dashboard_state(self, camera_info: Dict[str, Any]) -> Dict[str, Any]:
         """Tổng hợp toàn bộ trạng thái hệ thống trả về cho Web Dashboard"""
         now = time.time()
@@ -217,6 +253,7 @@ class AGVController:
         
         agv_record = self.workflow_manager.fleet_repo.get_agv(self.agv_id) or {}
         last_t = self.last_telemetry_data
+        map_sync_info = self._build_map_sync_info()
 
         if not is_connected:
             if self.last_seen_time > 0.0:
@@ -267,7 +304,8 @@ class AGVController:
                 "ina_ok": False,
                 "camera": camera_info,
                 "pending_command": self.workflow_manager.agv_fsm.pending_command,
-                "active_mission": self.workflow_manager.active_mission
+                "active_mission": self.workflow_manager.active_mission,
+                "map_sync": map_sync_info
             }
 
         # KHI ĐANG KẾT NỐI (TELEMETRY THỜI GIAN THỰC TỪ ESP32-S3)
@@ -312,7 +350,8 @@ class AGVController:
             "ina_ok": bool(last_t.get("ina_ok", True)),
             "camera": camera_info,
             "pending_command": self.workflow_manager.agv_fsm.pending_command,
-            "active_mission": self.workflow_manager.active_mission
+            "active_mission": self.workflow_manager.active_mission,
+            "map_sync": map_sync_info
         }
 
     def get_logs_data(self, limit: int = 100, offset: int = 0, state: str = "ALL") -> Dict[str, Any]:

@@ -44,6 +44,7 @@ class CameraController:
             "auto_capture_reason": "Đang chờ khởi tạo"
         }
         self.lock = threading.Lock()
+        self._shot1_dispatch_lock = threading.RLock()
 
     def _set_auto_capture_reason(self, reason: str):
         with self.lock:
@@ -71,6 +72,44 @@ class CameraController:
                 self.first_poll_time = now
             self.last_poll_time = now
             self.latest_info["online"] = True
+
+    def get_shot1_blocking_reason(self, agv_controller=None) -> Optional[str]:
+        """Kiểm tra xem AGV/WMS có đang bận giao hàng hoặc đang chạy để chặn Shot 1 trùng lặp."""
+        wf = self.workflow_manager
+        if wf is not None:
+            cur_m = getattr(wf, "active_mission", None)
+            if isinstance(cur_m, dict) and cur_m.get("status") == "ACTIVE" and cur_m.get("category") != "RETURN":
+                return f"Đang chạy nhiệm vụ tới Trạm {cur_m.get('to_node', '?')}"
+            try:
+                recent_tasks = wf.task_repo.get_recent_tasks(limit=5)
+                blocking_task = next(
+                    (t for t in recent_tasks if t["status"] in ("DISPATCHED", "IN_TRANSIT", "DELIVERED", "UNLOADING")),
+                    None
+                )
+                if blocking_task:
+                    return f"Task #{blocking_task['task_id']} đang ở trạng thái {blocking_task['status']}"
+            except Exception:
+                pass
+            if getattr(wf, "active_unloading_tasks", None):
+                return "Đang có tác vụ dỡ hàng tại trạm đích"
+
+        ctrl = agv_controller or self.agv_controller
+        now = time.time()
+        if ctrl and getattr(ctrl, "last_seen_time", 0.0) and (now - ctrl.last_seen_time) < 6.0:
+            last_t = getattr(ctrl, "last_telemetry_data", None) or {}
+            state = str(last_t.get("state", "IDLE")).upper()
+            try:
+                speed = abs(float(last_t.get("speed", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                speed = 0.0
+            moving_tokens = (
+                "RUNNING", "TURNING", "APPROACH", "DEAD_RECKONING",
+                "PAUSED_TRANSIT", "PAUSED_LOOP", "PIVOT", "LINE_FLICKER",
+                "BRAKING", "GAP"
+            )
+            if speed > 5.0 or any(tok in state for tok in moving_tokens):
+                return f"AGV đang di chuyển ({state})"
+        return None
 
     def check_auto_inbound_capture(self, agv_controller=None) -> bool:
         """
@@ -114,18 +153,23 @@ class CameraController:
             self._set_auto_capture_reason("Xe AGV chưa online hoặc mất kết nối")
             return False
 
-        # 4. Xe AGV phải đang dừng đỗ an toàn tại Trạm A
+        # 4. Xe AGV phải đang dừng đỗ an toàn tại Trạm Nhập Hàng (home_node INBOUND)
+        home_info = self.workflow_manager.get_home_node_info() if self.workflow_manager else {"node_id": "A", "x": 0.0, "y": 0.0}
+        home_node = str(home_info.get("node_id", "A")).strip().upper()
+        hx = float(home_info.get("x", 0.0))
+        hy = float(home_info.get("y", 0.0))
+
         last_t = getattr(ctrl, "last_telemetry_data", None) or {}
-        st = str(last_t.get("station", "A")).upper()
+        st = str(last_t.get("station", home_node)).upper()
         state = str(last_t.get("state", "IDLE")).upper()
         speed = float(last_t.get("speed", 0.0))
 
-        cur_x = float(last_t.get("x", 0.0))
-        cur_y = float(last_t.get("y", 0.0))
-        at_station_a = (st == "A") or (abs(cur_x) < 0.25 and abs(cur_y) < 0.25)
+        cur_x = float(last_t.get("x", hx))
+        cur_y = float(last_t.get("y", hy))
+        at_home_node = (st == home_node) or (((cur_x - hx) ** 2 + (cur_y - hy) ** 2) ** 0.5 < 0.25)
 
-        if not at_station_a:
-            self._set_auto_capture_reason(f"AGV đang ở Trạm {st or '?'} (cần về Trạm A)")
+        if not at_home_node:
+            self._set_auto_capture_reason(f"AGV đang ở Trạm {st or '?'} (cần về Trạm {home_node})")
             return False
         if speed > 5.0 or ("RUNNING" in state or "TURNING" in state or "GAP" in state):
             self._set_auto_capture_reason(f"AGV chưa dừng ổn định ({state})")
@@ -168,9 +212,9 @@ class CameraController:
 
         # ĐỦ ĐIỀU KIỆN -> PHÁT LỆNH CAPTURE_NOW TỰ ĐỘNG!
         self.last_shot1_auto_trigger = now
-        self._set_auto_capture_reason("Đang phát lệnh chụp kiểm tra khay tại Trạm A")
-        print("🎯 [AUTO SHOT 1]: Tự động phát lệnh chụp kiểm tra hàng tại Trạm Tiếp Nhận A (AGV & Camera đã sẵn sàng)")
-        self.queue_command("CAPTURE_NOW", metadata={"station": "A", "mode": "CAPTURE"})
+        self._set_auto_capture_reason(f"Đang phát lệnh chụp kiểm tra khay tại Trạm {home_node}")
+        print(f"🎯 [AUTO SHOT 1]: Tự động phát lệnh chụp kiểm tra hàng tại Trạm Tiếp Nhận {home_node} (AGV & Camera đã sẵn sàng)")
+        self.queue_command("CAPTURE_NOW", metadata={"station": home_node, "mode": "CAPTURE"})
         return True
 
     def queue_command(self, cmd: str, metadata: Optional[Dict[str, Any]] = None) -> int:
@@ -221,8 +265,9 @@ class CameraController:
             return 400, {"status": "error", "message": "Thiếu dữ liệu file ảnh ('image')"}
 
         orig_name, img_bytes = files["image"]
+        home_node = self.workflow_manager.get_home_node() if self.workflow_manager else "A"
         agv_id = fields.get("agv_id", "AGV_Ver2").strip()
-        station = fields.get("station", "A").strip()
+        station = fields.get("station", home_node).strip().upper() or home_node
         product_hint = fields.get("product_code", "").strip()
         mode = fields.get("mode", "CAPTURE").strip().upper()
 
@@ -260,16 +305,16 @@ class CameraController:
         is_shot_2 = (mode in ("VERIFY_UNLOAD", "SHOT2", "UNLOAD", "VERIFY"))
         awaiting_task = None
 
-        # Nếu trạm gửi lên là "A" nhưng AGV đang ở trạm giao hàng B/C/D chờ dỡ
+        # Nếu trạm gửi lên là home_node nhưng AGV đang ở trạm giao hàng khác chờ dỡ
         if not is_shot_2 and self.workflow_manager:
             recent_tasks = self.workflow_manager.task_repo.get_recent_tasks(limit=5)
             for t in recent_tasks:
-                if t["status"] in ("DELIVERED", "UNLOADING") and t.get("to_node") not in ("A", None, ""):
+                if t["status"] in ("DELIVERED", "UNLOADING") and t.get("to_node") not in (home_node, None, ""):
                     station = t["to_node"]
                     is_shot_2 = True
                     awaiting_task = t
                     break
-                elif station != "A" and t["status"] in ("DELIVERED", "UNLOADING") and t.get("to_node") == station:
+                elif station != home_node and t["status"] in ("DELIVERED", "UNLOADING") and t.get("to_node") == station:
                     is_shot_2 = True
                     awaiting_task = t
                     break
@@ -278,117 +323,168 @@ class CameraController:
             return self._handle_shot_2_unload(img_bytes, station, awaiting_task, product_hint=product_hint)
 
         # Chế độ CHỤP & GIAO HÀNG (CAPTURE & DISPATCH - SHOT 1)
-        # 1. Lưu file ảnh vào thư mục uploads
-        time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        uid = uuid4().hex[:6]
-        fname = f"{time_str}_{station}_{uid}.jpg"
-        save_path = UPLOAD_DIR / fname
-        save_path.write_bytes(img_bytes)
-        img_url = f"/images/{fname}"
+        with self._shot1_dispatch_lock:
+            block_reason = self.get_shot1_blocking_reason()
+            if block_reason:
+                self._set_auto_capture_reason(block_reason)
+                with self.lock:
+                    cur_img_url = self.latest_info.get("image_url", "")
+                return 200, {
+                    "status": "warning",
+                    "blocked": True,
+                    "reason": "MISSION_IN_PROGRESS",
+                    "message": f"Cảnh báo: Bỏ qua ảnh Shot 1 vì {block_reason}",
+                    "image_url": cur_img_url
+                }
 
-        # 2. Gọi AI phân loại sản phẩm (kèm tra cứu danh mục & trạm đích động từ DB)
-        try:
-            ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint, from_node=station)
-        except TypeError:
-            ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint)
-        detected_code = ai_res.get("product_code", "PKG_ELEC")
-        conf = float(ai_res.get("confidence", 0.95))
-        dec_status = ai_res.get("decision_status", "CLASSIFIED")
+            # 1. Lưu file ảnh vào thư mục uploads
+            time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            uid = uuid4().hex[:6]
+            fname = f"{time_str}_{station}_{uid}.jpg"
+            save_path = UPLOAD_DIR / fname
+            save_path.write_bytes(img_bytes)
+            img_url = f"/images/{fname}"
 
-        # Lưu ảnh BBox AI nếu có
-        annotated_bytes = ai_res.get("annotated_bytes")
-        if annotated_bytes:
-            ann_fname = f"annotated_{fname}"
-            ann_path = UPLOAD_DIR / ann_fname
+            # 2. Gọi AI phân loại sản phẩm (kèm tra cứu danh mục & trạm đích động từ DB)
             try:
-                ann_path.write_bytes(annotated_bytes)
-                img_url = f"/images/{ann_fname}"
-            except Exception:
-                pass
+                ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint, from_node=station)
+            except TypeError:
+                ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint)
+            detected_code = ai_res.get("product_code", "PKG_ELEC")
+            conf = float(ai_res.get("confidence", 0.95))
+            dec_status = ai_res.get("decision_status", "CLASSIFIED")
 
-        # Loại bỏ dữ liệu nhị phân raw bytes khỏi dict kết quả để đảm bảo JSON an toàn 100%
-        if "annotated_bytes" in ai_res:
-            del ai_res["annotated_bytes"]
-        ai_res["annotated_image_url"] = img_url
+            # Lưu ảnh BBox AI nếu có
+            annotated_bytes = ai_res.get("annotated_bytes")
+            if annotated_bytes:
+                ann_fname = f"annotated_{fname}"
+                ann_path = UPLOAD_DIR / ann_fname
+                try:
+                    ann_path.write_bytes(annotated_bytes)
+                    img_url = f"/images/{ann_fname}"
+                except Exception:
+                    pass
 
-        # 2b. Cổng an toàn: Nếu khay trống (NO_OBJECT) hoặc AI chưa đủ chắc chắn (NEEDS_REVIEW), dừng tạo task
-        if dec_status == "NO_OBJECT" or detected_code == "NONE":
-            self.last_shot1_auto_trigger = time.time()
+            # Loại bỏ dữ liệu nhị phân raw bytes khỏi dict kết quả để đảm bảo JSON an toàn 100%
+            if "annotated_bytes" in ai_res:
+                del ai_res["annotated_bytes"]
+            ai_res["annotated_image_url"] = img_url
+
+            # 2b. Cổng an toàn: Nếu khay trống (NO_OBJECT) hoặc AI chưa đủ chắc chắn (NEEDS_REVIEW), dừng tạo task
+            if dec_status == "NO_OBJECT" or detected_code == "NONE":
+                if self.workflow_manager and hasattr(self.workflow_manager, "emit_voice_cue"):
+                    self.workflow_manager.emit_voice_cue(
+                        f"WAIT_LOAD|{station}",
+                        min_interval_sec=28.0,
+                        dedupe_key="WAIT_LOAD"
+                    )
+                with self.lock:
+                    self.last_shot1_auto_trigger = time.time()
+                    self.latest_info.update({
+                        "online": True,
+                        "shot": 1,
+                        "station": station,
+                        "received_at": datetime.now().strftime("%H:%M:%S"),
+                        "product_code": "KHAY_TRỐNG",
+                        "category": "--",
+                        "target_station": "--",
+                        "confidence": 0.0,
+                        "task_id": 0,
+                        "image_url": img_url,
+                        "ai_result": ai_res
+                    })
+                return 200, {
+                    "status": "warning",
+                    "message": "Cảnh báo: Khay hàng trống (NO_OBJECT), hệ thống tạm dừng tạo nhiệm vụ chuyển kho",
+                    "ai_result": ai_res,
+                    "image_url": img_url
+                }
+
+            if dec_status == "NEEDS_REVIEW":
+                if self.workflow_manager and hasattr(self.workflow_manager, "emit_voice_cue"):
+                    self.workflow_manager.emit_voice_cue(
+                        "RETRY_LOAD",
+                        min_interval_sec=8.0,
+                        dedupe_key="RETRY_LOAD"
+                    )
+                with self.lock:
+                    self.last_shot1_auto_trigger = time.time()
+                    self.latest_info.update({
+                        "online": True,
+                        "shot": 1,
+                        "station": station,
+                        "received_at": datetime.now().strftime("%H:%M:%S"),
+                        "product_code": "CẦN_KIỂM_TRA",
+                        "category": "--",
+                        "target_station": "--",
+                        "confidence": 0.0,
+                        "task_id": 0,
+                        "image_url": img_url,
+                        "ai_result": ai_res
+                    })
+                return 200, {
+                    "status": "warning",
+                    "message": "Cảnh báo: Ảnh chưa đủ độ tin cậy hoặc vật bị che khuất/dính nhau (NEEDS_REVIEW). Vui lòng đặt lại và chụp lại!",
+                    "ai_result": ai_res,
+                    "image_url": img_url
+                }
+
+            # 3. Kích hoạt luồng WMS & Lập Hàng Đợi Mission tối ưu theo bản đồ hiện hoạt
+            block_reason = self.get_shot1_blocking_reason()
+            if block_reason:
+                self._set_auto_capture_reason(block_reason)
+                return 200, {
+                    "status": "warning",
+                    "blocked": True,
+                    "reason": "MISSION_IN_PROGRESS",
+                    "message": f"Cảnh báo: Hủy điều phối Shot 1 trùng lặp vì {block_reason}",
+                    "ai_result": ai_res,
+                    "image_url": img_url
+                }
+
             with self.lock:
-                self.latest_info.update({
-                    "online": True,
-                    "received_at": datetime.now().strftime("%H:%M:%S"),
-                    "product_code": "KHAY_TRỐNG",
-                    "confidence": 0.0,
-                    "task_id": 0,
-                    "image_url": img_url,
-                    "ai_result": ai_res
-                })
-            return 200, {
-                "status": "warning",
-                "message": "Cảnh báo: Khay hàng trống (NO_OBJECT), hệ thống tạm dừng tạo nhiệm vụ chuyển kho",
-                "ai_result": ai_res,
-                "image_url": img_url
-            }
+                self.last_shot1_auto_trigger = time.time()
+            active_map = self.workflow_manager.map_repo.get_active_map()
+            cur_map_id = active_map["map_id"] if active_map else DEFAULT_MAP_ID
 
-        if dec_status == "NEEDS_REVIEW":
-            self.last_shot1_auto_trigger = time.time()
-            with self.lock:
-                self.latest_info.update({
-                    "online": True,
-                    "received_at": datetime.now().strftime("%H:%M:%S"),
-                    "product_code": "CẦN_KIỂM_TRA",
-                    "confidence": 0.0,
-                    "task_id": 0,
-                    "image_url": img_url,
-                    "ai_result": ai_res
-                })
-            return 200, {
-                "status": "warning",
-                "message": "Cảnh báo: Ảnh chưa đủ độ tin cậy hoặc vật bị che khuất/dính nhau (NEEDS_REVIEW). Vui lòng đặt lại và chụp lại!",
-                "ai_result": ai_res,
-                "image_url": img_url
-            }
-
-        # 3. Kích hoạt luồng WMS & Lập Hàng Đợi Mission tối ưu theo bản đồ hiện hoạt
-        self.last_shot1_auto_trigger = time.time()
-        active_map = self.workflow_manager.map_repo.get_active_map()
-        cur_map_id = active_map["map_id"] if active_map else DEFAULT_MAP_ID
-
-        detected_items = ai_res.get("detected_items") or [{
-            "product_code": detected_code,
-            "product_name": ai_res.get("product_name", detected_code),
-            "category": ai_res.get("category", "ELECTRONIC"),
-            "target_station": ai_res.get("target_station", "B"),
-            "confidence": conf
-        }]
-
-        dispatch_res = self.workflow_manager.plan_and_dispatch_mission_queue(
-            map_id=cur_map_id,
-            detected_items=detected_items,
-            from_node=station,
-            image_path=str(save_path)
-        )
-
-        with self.lock:
-            self.latest_info.update({
-                "online": True,
-                "received_at": datetime.now().strftime("%H:%M:%S"),
+            detected_items = ai_res.get("detected_items") or [{
                 "product_code": detected_code,
-                "confidence": conf,
-                "task_id": dispatch_res.get("task_id", 0),
-                "image_url": img_url,
-                "dispatch": dispatch_res,
-                "ai_result": ai_res
-            })
+                "product_name": ai_res.get("product_name", detected_code),
+                "category": ai_res.get("category", "ELECTRONIC"),
+                "target_station": ai_res.get("target_station", "B"),
+                "confidence": conf
+            }]
 
-        return 200, {
-            "status": "success",
-            "message": "Đã nhận ảnh, phân loại AI và lập nhiệm vụ thành công",
-            "ai_result": ai_res,
-            "dispatch": dispatch_res,
-            "image_url": img_url
-        }
+            dispatch_res = self.workflow_manager.plan_and_dispatch_mission_queue(
+                map_id=cur_map_id,
+                detected_items=detected_items,
+                from_node=station,
+                image_path=str(save_path)
+            )
+
+            with self.lock:
+                self.latest_info.update({
+                    "online": True,
+                    "shot": 1,
+                    "station": station,
+                    "received_at": datetime.now().strftime("%H:%M:%S"),
+                    "product_code": detected_code,
+                    "category": ai_res.get("category", "--"),
+                    "target_station": dispatch_res.get("target_node", ai_res.get("target_station", "--")),
+                    "confidence": conf,
+                    "task_id": dispatch_res.get("task_id", 0),
+                    "image_url": img_url,
+                    "dispatch": dispatch_res,
+                    "ai_result": ai_res
+                })
+
+            return 200, {
+                "status": "success",
+                "message": "Đã nhận ảnh, phân loại AI và lập nhiệm vụ thành công",
+                "ai_result": ai_res,
+                "dispatch": dispatch_res,
+                "image_url": img_url
+            }
 
     def _handle_shot_2_unload(self, img_bytes: bytes, station: str, awaiting_task: Optional[Dict[str, Any]] = None, product_hint: str = "") -> Tuple[int, Dict[str, Any]]:
         """Xử lý Shot 2: Kiểm định khay hàng bằng thị giác AI để xác nhận dỡ hàng hoàn tất"""
@@ -399,10 +495,42 @@ class CameraController:
         save_path.write_bytes(img_bytes)
         img_url = f"/images/{fname}"
 
+        expected_codes: list = []
+        planned_targets: dict = {}
+        if self.workflow_manager is not None:
+            cur_m = getattr(self.workflow_manager, "active_mission", None)
+            m_queue = list(getattr(self.workflow_manager, "mission_queue", []) or [])
+            for m in ([cur_m] if cur_m else []) + m_queue:
+                if not isinstance(m, dict):
+                    continue
+                to_n = str(m.get("to_node", "")).strip().upper()
+                p_code = str(m.get("product_code", "")).strip().upper()
+                if p_code and to_n:
+                    planned_targets[p_code] = to_n
+                    if to_n == station.upper() and p_code not in expected_codes:
+                        expected_codes.append(p_code)
+            if awaiting_task and awaiting_task.get("product_code"):
+                ap = str(awaiting_task["product_code"]).strip().upper()
+                at = str(awaiting_task.get("to_node", station)).strip().upper()
+                if ap:
+                    planned_targets.setdefault(ap, at)
+                    if ap not in expected_codes:
+                        expected_codes.append(ap)
+
         try:
-            ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint, from_node=station)
+            ai_res = self.ai_service.classify_image(
+                img_bytes,
+                product_hint=product_hint,
+                from_node=station,
+                unload_station=station,
+                expected_product_codes=expected_codes,
+                planned_targets=planned_targets,
+            )
         except TypeError:
-            ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint)
+            try:
+                ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint, from_node=station)
+            except TypeError:
+                ai_res = self.ai_service.classify_image(img_bytes, product_hint=product_hint)
         annotated_bytes = ai_res.get("annotated_bytes")
         if annotated_bytes:
             ann_fname = f"annotated_{fname}"
@@ -440,8 +568,12 @@ class CameraController:
         with self.lock:
             self.latest_info.update({
                 "online": True,
+                "shot": 2,
+                "station": station,
                 "received_at": datetime.now().strftime("%H:%M:%S"),
                 "product_code": display_prod_code,
+                "category": ai_res.get("category", "--"),
+                "target_station": station,
                 "confidence": float(ai_res.get("confidence", 0.0)),
                 "task_id": unload_res.get("task_id", 0),
                 "image_url": img_url,

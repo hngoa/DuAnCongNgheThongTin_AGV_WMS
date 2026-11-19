@@ -5,19 +5,61 @@ SCRIPT NẠP DỮ LIỆU BAN ĐẦU (SEED DATA) CHO BẢN ĐỒ & TỒN KHO ĐA 
 """
 
 from pathlib import Path
+import json
 import sys
 SERVER_DIR = Path(__file__).resolve().parent.parent
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
+from app.config import ACTIVE_MAP_CONFIG_PATH, ALLOW_RUNTIME_MAP_CHANGE, MAP_PRESETS_DIR
 from database.db_connection import get_db, init_db, DB_PATH
+from database.repositories import MapRepository
+
+
+def sync_config_maps_to_db(db_file: Path = DB_PATH, activate_active_map: bool = True) -> None:
+    """Đồng bộ không phá hủy (non-destructive UPSERT) các bản đồ từ config/maps/*.json & config/active_map.json vào SQLite."""
+    repo = MapRepository(db_file)
+    active_map_id = None
+
+    if MAP_PRESETS_DIR.is_dir():
+        for preset_path in sorted(MAP_PRESETS_DIR.glob("*.json")):
+            try:
+                cfg = json.loads(preset_path.read_text(encoding="utf-8"))
+                repo.upsert_map_config(cfg, activate=False)
+            except Exception as e:
+                print(f"⚠️ Bỏ qua preset bản đồ '{preset_path.name}' khi đồng bộ DB: {e}")
+
+    if ACTIVE_MAP_CONFIG_PATH.is_file():
+        try:
+            active_cfg = json.loads(ACTIVE_MAP_CONFIG_PATH.read_text(encoding="utf-8"))
+            res = repo.upsert_map_config(active_cfg, activate=activate_active_map)
+            active_map_id = res["map_id"]
+        except Exception as e:
+            print(f"⚠️ Không thể đồng bộ active_map.json vào DB: {e}")
+
+    if activate_active_map and active_map_id:
+        repo.set_active_map(active_map_id, sync_fleet=True)
+
+
+def sync_active_map_db(db_file: Path = DB_PATH) -> None:
+    """Entry-point cho tools/sync_map.py --apply-db: khởi tạo DB nếu chưa có và đồng bộ bản đồ active."""
+    init_db(db_file)
+    with get_db(db_file) as conn:
+        maps_cnt = conn.execute("SELECT COUNT(*) FROM maps;").fetchone()[0]
+        prods_cnt = conn.execute("SELECT COUNT(*) FROM products;").fetchone()[0]
+    if maps_cnt == 0 or prods_cnt == 0:
+        seed_database(db_file, reset=True)
+    else:
+        sync_config_maps_to_db(db_file, activate_active_map=True)
+
 
 def seed_database(db_file: Path = DB_PATH, reset: bool = True):
     """Nạp dữ liệu cấu hình bản đồ động và quy tắc phân bổ kho thông minh.
 
     - Khi reset=False (mặc định khi server khởi động lại): giữ nguyên toàn bộ bản đồ,
-      danh mục sản phẩm, quy tắc phân bổ trạm, tồn kho và lịch sử nếu DB đã khởi tạo.
-    - Khi reset=True hoặc DB mới tinh: nạp dữ liệu mẫu ban đầu.
+      danh mục sản phẩm, quy tắc phân bổ trạm, tồn kho và lịch sử nếu DB đã khởi tạo,
+      đồng thời đồng bộ không phá hủy cấu hình bản đồ từ config/active_map.json.
+    - Khi reset=True hoặc DB mới tinh: nạp dữ liệu mẫu ban đầu rồi đồng bộ active_map.json.
     """
     # 1. Đảm bảo cấu trúc bảng đã tồn tại
     init_db(db_file)
@@ -36,7 +78,19 @@ def seed_database(db_file: Path = DB_PATH, reset: bool = True):
                     "voltage_v = 0.0, current_a = 0.0, battery_pct = 0.0;"
                 )
                 print(f"💾 Đã phát hiện Database hiện có ({maps_cnt} bản đồ, {prods_cnt} mặt hàng) -> Giữ nguyên cấu hình & tồn kho: {db_file}")
-                return
+                # Đồng bộ non-destructive sau khi thoát context transaction
+                maps_ready = True
+            else:
+                maps_ready = False
+        else:
+            maps_ready = False
+
+    if not reset and maps_ready:
+        sync_config_maps_to_db(db_file, activate_active_map=not ALLOW_RUNTIME_MAP_CHANGE)
+        return
+
+    with get_db(db_file) as conn:
+        cursor = conn.cursor()
 
         # 2. NẠP CÁC BẢN ĐỒ MẪU (BẢN ĐỒ 1: SA BÀN LAB 1.54m x 1.51m & BẢN ĐỒ 2: KHO MỞ RỘNG 6 TRẠM)
         cursor.execute("""
@@ -113,8 +167,8 @@ def seed_database(db_file: Path = DB_PATH, reset: bool = True):
                 is_locked=0, locked_by_agv=NULL;
         """, segments_data)
 
-        # 5. NẠP DANH MỤC SẢN PHẨM & MÔ HÌNH AI MOBILENETV3 (PRODUCTS)
-        # Khớp class_names.json của best.pth: 0 = cylinder (PKG_MECH), 1 = rectangular_box (PKG_ELEC), 2 = triangular_prism (PKG_TOOL)
+        # 5. NẠP DANH MỤC SẢN PHẨM & ÁNH XẠ CV VER3 (PRODUCTS)
+        # Khớp class_names.json (yolo11n_v5b_best.pt + best.pth): 0 = cylinder (PKG_MECH), 1 = rectangular_box (PKG_ELEC), 2 = triangular_prism (PKG_TOOL)
         cursor.execute(
             "UPDATE products SET yolo_class_id = -(yolo_class_id + 1000) "
             "WHERE product_code IN ('PKG_MECH', 'PKG_ELEC', 'PKG_TOOL') AND yolo_class_id >= 0;"
@@ -177,6 +231,7 @@ def seed_database(db_file: Path = DB_PATH, reset: bool = True):
                     'Map: SABAN_154_151, Nodes: 4, Segments: 8, Products: 3, Dynamic Rules: 4, AGV: OFFLINE');
         """)
 
+    sync_config_maps_to_db(db_file, activate_active_map=True)
     print(f"🎉 Đã nạp thành công dữ liệu Bản đồ động & Tồn kho đa sản phẩm vào: {db_file}")
 
 if __name__ == "__main__":
